@@ -1,0 +1,83 @@
+# Queries for `rkb eval` on tests/fixtures/search/kb. Every lesson and query here is written from scratch.
+
+[[query]]
+text = "undefined reference to vtable"
+expect = ["1a00000012"]
+
+[[query]]
+text = "undefined reference to `vtable"
+expect = ["1a00000012"]
+mode = "literal"
+
+[[query]]
+text = "find_package still not found after install"
+expect = ["1a00000001"]
+
+[[query]]
+text = "clangd cannot find headers"
+expect = ["1a00000002"]
+
+[[query]]
+text = "git describe no names found"
+expect = ["1a00000004"]
+
+[[query]]
+text = "pull with uncommitted changes"
+expect = ["1a00000003"]
+
+[[query]]
+text = "fixup commits"
+expect = ["1a00000005"]
+
+[[query]]
+text = "pyproject build-system editable"
+expect = ["1a00000006"]
+
+[[query]]
+text = "packages installed into the wrong python"
+expect = ["1a00000007"]
+
+[[query]]
+text = "fish venv activate"
+expect = ["1a00000008"]
+
+[[query]]
+text = "hyperref cleveref order"
+expect = ["1a00000009"]
+
+[[query]]
+text = "latexmk continuous preview"
+expect = ["1a00000010"]
+
+[[query]]
+text = "srun cpu binding"
+expect = ["1a00000011"]
+
+[[query]]
+text = "--start-group"
+expect = ["1a00000013"]
+mode = "literal"
+
+[[query]]
+text = "static library link order"
+expect = ["1a00000013"]
+
+[[query]]
+text = "H5_USE_18_API"
+expect = ["1a00000014"]
+with = { hdf5 = "1.12.2" }
+
+[[query]]
+text = "hdf5 1.10"
+expect = ["1a00000014"]
+with = { hdf5 = "1.14.3" }
+
+[[query]]
+text = "strpe large files"
+expect = ["1a00000015"]
+system = "hpc1"
+
+[[query]]
+text = "getstripe"
+expect = ["1a00000016"]
+system = "hpc1"

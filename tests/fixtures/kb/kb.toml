@@ -1,0 +1,19 @@
+[labels]
+sensitivity = ["public", "internal", "confidential"]
+
+[sinks.web]
+allow = { sensitivity = ["public"] }
+
+[sinks.web-protected]
+allow = { sensitivity = ["public", "internal"] }
+
+[sinks.jev]
+allow = { sensitivity = ["public", "internal"] }
+
+[rerank]
+chain = ["bm25"]
+
+[leak]
+usernames = []
+paths = []
+allow = []

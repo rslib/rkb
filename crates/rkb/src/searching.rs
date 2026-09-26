@@ -1,0 +1,207 @@
+use rkb_core::conditions::{Facts, Verdict};
+use rkb_core::eval;
+use rkb_core::lesson::Status;
+use rkb_core::search::{self, Found, Mode, Options, RANKED_BY, Results};
+use serde_json::{Value, json};
+
+use crate::list::{cut, kind_name, len, marker, marks, width};
+use crate::output::{CliError, ErrorCode, Output, paint};
+use crate::writes::Env;
+
+const SUMMARY_LIMIT: usize = 160;
+
+fn applies_color(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Yes => "32",
+        Verdict::No => "31",
+        Verdict::Unknown => "33",
+    }
+}
+
+fn hidden_text(r: &Results) -> Option<String> {
+    (r.hidden > 0).then(|| {
+        let keys: Vec<String> = r.hidden_by.keys().cloned().collect();
+        format!("hidden: {} (applies=no: {}); --all shows them", r.hidden, keys.join(", "))
+    })
+}
+
+pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options) -> Result<Output, CliError> {
+    let place = env.place.clone().unwrap_or_default();
+    let r = search::search(&env.root, &place, facts, &mode, &opts)?;
+    let (label, query) = match &mode {
+        Mode::Ranked(q) => ("search", q.clone()),
+        Mode::Literal(t) => ("literal", t.clone()),
+        Mode::Regex(p) => ("regex", p.clone()),
+    };
+    let ranked = matches!(mode, Mode::Ranked(_));
+    let m = marks();
+    let w = width();
+    let c = env.colored;
+
+    let mut human = format!(
+        "{} {} {} {}",
+        paint(c, "1", &format!("{label} \"{query}\"")),
+        m.sep,
+        if r.hits.len() == 1 { "1 result".to_string() } else { format!("{} results", r.hits.len()) },
+        if ranked { format!("{} ranked by: {RANKED_BY}", m.sep) } else { String::new() }
+    )
+    .trim_end()
+    .to_string();
+    human.push('\n');
+    for h in &r.hits {
+        let mut right = vec![];
+        if h.status != Status::Active {
+            right.push(paint(c, "33", h.status.as_str()));
+        }
+        right.push(paint(c, applies_color(h.applies), h.applies.as_str()));
+        let right_plain: usize = right.iter().map(|s| len(&strip(s)) + 2).sum();
+        let (mk, color) = marker(h.kind, m);
+        let title = cut(&h.title, w.saturating_sub(4 + right_plain).max(20), m);
+        let pad = w.saturating_sub(4 + len(&title) + right_plain).min(w);
+        human.push_str(&format!("\n  {} {title}{}  {}\n", paint(c, color, mk), " ".repeat(pad), right.join("  ")));
+        human.push_str(&format!("    {}\n", paint(c, "2", &format!("{} {} {}", h.id, m.sep, h.path))));
+        let detail = match &h.line {
+            Some((n, line)) => format!("L{n}: {line}"),
+            None => h.summary.clone(),
+        };
+        if !detail.is_empty() {
+            human.push_str(&format!("    {}\n", paint(c, "2", &cut(&detail, w.saturating_sub(4), m))));
+        }
+    }
+    if r.hits.is_empty() && r.hidden > 0 {
+        human.push_str("\nNo lesson that applies here matches.\n");
+    } else if r.hits.is_empty() {
+        human.push_str("\nNo lessons match. Try `rkb find` for names, `--all` for every folder, or `rkb list` to browse.\n");
+    }
+    if let Some(h) = hidden_text(&r) {
+        human.push_str(&format!("\n{}\n", paint(c, "2", &h)));
+    }
+
+    let rows: Vec<Value> = r
+        .hits
+        .iter()
+        .map(|h| {
+            let mut row = json!({
+                "id": h.id,
+                "type": kind_name(h.kind),
+                "title": h.title,
+                "path": h.path,
+                "status": h.status.as_str(),
+                "applies": h.applies.as_str(),
+            });
+            match &h.line {
+                Some((n, line)) => row["line"] = json!(format!("{n}: {}", crate::output::cut(line, SUMMARY_LIMIT, "rkb show <id>"))),
+                None => row["summary"] = json!(crate::output::cut(&h.summary, SUMMARY_LIMIT, "rkb show <id>")),
+            }
+            row
+        })
+        .collect();
+    let mut data = json!({ "query": query, "mode": label, "results": rows });
+    if ranked {
+        data["ranked_by"] = json!(RANKED_BY);
+    }
+    if r.hidden > 0 {
+        data["hidden"] = json!(r.hidden);
+        data["hidden_by"] = json!(r.hidden_by);
+    }
+    let help: Vec<String> = if r.hits.is_empty() {
+        vec![
+            "Run `rkb find <words>` to look up a lesson by name".into(),
+            "Add --all to search every folder and show hidden results".into(),
+            "Run `rkb list` to browse the topics".into(),
+        ]
+    } else {
+        vec!["Run `rkb show <id>` to read a lesson; check `applies` before you act on it".into()]
+    };
+    data["help"] = json!(help);
+    Ok(Output { data, human, exit: 0, raw: false })
+}
+
+/// Removes ANSI color codes, to measure the visible width of a painted string.
+fn strip(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            for x in chars.by_ref() {
+                if x == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+pub fn find(env: &Env, query: &str, limit: usize) -> Result<Output, CliError> {
+    let found: Vec<Found> = search::find(&env.root, query, limit)?;
+    let m = marks();
+    let w = width();
+    let c = env.colored;
+    let mut human = format!("{} {} {}\n", paint(c, "1", &format!("find \"{query}\"")), m.sep, found.len());
+    for f in &found {
+        let (mk, color) = marker(f.kind, m);
+        human.push_str(&format!(
+            "\n  {} {}\n    {}\n",
+            paint(c, color, mk),
+            cut(&f.title, w.saturating_sub(4), m),
+            paint(c, "2", &format!("{} {} {}", f.id, m.sep, f.path))
+        ));
+    }
+    if found.is_empty() {
+        human.push_str("\nNo lesson name matches. Try `rkb search` with words from the problem.\n");
+    }
+    let rows: Vec<Value> =
+        found.iter().map(|f| json!({ "id": f.id, "type": kind_name(f.kind), "title": f.title, "path": f.path })).collect();
+    let help = if found.is_empty() { "Run `rkb search <words>` to search the lesson text" } else { "Run `rkb show <id>` to read a lesson" };
+    Ok(Output { data: json!({ "query": query, "results": rows, "help": [help] }), human, exit: 0, raw: false })
+}
+
+pub fn eval(env: &Env, file: Option<String>, min_recall: Option<f64>) -> Result<Output, CliError> {
+    let path = file.map(std::path::PathBuf::from).unwrap_or_else(|| env.root.join("eval/queries.toml"));
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        CliError::new(
+            ErrorCode::NotFound,
+            format!("cannot read {}: {e}", path.display()),
+            "create it with [[query]] tables (text, expect), or pass --queries <file>",
+        )
+    })?;
+    let queries = eval::parse(&text).map_err(|e| {
+        CliError::new(
+            ErrorCode::Usage,
+            format!("{}: {e}", path.display()),
+            "each [[query]] has text, expect and optionally mode, with, project, system",
+        )
+    })?;
+    let report = eval::run(&env.root, &queries)?;
+    let pass = min_recall.is_none_or(|m| report.recall_at_5 + 1e-9 >= m);
+    let c = env.colored;
+    let mut human = String::new();
+    for r in &report.rows {
+        let rank = r.rank.map_or_else(|| "-".to_string(), |k| k.to_string());
+        let rank =
+            if r.rank.is_some_and(|k| k <= 5) { paint(c, "32", &format!("{rank:>2}")) } else { paint(c, "31", &format!("{rank:>2}")) };
+        human.push_str(&format!("{rank}  {}\n", r.text));
+    }
+    human.push_str(&format!(
+        "\n{} queries  recall@5 {:.2}  mrr {:.2}  ranked by: {RANKED_BY}",
+        report.rows.len(),
+        report.recall_at_5,
+        report.mrr
+    ));
+    if let Some(m) = min_recall {
+        human.push_str(&format!("  ({} the minimum {m:.2})", if pass { "meets" } else { "BELOW" }));
+    }
+    let rows: Vec<Value> = report.rows.iter().map(|r| json!({ "query": r.text, "rank": r.rank.unwrap_or(0) })).collect();
+    let data = json!({
+        "queries": report.rows.len(),
+        "recall_at_5": (report.recall_at_5 * 1000.0).round() / 1000.0,
+        "mrr": (report.mrr * 1000.0).round() / 1000.0,
+        "ranked_by": RANKED_BY,
+        "rows": rows,
+        "help": ["rank 0 means not in the first 10; add a missed search to the query file to keep it tested"],
+    });
+    Ok(Output { data, human, exit: u8::from(!pass), raw: false })
+}

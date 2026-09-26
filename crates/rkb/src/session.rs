@@ -1,0 +1,160 @@
+use rkb_core::doctor::{self, Check, Level};
+use rkb_core::matching::{Matched, Place};
+use rkb_core::state::State;
+use rkb_core::{kb, paths};
+use serde_json::{Value, json};
+
+use crate::output::{CliError, Output, paint};
+use crate::writes::{self, Env};
+
+fn plural(n: usize, word: &str) -> String {
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+}
+
+fn home_path(root: &std::path::Path) -> String {
+    let root = root.display().to_string();
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() && root.starts_with(&h) => format!("~{}", &root[h.len()..]),
+        _ => root,
+    }
+}
+
+fn matched(m: &Option<Matched>) -> Value {
+    m.as_ref().map_or(Value::Null, |m| json!({ "name": m.name, "rule": m.rule.describe() }))
+}
+
+fn next_list(place: &Place) -> String {
+    match &place.project {
+        Some(p) => format!("rkb list projects/{}", p.name),
+        None => "rkb list".into(),
+    }
+}
+
+/// The live state for `rkb` with no command.
+pub fn status(env: &Env, s: &State) -> Output {
+    let c = env.colored;
+    let mut human = format!("{} {}\n\n", paint(c, "1", "rkb"), home_path(&env.root));
+    let row = |label: &str, m: &Option<Matched>, n: Option<usize>| match m {
+        Some(m) => format!(
+            "{label:<8} {:<14} {:>12}   {}\n",
+            m.name,
+            plural(n.unwrap_or(0), "lesson"),
+            paint(c, "2", &format!("({})", m.rule.describe()))
+        ),
+        None => format!("{label:<8} {}\n", paint(c, "2", &format!("none matched here; --{label} <name> sets it"))),
+    };
+    human.push_str(&row("project", &s.place.project, s.project_lessons));
+    human.push_str(&row("system", &s.place.system, s.system_lessons));
+    human.push_str(&format!("{:<8} {:<14} {:>12}\n", "general", "", plural(s.general_lessons, "lesson")));
+    let mut notes = vec![];
+    if s.pending > 0 {
+        notes.push(paint(c, "33", &plural(s.pending, "pending request")));
+    }
+    if s.uncommitted > 0 {
+        notes.push(paint(c, "33", &format!("{} uncommitted", plural(s.uncommitted, "change"))));
+    }
+    if !notes.is_empty() {
+        human.push_str(&format!("\n{}\n", notes.join("  ")));
+    }
+    let next = next_list(&s.place);
+    human.push_str(&format!("\nNext: {next}"));
+
+    let mut help = vec![format!("Run `{next}` to see the lessons here")];
+    if s.pending > 0 {
+        help.push("Answer pending requests with `rkb confirm`, after asking the user".into());
+    }
+    if s.uncommitted > 0 {
+        help.push("Run `rkb doctor` to see the uncommitted changes".into());
+    }
+    let data = json!({
+        "kb": env.root.display().to_string(),
+        "project": matched(&s.place.project),
+        "system": matched(&s.place.system),
+        "lessons": { "project": s.project_lessons, "system": s.system_lessons, "general": s.general_lessons },
+        "pending": s.pending,
+        "uncommitted": s.uncommitted,
+        "help": help,
+    });
+    Output { data, human, exit: 0, raw: false }
+}
+
+/// At most 5 lines, for a SessionStart hook.
+pub fn context(s: &State) -> Output {
+    let part = |label: &str, m: &Option<Matched>| match m {
+        Some(m) => format!("{label} {} ({})", m.name, m.rule.short()),
+        None => format!("no {label}"),
+    };
+    let place = format!("{}, {}", part("project", &s.place.project), part("system", &s.place.system));
+    let mut counts = vec![];
+    if let Some(n) = s.project_lessons {
+        counts.push(format!("{n} project"));
+    }
+    if let Some(n) = s.system_lessons {
+        counts.push(format!("{n} system"));
+    }
+    counts.push(format!("{} general", s.general_lessons));
+    let lessons = counts.join(", ");
+    let next = next_list(&s.place);
+    let pending = (s.pending > 0).then(|| format!("{}; ask the user before `rkb confirm`", plural(s.pending, "pending request")));
+
+    let mut human = format!("rkb: {place}\nlessons here: {lessons}\n");
+    if let Some(p) = &pending {
+        human.push_str(&format!("{p}\n"));
+    }
+    human.push_str(&format!("see lessons: {next}"));
+    let mut data = json!({ "rkb": place, "lessons": lessons });
+    if let Some(p) = pending {
+        data["pending"] = json!(p);
+    }
+    data["next"] = json!(next);
+    Output { data, human, exit: 0, raw: false }
+}
+
+pub fn doctor(env: &Env, place: &Place, break_lock: bool) -> Result<Output, CliError> {
+    if break_lock {
+        kb::open(&env.root)?;
+        return Ok(match doctor::break_lock_request(&env.root, &env.state)? {
+            Some(req) => writes::outcome(env, rkb_core::write::Outcome::NeedsUser(req)),
+            None => writes::outcome(env, rkb_core::write::Outcome::Info("There is no write lock; nothing to break".into())),
+        });
+    }
+    let checks = doctor::run(&env.root, place, &env.state, &paths::config_dir(), &env.lint);
+    let failed = checks.iter().filter(|c| c.level == Level::Fail).count();
+    let warned = checks.iter().filter(|c| c.level == Level::Warn).count();
+    Ok(Output {
+        data: doctor_data(&checks, failed, warned),
+        human: doctor_human(env.colored, &checks, failed, warned),
+        exit: u8::from(failed > 0),
+        raw: false,
+    })
+}
+
+fn doctor_data(checks: &[Check], failed: usize, warned: usize) -> Value {
+    let rows: Vec<Value> = checks
+        .iter()
+        .map(|c| json!({ "check": c.name, "status": c.level, "detail": c.detail, "fix": c.fix.clone().unwrap_or_default() }))
+        .collect();
+    let mut data = json!({ "failed": failed, "warnings": warned, "checks": rows });
+    if failed + warned > 0 {
+        data["help"] = json!(["Run the fix of each check that is not ok, then `rkb doctor` again"]);
+    }
+    data
+}
+
+fn doctor_human(c: bool, checks: &[Check], failed: usize, warned: usize) -> String {
+    let width = checks.iter().map(|k| k.name.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    for k in checks {
+        let mark = match k.level {
+            Level::Ok => paint(c, "32", "ok  "),
+            Level::Warn => paint(c, "33", "warn"),
+            Level::Fail => paint(c, "31", "FAIL"),
+        };
+        out.push_str(&format!("{mark}  {:width$}  {}\n", k.name, k.detail));
+        if let Some(fix) = &k.fix {
+            out.push_str(&format!("      {:width$}  {} {fix}\n", "", paint(c, "2", "fix:")));
+        }
+    }
+    out.push_str(&format!("\n{failed} failed, {warned} warnings"));
+    out
+}

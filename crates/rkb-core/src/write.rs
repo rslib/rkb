@@ -1,0 +1,621 @@
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::Path;
+use std::time::Duration;
+
+use jiff::civil::Date;
+use serde_norway::{Mapping, Value};
+use sha2::{Digest, Sha256};
+
+use crate::body;
+use crate::config::{self, KbConfig, TopicNote};
+use crate::error::{Error, Result, io};
+use crate::git;
+use crate::kb::{FileKind, NoteRole, Snapshot, note_chain, note_role};
+use crate::lesson::{self, Frontmatter, Lesson, LessonType, Status, VerifiedHow};
+use crate::lint::{self, LintEnv, Severity};
+use crate::lock;
+use crate::matching::Place;
+use crate::request::{self, Action, Choice, Decision, Request};
+
+pub const DIFF_LINES: usize = 80;
+pub const SIMILAR_TITLE: f64 = 0.6;
+
+/// What a write needs from the caller.
+pub struct Ctx<'a> {
+    pub root: &'a Path,
+    pub env: &'a LintEnv,
+    /// `$XDG_STATE_HOME/rkb`; requests live in its `requests/` folder.
+    pub state: &'a Path,
+    pub today: Date,
+    /// Where the command runs; lets `add` offer to record a new project's remote.
+    pub place: Option<&'a Place>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Written {
+    pub kind: &'static str,
+    pub id: String,
+    pub path: String,
+    pub title: String,
+    pub commit: String,
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Imported {
+    pub added: Vec<Written>,
+    /// Sources skipped as duplicates.
+    pub skipped: Vec<String>,
+    /// Sources not added, with the reason; the first one stopped the import.
+    pub not_added: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    Written(Written),
+    Unchanged {
+        id: String,
+        path: String,
+    },
+    NeedsUser(Request),
+    Cancelled,
+    /// The result of a confirmed import.
+    Imported(Imported),
+    /// A finished action that wrote no lesson, such as breaking a lock.
+    Info(String),
+}
+
+/// 10 random lowercase hex characters that no lesson in `taken` has.
+pub fn new_id(taken: &HashSet<&str>) -> String {
+    loop {
+        let mut b = [0u8; 5];
+        getrandom::fill(&mut b).expect("system random source");
+        let id: String = b.iter().map(|x| format!("{x:02x}")).collect();
+        // An all-digit id such as 1311911595 reads as a YAML number, so it would be written quoted.
+        if !taken.contains(id.as_str()) && plain_yaml_string(&id) {
+            return id;
+        }
+    }
+}
+
+fn plain_yaml_string(s: &str) -> bool {
+    serde_norway::to_string(s).is_ok_and(|out| out.trim_end() == s)
+}
+
+/// The first 12 hex characters of the SHA-256 of a file, as `rkb show` prints it.
+pub fn content_hash(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().take(6).map(|x| format!("{x:02x}")).collect()
+}
+
+/// Lowercase words of a title: runs of letters and digits.
+fn words(title: &str) -> impl Iterator<Item = String> + '_ {
+    title.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase)
+}
+
+/// The file name for a title: lowercase words joined by `-`, cut at a word boundary to 60 characters.
+pub fn slug(title: &str) -> String {
+    let mut out = String::new();
+    for w in words(title) {
+        if !out.is_empty() && out.len() + 1 + w.len() > 60 {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('-');
+        }
+        out.push_str(&w);
+    }
+    if out.is_empty() { "lesson".into() } else { out.chars().take(60).collect() }
+}
+
+pub fn jaccard(a: &str, b: &str) -> f64 {
+    let a: BTreeSet<String> = words(a).collect();
+    let b: BTreeSet<String> = words(b).collect();
+    let union = a.union(&b).count();
+    if union == 0 { 0.0 } else { a.intersection(&b).count() as f64 / union as f64 }
+}
+
+/// Up to three of `names`, closest to `name` first.
+pub fn closest<'a>(name: &str, names: &'a [String]) -> Vec<&'a str> {
+    let mut ranked: Vec<(f64, &str)> =
+        names.iter().map(|n| (crate::text::edit_distance(name, n) as f64 / name.len().max(n.len()).max(1) as f64, n.as_str())).collect();
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)));
+    ranked.into_iter().take(3).map(|(_, n)| n).collect()
+}
+
+/// The scope folder that `when` implies: one project, else one system, else `general`.
+pub fn scope_of(when: &Mapping) -> String {
+    let one = |k: &str| when.get(k).and_then(Value::as_str).map(str::to_string);
+    match (one("project"), one("system")) {
+        (Some(p), _) => format!("projects/{p}"),
+        (None, Some(s)) => format!("systems/{s}"),
+        _ => "general".into(),
+    }
+}
+
+/// A lesson skeleton with the headings its type requires.
+pub fn template(kind: LessonType) -> String {
+    let name = serde_norway::to_string(&kind).unwrap_or_default();
+    let mut out =
+        format!("---\ntype: {}\nverified_how: ran\n# when:\n#   project: <name>\n# tags:\n#   - <word>\n---\n\n# <Title>\n", name.trim());
+    for h in kind.required_headings() {
+        out.push_str(&format!("\n## {h}\n\n"));
+    }
+    out
+}
+
+fn title_of(body_text: &str) -> Option<String> {
+    body::scan(body_text).h1.into_iter().next().map(|(_, t)| t)
+}
+
+fn note_labels(text: &str) -> BTreeMap<String, String> {
+    let Some(fm) = config::note_frontmatter(text) else { return BTreeMap::new() };
+    let Ok(Value::Mapping(m)) = serde_norway::from_str::<Value>(fm) else { return BTreeMap::new() };
+    let Some(Value::Mapping(labels)) = m.get("labels") else { return BTreeMap::new() };
+    labels.iter().filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string()))).collect()
+}
+
+fn effective(snap: &Snapshot, path: &str, own: &Mapping) -> BTreeMap<String, String> {
+    let notes: Vec<BTreeMap<String, String>> =
+        note_chain(path).iter().filter_map(|n| snap.files.get(n)).map(|d| note_labels(&String::from_utf8_lossy(d))).collect();
+    let refs: Vec<&BTreeMap<String, String>> = notes.iter().collect();
+    config::effective_labels(own, &refs)
+}
+
+/// The first label that becomes looser: an earlier value in that key's list in `kb.toml`.
+fn looser(kb: &KbConfig, old: &BTreeMap<String, String>, new: &BTreeMap<String, String>) -> Option<(String, String)> {
+    for (key, value) in new {
+        let (Some(order), Some(before)) = (kb.labels.get(key), old.get(key)) else { continue };
+        let pos = |v: &str| order.iter().position(|o| o == v);
+        if let (Some(n), Some(o)) = (pos(value), pos(before))
+            && n < o
+        {
+            return Some((key.clone(), value.clone()));
+        }
+    }
+    None
+}
+
+fn refused(msg: impl Into<String>) -> Error {
+    Error::Refused(msg.into())
+}
+
+fn ask(action: &Action, approved: &[Decision], question: String, mut choices: Vec<Choice>) -> Result<Outcome> {
+    choices.push(Choice { text: "cancel".into(), decision: None });
+    let req =
+        Request { id: request::new_id(), created: request::now(), action: action.clone(), approved: approved.to_vec(), question, choices };
+    Ok(Outcome::NeedsUser(req))
+}
+
+pub(crate) struct Prepared {
+    kind: &'static str,
+    id: String,
+    pub(crate) path: String,
+    pub(crate) title: String,
+    text: String,
+    /// Other new files committed with the lesson, such as a created folder note.
+    extra: Vec<(String, String)>,
+}
+
+/// Runs one write: prepare, check each decision point, validate, write, commit.
+/// A check whose decision is not in `approved` stores a request and returns `NeedsUser`.
+pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcome> {
+    let kb: KbConfig = std::fs::read_to_string(ctx.root.join("kb.toml")).ok().and_then(|t| config::parse(&t).ok()).unwrap_or_default();
+    let _lock = kb_lock(ctx.root, &kb)?;
+    let snap = Snapshot::from_dir(ctx.root)?;
+    let prepared = match action {
+        Action::Add { text, topic } => add(ctx, &kb, &snap, action, approved, text, topic)?,
+        Action::Edit { id, text, base } => edit(&kb, &snap, action, approved, id, text, base)?,
+        Action::Flag { id, reason } => flag(&snap, id, reason)?,
+        Action::BreakLock { .. } | Action::Install { .. } | Action::Import { .. } => {
+            unreachable!("confirm handles these itself")
+        }
+    };
+    match prepared {
+        Ok(p) => finish(ctx, snap, p),
+        Err(Outcome::NeedsUser(req)) => {
+            request::save(&ctx.state.join("requests"), &req)?;
+            Ok(Outcome::NeedsUser(req))
+        }
+        Err(outcome) => Ok(outcome),
+    }
+}
+
+/// Takes the knowledge base's write lock with `lock.stale_s` and `lock.wait_s` from `kb.toml`.
+pub fn kb_lock(root: &Path, kb: &KbConfig) -> Result<lock::LockGuard> {
+    let setting = |key: &str, default: u64| {
+        kb.lock.as_ref().and_then(|t| t.get(key)).and_then(|v| v.as_integer()).map_or(default, |v| v.max(0) as u64)
+    };
+    let git_dir = String::from_utf8_lossy(&git::run(root, &["rev-parse", "--git-dir"])?).trim().to_string();
+    lock::acquire(&root.join(git_dir).join("rkb.lock"), setting("stale_s", 600), Duration::from_secs(setting("wait_s", 10)))
+}
+
+/// Runs the stored action of a request with the chosen decision added.
+pub fn confirm(ctx: &Ctx, req: &Request, choice: &str) -> Result<Outcome> {
+    let Some(c) = req.choices.iter().find(|c| c.text == choice) else {
+        return Err(Error::BadChoice { choice: choice.to_string(), options: req.options() });
+    };
+    request::remove(&ctx.state.join("requests"), &req.id);
+    let Some(decision) = &c.decision else { return Ok(Outcome::Cancelled) };
+    if let Action::Install { harnesses, uninstall } = &req.action {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+        let steps = crate::install::plan(&home, &crate::paths::config_dir(), harnesses, *uninstall);
+        let changes = crate::install::apply(&steps, crate::install::SKILL)?;
+        let lines: Vec<String> =
+            changes.iter().map(|c| format!("{:<9} {}", format!("{:?}", c.effect).to_lowercase(), c.path.display())).collect();
+        return Ok(Outcome::Info(lines.join("\n")));
+    }
+    if let Action::BreakLock { path, holder } = &req.action {
+        return Ok(Outcome::Info(if crate::doctor::break_lock(path, holder) {
+            format!("Removed the lock {path}")
+        } else {
+            format!("The lock {path} changed or is gone since the request; nothing was removed")
+        }));
+    }
+    if let Action::Import { items } = &req.action {
+        return crate::import::write(ctx, items, *decision == Decision::SkipDuplicates);
+    }
+    let mut approved = req.approved.clone();
+    approved.push(decision.clone());
+    apply(ctx, &req.action, &approved)
+}
+
+fn find<'a>(lessons: &'a [Lesson], id: &str) -> Result<&'a Lesson> {
+    lessons.iter().find(|l| l.frontmatter.id == id).ok_or_else(|| Error::NotFound(id.to_string()))
+}
+
+pub(crate) type Step = std::result::Result<Prepared, Outcome>;
+
+pub(crate) fn add(
+    ctx: &Ctx,
+    kb: &KbConfig,
+    snap: &Snapshot,
+    action: &Action,
+    approved: &[Decision],
+    text: &str,
+    topic: &str,
+) -> Result<Step> {
+    let (fm_text, body_text, _) = lesson::split(text).map_err(|e| refused(e.message))?;
+    let mut map: Mapping = if fm_text.trim().is_empty() {
+        Mapping::new()
+    } else {
+        serde_norway::from_str(fm_text).map_err(|e| refused(format!("frontmatter: {e}")))?
+    };
+    for key in ["id", "schema", "status", "superseded_by", "stale_reason"] {
+        if map.contains_key(key) {
+            return Err(refused(format!("remove `{key}` from the frontmatter; rkb sets it")));
+        }
+    }
+    if map.get("verified_how").and_then(Value::as_str) == Some("checked") {
+        return Err(refused("only `rkb verify` sets `verified_how: checked`"));
+    }
+    let title = title_of(body_text).ok_or_else(|| refused("the body needs a `# Title` line"))?;
+
+    let (lessons, _) = snap.lessons();
+    let taken: HashSet<&str> = lessons.iter().map(|l| l.frontmatter.id.as_str()).collect();
+    let id = new_id(&taken);
+    map.insert("schema".into(), 1.into());
+    map.insert("id".into(), id.clone().into());
+    map.insert("status".into(), "active".into());
+    if !map.contains_key("verified") {
+        map.insert("verified".into(), ctx.today.to_string().into());
+    }
+    let fm: Frontmatter = serde_norway::from_value(Value::Mapping(map)).map_err(|e| refused(format!("frontmatter: {e}")))?;
+
+    let scope = scope_of(&fm.when);
+    let folder = approved
+        .iter()
+        .find_map(|d| match d {
+            Decision::UseTopic { path } => Some(path.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| format!("{scope}/{}", resolve_topic(snap, &scope, topic)));
+
+    let project_note = approved.iter().find_map(|d| match d {
+        Decision::CreateProject { path, remotes, root_commit } if *path == folder => Some((remotes.clone(), root_commit.clone())),
+        _ => None,
+    });
+    let folder_ok =
+        ctx.root.join(&folder).is_dir() || approved.contains(&Decision::CreateFolder { path: folder.clone() }) || project_note.is_some();
+    if !folder_ok {
+        let topics = topics_in(ctx.root, &scope);
+        let question = if ctx.root.join(&scope).is_dir() {
+            format!("Topic folder {folder} does not exist. Create it, or use an existing topic?")
+        } else {
+            format!("Folder {scope} does not exist yet. Create {folder} for this lesson?")
+        };
+        let mut choices = vec![];
+        if let Some(repo) = new_project_repo(ctx, &scope)
+            && let Some(first) = repo.remotes.first()
+        {
+            let root_commit = match repo.root_commits.as_slice() {
+                [one] => Some(one.clone()),
+                _ => None,
+            };
+            choices.push(Choice {
+                text: format!("create {folder} with remote {first}"),
+                decision: Some(Decision::CreateProject { path: folder.clone(), remotes: repo.remotes.clone(), root_commit }),
+            });
+        }
+        choices.push(Choice { text: format!("create {folder}"), decision: Some(Decision::CreateFolder { path: folder.clone() }) });
+        for t in closest(folder.rsplit('/').next().unwrap(), &topics) {
+            let path = format!("{scope}/{t}");
+            choices.push(Choice { text: format!("use {path}"), decision: Some(Decision::UseTopic { path }) });
+        }
+        return ask(action, approved, question, choices).map(Err);
+    }
+
+    let base_slug = slug(&title);
+    let siblings: Vec<&Lesson> = lessons.iter().filter(|l| l.path.rsplit_once('/').map(|p| p.0) == Some(folder.as_str())).collect();
+    let matches: Vec<&&Lesson> = siblings
+        .iter()
+        .filter(|l| {
+            let stem = l.path.rsplit('/').next().unwrap().trim_end_matches(".md");
+            stem == base_slug || title_of(&l.body).is_some_and(|t| jaccard(&t, &title) >= SIMILAR_TITLE)
+        })
+        .collect();
+    if !matches.is_empty() && !approved.contains(&Decision::AddAnyway) {
+        let mut question = format!("\"{title}\" looks like an existing lesson in {folder}:");
+        for m in &matches {
+            question.push_str(&format!("\n- {} {} ({})", m.frontmatter.id, title_of(&m.body).unwrap_or_default(), m.path));
+        }
+        question.push_str("\nTo extend one instead, run `rkb show <id>`, then `rkb edit <id> --base <hash>`.");
+        let choices = vec![Choice { text: "add anyway".into(), decision: Some(Decision::AddAnyway) }];
+        return ask(action, approved, question, choices).map(Err);
+    }
+    let mut path = format!("{folder}/{base_slug}.md");
+    let mut n = 2;
+    while snap.files.contains_key(&path) || ctx.root.join(&path).exists() {
+        path = format!("{folder}/{base_slug}-{n}.md");
+        n += 1;
+    }
+
+    if let Some(step) = check_labels(kb, snap, action, approved, &path, &Mapping::new(), &fm.labels)? {
+        return Ok(Err(step));
+    }
+    let mut extra = vec![];
+    if let Some((remotes, root_commit)) = project_note {
+        let note = format!("{scope}/README.md");
+        if !ctx.root.join(&note).exists() {
+            extra.push((note, project_note_text(&scope, &remotes, root_commit.as_deref())));
+        }
+    }
+    Ok(Ok(Prepared { kind: "add", id, path, title, text: lesson::write(&fm, body_text), extra }))
+}
+
+/// The current repository, when a new project folder is being made from inside an unmatched checkout.
+fn new_project_repo<'a>(ctx: &Ctx<'a>, scope: &str) -> Option<&'a crate::matching::Repo> {
+    let place = ctx.place?;
+    (scope.starts_with("projects/") && !ctx.root.join(scope).exists() && place.project.is_none()).then_some(())?;
+    place.repo.as_ref()
+}
+
+fn project_note_text(scope: &str, remotes: &[String], root_commit: Option<&str>) -> String {
+    let mut m = Mapping::new();
+    m.insert("remotes".into(), Value::Sequence(remotes.iter().map(|r| r.clone().into()).collect()));
+    if let Some(c) = root_commit {
+        m.insert("root_commit".into(), c.into());
+    }
+    let name = scope.rsplit('/').next().unwrap_or(scope);
+    format!("---\n{}---\n\n# {name}\n", crate::yaml::block(&Value::Mapping(m)))
+}
+
+fn resolve_topic(snap: &Snapshot, scope: &str, topic: &str) -> String {
+    for (path, data) in snap.of_kind(FileKind::FolderNote) {
+        if note_role(path) != NoteRole::Topic || !path.starts_with(&format!("{scope}/")) {
+            continue;
+        }
+        let note: TopicNote = config::parse_note(&String::from_utf8_lossy(data)).unwrap_or_default();
+        if note.aliases.iter().any(|a| a == topic) {
+            return path.rsplit('/').nth(1).unwrap().to_string();
+        }
+    }
+    topic.to_string()
+}
+
+fn topics_in(root: &Path, scope: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root.join(scope)) else { return vec![] };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.starts_with('.') && !n.ends_with(".assets"))
+        .collect();
+    names.sort();
+    names
+}
+
+fn check_labels(
+    kb: &KbConfig,
+    snap: &Snapshot,
+    action: &Action,
+    approved: &[Decision],
+    path: &str,
+    old: &Mapping,
+    new: &Mapping,
+) -> Result<Option<Outcome>> {
+    let before = effective(snap, path, old);
+    let after = effective(snap, path, new);
+    match looser(kb, &before, &after) {
+        Some((key, value)) if !approved.contains(&Decision::Loosen { key: key.clone(), value: value.clone() }) => {
+            let question = format!(
+                "This write makes label {key} looser, from `{}` to `{value}`. Allow it?",
+                before.get(&key).cloned().unwrap_or_default()
+            );
+            let choices = vec![Choice { text: format!("loosen {key} to {value}"), decision: Some(Decision::Loosen { key, value }) }];
+            ask(action, approved, question, choices).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn edit(kb: &KbConfig, snap: &Snapshot, action: &Action, approved: &[Decision], id: &str, text: &str, base: &str) -> Result<Step> {
+    let (lessons, _) = snap.lessons();
+    let old = find(&lessons, id)?;
+    let current = content_hash(&snap.files[&old.path]);
+    if current != base {
+        return Err(Error::Conflict(current));
+    }
+    let mut new = lesson::parse(&old.path, text).map_err(|e| refused(e.message))?;
+    let (o, n) = (&old.frontmatter, &mut new.frontmatter);
+    if n.id != o.id {
+        return Err(refused("`rkb edit` cannot change `id`"));
+    }
+    if n.schema != o.schema {
+        return Err(refused("`rkb edit` cannot change `schema`; `rkb migrate` does that"));
+    }
+    if n.verified_how == VerifiedHow::Checked && o.verified_how != VerifiedHow::Checked {
+        return Err(refused("only `rkb verify` sets `verified_how: checked`"));
+    }
+    let revive = o.status == Status::Stale
+        && body::section_text(&old.body, "Evidence") != body::section_text(&new.body, "Evidence")
+        && matches!(n.status, Status::Stale | Status::Active)
+        && n.superseded_by == o.superseded_by;
+    if revive {
+        n.status = Status::Active;
+        n.stale_reason = None;
+    } else if n.status != o.status || n.superseded_by != o.superseded_by || n.stale_reason != o.stale_reason {
+        return Err(refused(
+            "`rkb edit` does not change `status`, `superseded_by` or `stale_reason`; use `rkb flag` (or change `Evidence` to revive a stale lesson)",
+        ));
+    }
+    let out = lesson::write(&new.frontmatter, &new.body);
+    if out.as_bytes() == snap.files[&old.path].as_slice() {
+        return Ok(Err(Outcome::Unchanged { id: id.to_string(), path: old.path.clone() }));
+    }
+    if let Some(step) = check_labels(kb, snap, action, approved, &old.path, &o.labels, &new.frontmatter.labels)? {
+        return Ok(Err(step));
+    }
+    let title = title_of(&new.body).unwrap_or_default();
+    Ok(Ok(Prepared { kind: "edit", id: id.to_string(), path: old.path.clone(), title, text: out, extra: vec![] }))
+}
+
+fn flag(snap: &Snapshot, id: &str, reason: &str) -> Result<Step> {
+    let (lessons, _) = snap.lessons();
+    let old = find(&lessons, id)?;
+    if reason.trim().is_empty() {
+        return Err(refused("give a reason with --reason"));
+    }
+    if !old.frontmatter.status.is_current() {
+        return Err(refused(format!("lesson {id} is {}; only an active or stale lesson can be flagged", old.frontmatter.status.as_str())));
+    }
+    let mut fm = old.frontmatter.clone();
+    fm.status = Status::Stale;
+    fm.stale_reason = Some(reason.trim().to_string());
+    let out = lesson::write(&fm, &old.body);
+    if out.as_bytes() == snap.files[&old.path].as_slice() {
+        return Ok(Err(Outcome::Unchanged { id: id.to_string(), path: old.path.clone() }));
+    }
+    let title = title_of(&old.body).unwrap_or_default();
+    Ok(Ok(Prepared { kind: "flag", id: id.to_string(), path: old.path.clone(), title, text: out, extra: vec![] }))
+}
+
+/// Puts the prepared files into `snap` and returns the lint errors that concern them.
+pub(crate) fn stage(snap: &mut Snapshot, env: &LintEnv, p: &Prepared) -> Vec<lint::Finding> {
+    snap.files.insert(p.path.clone(), p.text.clone().into_bytes());
+    for (path, text) in &p.extra {
+        snap.files.insert(path.clone(), text.clone().into_bytes());
+    }
+    let written: Vec<&String> = std::iter::once(&p.path).chain(p.extra.iter().map(|(path, _)| path)).collect();
+    let focus: BTreeSet<String> = written.iter().map(|s| s.to_string()).collect();
+    lint::lint(snap, env, Some(&focus))
+        .into_iter()
+        .filter(|f| f.severity == Severity::Error && written.iter().any(|w| **w == f.path || w.starts_with(&format!("{}/", f.path))))
+        .collect()
+}
+
+pub(crate) fn finish(ctx: &Ctx, mut snap: Snapshot, p: Prepared) -> Result<Outcome> {
+    let blocking = stage(&mut snap, ctx.env, &p);
+    if !blocking.is_empty() {
+        return Err(Error::Invalid(blocking));
+    }
+    let written: Vec<&String> = std::iter::once(&p.path).chain(p.extra.iter().map(|(path, _)| path)).collect();
+
+    for (path, text) in p.extra.iter().chain(std::iter::once(&(p.path.clone(), p.text.clone()))) {
+        let abs = ctx.root.join(path);
+        let dir = abs.parent().unwrap();
+        std::fs::create_dir_all(dir).map_err(io(dir))?;
+        let tmp = dir.join(format!(".{}.rkb-tmp", abs.file_name().unwrap().to_string_lossy()));
+        std::fs::write(&tmp, text).map_err(io(&tmp))?;
+        std::fs::rename(&tmp, &abs).map_err(io(&abs))?;
+    }
+
+    let folder = p.path.rsplit_once('/').map_or("", |(d, _)| d);
+    let message = format!("{}({folder}): {} [{}]", p.kind, p.title, p.id);
+    let paths: Vec<&str> = written.iter().map(|s| s.as_str()).collect();
+    let mut add_args = vec!["add", "--"];
+    add_args.extend(&paths);
+    git::run(ctx.root, &add_args)?;
+    git::commit_paths(ctx.root, &message, &paths)?;
+    let commit = String::from_utf8_lossy(&git::run(ctx.root, &["rev-parse", "--short", "HEAD"])?).trim().to_string();
+    let diff = String::from_utf8_lossy(&git::run(ctx.root, &["show", "--format=", &commit])?).into_owned();
+    Ok(Outcome::Written(Written { kind: p.kind, id: p.id, path: p.path, title: p.title, commit, diff }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_are_plain_yaml_strings() {
+        assert!(!plain_yaml_string("1311911595") && !plain_yaml_string("0000000001"));
+        assert!(plain_yaml_string("7f3a9c2b41") && plain_yaml_string("12e4567890"));
+        let taken = HashSet::new();
+        assert!((0..2000).all(|_| plain_yaml_string(&new_id(&taken))));
+    }
+
+    #[test]
+    fn ids_and_hash() {
+        let id = new_id(&HashSet::new());
+        assert_eq!(id.len(), 10);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(content_hash(b"abc"), "ba7816bf8f01");
+    }
+
+    #[test]
+    fn slugs() {
+        assert_eq!(slug("CMake cannot find HDF5 unless HDF5_ROOT is set"), "cmake-cannot-find-hdf5-unless-hdf5-root-is-set");
+        let long = slug(&"word ".repeat(30));
+        assert!(long.len() <= 60 && !long.ends_with('-') && long.ends_with("word"));
+        assert_eq!(slug("!!!"), "lesson");
+    }
+
+    #[test]
+    fn title_similarity() {
+        assert!(jaccard("Avoid std::regex in hot loops", "Avoid std regex in hot loops too") >= SIMILAR_TITLE);
+        assert!(jaccard("Avoid std::regex in hot loops", "Link libstdc++ statically on old clusters") < SIMILAR_TITLE);
+    }
+
+    #[test]
+    fn scopes_and_closest_topics() {
+        let when = |y: &str| -> Mapping { serde_norway::from_str(y).unwrap() };
+        assert_eq!(scope_of(&when("project: dftracer\nsystem: tuolumne")), "projects/dftracer");
+        assert_eq!(scope_of(&when("system: tuolumne")), "systems/tuolumne");
+        assert_eq!(scope_of(&when("project: [a, b]")), "general");
+        assert_eq!(scope_of(&Mapping::new()), "general");
+        let names = vec!["cmake".to_string(), "cpp".into(), "git".into(), "lustre".into()];
+        assert_eq!(closest("cmak", &names), ["cmake", "cpp", "git"]);
+    }
+
+    #[test]
+    fn label_order() {
+        let kb: KbConfig = config::parse(config::DEFAULT_KB_TOML).unwrap();
+        let m = |v: &str| BTreeMap::from([("sensitivity".to_string(), v.to_string())]);
+        assert_eq!(looser(&kb, &m("internal"), &m("public")), Some(("sensitivity".into(), "public".into())));
+        assert_eq!(looser(&kb, &m("internal"), &m("confidential")), None);
+        assert_eq!(looser(&kb, &m("public"), &m("public")), None);
+    }
+
+    #[test]
+    fn templates_have_required_headings() {
+        let t = template(LessonType::Recipe);
+        assert!(t.contains("type: recipe") && t.contains("## When to use") && t.contains("## Steps") && t.contains("## Evidence"));
+        assert!(lesson::split(&t).is_ok());
+    }
+
+    #[test]
+    fn section_text_is_compared() {
+        let b = "# T\n\n## Evidence\nA\n\n## Check\nB\n";
+        assert_eq!(body::section_text(b, "Evidence").unwrap(), "A\n");
+        assert_eq!(body::section_text(b, "Check").unwrap(), "B");
+    }
+}
