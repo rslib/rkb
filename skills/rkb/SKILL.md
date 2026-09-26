@@ -36,16 +36,19 @@ Never write or change a lesson file with your own tools. rkb checks it, places i
 
 ## When rkb needs the user
 
-Some decisions belong to the user: a new topic or project folder, a lesson that looks like a duplicate, a looser label. Then rkb writes nothing, exits with code 3 and prints `status: needs_user` with a `question`, `options` and a `next` command.
+Some decisions belong to the user: a topic name that looks like a typo of an existing topic, a looser label, and actions such as installing or breaking a lock. Then rkb writes nothing, exits with code 3 and prints `status: needs_user` with a `question`, `options` and a `next` command.
 
 1. Show the question and the options to the user. Do not choose for them.
 2. Wait for their answer.
 3. Run `rkb confirm <request> --choice "<option they chose>"`. When it returns `needs_terminal`, tell the user to run the command in a separate terminal window (the `fix` line has it). You cannot answer the terminal prompt yourself, and Claude Code's `!` prefix has no terminal either, so do not suggest `! rkb confirm`.
-4. For a duplicate, prefer to extend the existing lesson with `rkb edit` over `add anyway`.
 
 A request expires after one hour. Run the original command again after that.
 
-For a lesson in a project that has no folder yet, run `rkb add` from inside that project's repository. The options then include `create projects/<p>/<topic> with remote <url>`, which records the remote so rkb recognizes the repository from then on.
+A write can also succeed with `notes`. Read them and tell the user:
+- `created the folder ...`: rkb made a new topic, project or system folder. Say so, in case the name is wrong.
+- `looks like <id> ...`: a similar lesson exists in the same topic. Offer to merge the two with `rkb show` and `rkb edit`; do not merge without the user.
+
+For a lesson in a project that has no folder yet, run `rkb add` from inside that project's repository: when the repository's remote ends in the project name, rkb records the remote in `projects/<p>/README.md` so it recognizes the repository from then on.
 
 Pass `--project <name>` or `--system <name>` when rkb matched the wrong place or none.
 

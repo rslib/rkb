@@ -1,0 +1,22 @@
+# Run with prek (https://github.com/j178/prek); install the git hook once with `prek install`.
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --check
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --quiet
+        language: system
+        pass_filenames: false
+        always_run: true

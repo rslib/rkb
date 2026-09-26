@@ -39,6 +39,30 @@ pub struct Written {
     pub title: String,
     pub commit: String,
     pub diff: String,
+    pub notes: Vec<Note>,
+}
+
+/// Something a write did or found that the user should hear about, without stopping the write.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Note {
+    /// A scope or topic folder the write created.
+    NewFolder(String),
+    /// A project folder note that records the current repository's remote.
+    ProjectNote { path: String, remote: String },
+    /// An existing lesson in the same topic that looks like the new one.
+    Similar { id: String, title: String, path: String },
+}
+
+impl Note {
+    pub fn message(&self) -> String {
+        match self {
+            Note::NewFolder(f) => format!("created the folder {f}"),
+            Note::ProjectNote { path, remote } => format!("wrote {path} with the remote {remote}"),
+            Note::Similar { id, title, path } => format!(
+                "looks like {id} \"{title}\" ({path}); merge them with `rkb show {id}` and `rkb edit {id} --base <hash>` if they say the same"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -194,6 +218,7 @@ pub(crate) struct Prepared {
     text: String,
     /// Other new files committed with the lesson, such as a created folder note.
     extra: Vec<(String, String)>,
+    pub(crate) notes: Vec<Note>,
 }
 
 /// Runs one write: prepare, check each decision point, validate, write, commit.
@@ -314,53 +339,50 @@ pub(crate) fn add(
         Decision::CreateProject { path, remotes, root_commit } if *path == folder => Some((remotes.clone(), root_commit.clone())),
         _ => None,
     });
-    let folder_ok =
-        ctx.root.join(&folder).is_dir() || approved.contains(&Decision::CreateFolder { path: folder.clone() }) || project_note.is_some();
-    if !folder_ok {
+    let exists = ctx.root.join(&folder).is_dir() || snap.files.keys().any(|k| k.starts_with(&format!("{folder}/")));
+    let decided = approved.iter().any(|d| matches!(d, Decision::CreateFolder { path } | Decision::UseTopic { path } if *path == folder));
+    let mut notes = vec![];
+    let mut project_note = project_note;
+    if !exists && project_note.is_none() {
+        let name = folder.rsplit('/').next().unwrap();
         let topics = topics_in(ctx.root, &scope);
-        let question = if ctx.root.join(&scope).is_dir() {
-            format!("Topic folder {folder} does not exist. Create it, or use an existing topic?")
-        } else {
-            format!("Folder {scope} does not exist yet. Create {folder} for this lesson?")
-        };
-        let mut choices = vec![];
+        let limit = (name.chars().count() / 4).max(1);
+        let close: Vec<&String> = topics.iter().filter(|t| *t != name && crate::text::edit_distance(name, t) <= limit).collect();
+        if !close.is_empty() && !decided {
+            let question = format!(
+                "Topic folder {folder} does not exist, and its name is close to an existing topic. Create it, or use the existing one?"
+            );
+            let mut choices =
+                vec![Choice { text: format!("create {folder}"), decision: Some(Decision::CreateFolder { path: folder.clone() }) }];
+            for t in closest(name, &topics) {
+                let path = format!("{scope}/{t}");
+                choices.push(Choice { text: format!("use {path}"), decision: Some(Decision::UseTopic { path }) });
+            }
+            return ask(action, approved, question, choices).map(Err);
+        }
         if let Some(repo) = new_project_repo(ctx, &scope)
             && let Some(first) = repo.remotes.first()
+            && first.rsplit('/').next() == scope.strip_prefix("projects/")
         {
             let root_commit = match repo.root_commits.as_slice() {
                 [one] => Some(one.clone()),
                 _ => None,
             };
-            choices.push(Choice {
-                text: format!("create {folder} with remote {first}"),
-                decision: Some(Decision::CreateProject { path: folder.clone(), remotes: repo.remotes.clone(), root_commit }),
-            });
+            project_note = Some((repo.remotes.clone(), root_commit));
         }
-        choices.push(Choice { text: format!("create {folder}"), decision: Some(Decision::CreateFolder { path: folder.clone() }) });
-        for t in closest(folder.rsplit('/').next().unwrap(), &topics) {
-            let path = format!("{scope}/{t}");
-            choices.push(Choice { text: format!("use {path}"), decision: Some(Decision::UseTopic { path }) });
-        }
-        return ask(action, approved, question, choices).map(Err);
+    }
+    if !exists {
+        notes.push(Note::NewFolder(folder.clone()));
     }
 
     let base_slug = slug(&title);
     let siblings: Vec<&Lesson> = lessons.iter().filter(|l| l.path.rsplit_once('/').map(|p| p.0) == Some(folder.as_str())).collect();
-    let matches: Vec<&&Lesson> = siblings
-        .iter()
-        .filter(|l| {
-            let stem = l.path.rsplit('/').next().unwrap().trim_end_matches(".md");
-            stem == base_slug || title_of(&l.body).is_some_and(|t| jaccard(&t, &title) >= SIMILAR_TITLE)
-        })
-        .collect();
-    if !matches.is_empty() && !approved.contains(&Decision::AddAnyway) {
-        let mut question = format!("\"{title}\" looks like an existing lesson in {folder}:");
-        for m in &matches {
-            question.push_str(&format!("\n- {} {} ({})", m.frontmatter.id, title_of(&m.body).unwrap_or_default(), m.path));
+    for l in siblings {
+        let stem = l.path.rsplit('/').next().unwrap().trim_end_matches(".md");
+        let other = title_of(&l.body).unwrap_or_default();
+        if stem == base_slug || jaccard(&other, &title) >= SIMILAR_TITLE {
+            notes.push(Note::Similar { id: l.frontmatter.id.clone(), title: other, path: l.path.clone() });
         }
-        question.push_str("\nTo extend one instead, run `rkb show <id>`, then `rkb edit <id> --base <hash>`.");
-        let choices = vec![Choice { text: "add anyway".into(), decision: Some(Decision::AddAnyway) }];
-        return ask(action, approved, question, choices).map(Err);
     }
     let mut path = format!("{folder}/{base_slug}.md");
     let mut n = 2;
@@ -376,10 +398,11 @@ pub(crate) fn add(
     if let Some((remotes, root_commit)) = project_note {
         let note = format!("{scope}/README.md");
         if !ctx.root.join(&note).exists() {
-            extra.push((note, project_note_text(&scope, &remotes, root_commit.as_deref())));
+            extra.push((note.clone(), project_note_text(&scope, &remotes, root_commit.as_deref())));
+            notes.push(Note::ProjectNote { path: note, remote: remotes.first().cloned().unwrap_or_default() });
         }
     }
-    Ok(Ok(Prepared { kind: "add", id, path, title, text: lesson::write(&fm, body_text), extra }))
+    Ok(Ok(Prepared { kind: "add", id, path, title, text: lesson::write(&fm, body_text), extra, notes }))
 }
 
 /// The current repository, when a new project folder is being made from inside an unmatched checkout.
@@ -486,7 +509,7 @@ fn edit(kb: &KbConfig, snap: &Snapshot, action: &Action, approved: &[Decision], 
         return Ok(Err(step));
     }
     let title = title_of(&new.body).unwrap_or_default();
-    Ok(Ok(Prepared { kind: "edit", id: id.to_string(), path: old.path.clone(), title, text: out, extra: vec![] }))
+    Ok(Ok(Prepared { kind: "edit", id: id.to_string(), path: old.path.clone(), title, text: out, extra: vec![], notes: vec![] }))
 }
 
 fn flag(snap: &Snapshot, id: &str, reason: &str) -> Result<Step> {
@@ -506,7 +529,7 @@ fn flag(snap: &Snapshot, id: &str, reason: &str) -> Result<Step> {
         return Ok(Err(Outcome::Unchanged { id: id.to_string(), path: old.path.clone() }));
     }
     let title = title_of(&old.body).unwrap_or_default();
-    Ok(Ok(Prepared { kind: "flag", id: id.to_string(), path: old.path.clone(), title, text: out, extra: vec![] }))
+    Ok(Ok(Prepared { kind: "flag", id: id.to_string(), path: old.path.clone(), title, text: out, extra: vec![], notes: vec![] }))
 }
 
 /// Puts the prepared files into `snap` and returns the lint errors that concern them.
@@ -548,7 +571,7 @@ pub(crate) fn finish(ctx: &Ctx, mut snap: Snapshot, p: Prepared) -> Result<Outco
     git::commit_paths(ctx.root, &message, &paths)?;
     let commit = String::from_utf8_lossy(&git::run(ctx.root, &["rev-parse", "--short", "HEAD"])?).trim().to_string();
     let diff = String::from_utf8_lossy(&git::run(ctx.root, &["show", "--format=", &commit])?).into_owned();
-    Ok(Outcome::Written(Written { kind: p.kind, id: p.id, path: p.path, title: p.title, commit, diff }))
+    Ok(Outcome::Written(Written { kind: p.kind, id: p.id, path: p.path, title: p.title, commit, diff, notes: p.notes }))
 }
 
 #[cfg(test)]

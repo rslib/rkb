@@ -79,7 +79,10 @@ pub fn outcome(env: &Env, o: Outcome) -> Output {
             } else {
                 w.diff.trim_end().to_string()
             };
-            let human = format!("{} {} [{}] in commit {}\n\n{diff}", paint(env.colored, "32", w.kind), w.path, w.id, w.commit);
+            let mut human = format!("{} {} [{}] in commit {}\n\n{diff}", paint(env.colored, "32", w.kind), w.path, w.id, w.commit);
+            for n in &w.notes {
+                human.push_str(&format!("\n{} {}", paint(env.colored, "33", "note:"), n.message()));
+            }
             let data = json!({
                 "status": "written",
                 "action": w.kind,
@@ -88,6 +91,7 @@ pub fn outcome(env: &Env, o: Outcome) -> Output {
                 "title": w.title,
                 "commit": w.commit,
                 "diff": diff.lines().collect::<Vec<_>>(),
+                "notes": w.notes.iter().map(|n| n.message()).collect::<Vec<_>>(),
                 "help": [format!("Run `rkb show {}` to read the lesson", w.id)],
             });
             Output { data, human, exit: 0, raw: false }

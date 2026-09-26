@@ -5,7 +5,7 @@ use crate::config::{self, KbConfig};
 use crate::error::{Error, Result, io};
 use crate::kb::Snapshot;
 use crate::request::{self, Action, Choice, Decision, ImportItem, Request};
-use crate::write::{self, Ctx, Imported, Outcome};
+use crate::write::{self, Ctx, Imported, Note, Outcome};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invalid {
@@ -96,30 +96,21 @@ pub fn plan(ctx: &Ctx, dir: &Path) -> Result<Plan> {
             similar: vec![],
             looser: None,
         };
-        // Each retry approves one more of three decision kinds, so the loop ends.
+        // Each retry approves one more decision of two kinds, so the loop ends.
         let prepared = loop {
             match write::add(ctx, &kb, &sim, &action, &item.approved, &text, &topic) {
                 Err(Error::Refused(m)) => break Err(vec![m]),
                 Err(e) => return Err(e),
                 Ok(Ok(p)) => break Ok(p),
                 Ok(Err(Outcome::NeedsUser(req))) => {
-                    let pick = req.choices.iter().filter_map(|c| c.decision.clone()).find(|d| {
-                        matches!(d, Decision::CreateFolder { .. } | Decision::AddAnyway | Decision::Loosen { .. })
-                            && !item.approved.contains(d)
-                    });
+                    // Only a likely typo in the topic name or a looser label still asks.
+                    let pick = req
+                        .choices
+                        .iter()
+                        .filter_map(|c| c.decision.clone())
+                        .find(|d| matches!(d, Decision::CreateFolder { .. } | Decision::Loosen { .. }) && !item.approved.contains(d));
                     match &pick {
-                        Some(Decision::CreateFolder { path }) => {
-                            if announced.insert(path.clone()) {
-                                item.new_folder = Some(path.clone());
-                            }
-                        }
-                        Some(Decision::AddAnyway) => {
-                            item.similar = req
-                                .question
-                                .lines()
-                                .filter_map(|l| l.strip_prefix("- ")?.split_whitespace().next().map(str::to_string))
-                                .collect();
-                        }
+                        Some(Decision::CreateFolder { .. }) => {}
                         Some(Decision::Loosen { key, value }) => item.looser = Some(format!("{key}={value}")),
                         _ => break Err(vec![format!("needs a decision an import cannot make: {}", req.question)]),
                     }
@@ -133,6 +124,13 @@ pub fn plan(ctx: &Ctx, dir: &Path) -> Result<Plan> {
             Ok(p) => {
                 let errors = write::stage(&mut sim, ctx.env, &p);
                 if errors.is_empty() {
+                    for n in &p.notes {
+                        match n {
+                            Note::NewFolder(f) if announced.insert(f.clone()) => item.new_folder = Some(f.clone()),
+                            Note::Similar { id, .. } => item.similar.push(id.clone()),
+                            _ => {}
+                        }
+                    }
                     item.path = p.path.clone();
                     item.title = p.title.clone();
                     items.push(item);

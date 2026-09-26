@@ -480,35 +480,26 @@ fn project_scope_and_alias_paths() {
     let v = add_ok(&env, "c++", &lesson_with("Avoid std::regex in hot loops").replace("tags:", "tags:\n  - regex"));
     assert!(v["path"].as_str().unwrap().starts_with("general/cpp/avoid-std-regex-in-hot-loops"));
     let proj = PITFALL.replace("verified_how: ran", "verified_how: ran\nwhen:\n  project: dftracer");
-    let (v, code) = env.json(&["add", "--topic", "cmake"], &proj);
-    assert_eq!(code, Some(3));
-    assert_eq!(v["options"][0], "create projects/dftracer/cmake");
-    assert!(v["question"].as_str().unwrap().contains("projects/dftracer does not exist"));
+    let v = add_ok(&env, "cmake", &proj);
+    assert!(v["path"].as_str().unwrap().starts_with("projects/dftracer/cmake/"), "{v}");
+    assert_eq!(v["notes"], serde_json::json!(["created the folder projects/dftracer/cmake"]));
+    assert!(!env.kb().join("projects/dftracer/README.md").exists(), "no note without a matching repository");
 }
 
 #[test]
-fn duplicates_need_user() {
+fn duplicates_get_a_note() {
     let env = kb_with_topics();
-    env.trust_claude();
     let first = add_ok(&env, "cpp", &lesson_with("Avoid std::regex in hot loops"));
-    let (v, code) = env.json(&["add", "--topic", "cpp"], &lesson_with("Avoid std regex in hot loops too"));
-    assert_eq!(code, Some(3));
-    assert!(v["question"].as_str().unwrap().contains(first["id"].as_str().unwrap()));
-    assert_eq!(v["options"], serde_json::json!(["add anyway", "cancel"]));
-    let req = v["request"].as_str().unwrap();
-    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
-    c.env("CLAUDECODE", "1");
-    let o = rkb_with(c, &["confirm", req, "--choice", "cancel", "--format", "json"], "");
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!(v["status"], "cancelled");
-
-    add_ok(&env, "cpp", &lesson_with("Link libstdc++ statically on old clusters"));
-    let (v, _) = env.json(&["add", "--topic", "cpp"], &lesson_with("Avoid std::regex in hot loops"));
-    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
-    c.env("CLAUDECODE", "1");
-    let o = rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", "add anyway", "--format", "json"], "");
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let id = first["id"].as_str().unwrap();
+    let v = add_ok(&env, "cpp", &lesson_with("Avoid std regex in hot loops too"));
+    let notes = v["notes"].as_array().unwrap();
+    assert!(notes.len() == 1 && notes[0].as_str().unwrap().contains(id) && notes[0].as_str().unwrap().contains("rkb edit"), "{v}");
+    let v = add_ok(&env, "cpp", &lesson_with("Link libstdc++ statically on old clusters"));
+    assert_eq!(v["notes"], serde_json::json!([]));
+    let v = add_ok(&env, "cpp", &lesson_with("Avoid std::regex in hot loops"));
     assert_eq!(v["path"], "general/cpp/avoid-std-regex-in-hot-loops-2.md");
+    let human = stdout(&env.rkb_in(&["add", "--topic", "cpp", "--format", "human"], &lesson_with("Avoid std::regex in hot loops")));
+    assert!(human.contains("note: looks like"), "{human}");
 }
 
 #[test]
@@ -721,12 +712,11 @@ fn full_write_flow() {
         serde_json::from_slice::<serde_json::Value>(&rkb_with(c, &all, "").stdout).unwrap()
     };
 
-    let (v, _) = env.json(&["add", "--topic", "cmake"], PITFALL);
-    assert_eq!(v["status"], "needs_user");
-    let v = trusted(&["confirm", v["request"].as_str().unwrap(), "--choice", "create general/cmake"]);
+    let v = add_ok(&env, "cmake", PITFALL);
+    assert_eq!(v["notes"], serde_json::json!(["created the folder general/cmake"]));
     let id = v["id"].as_str().unwrap().to_string();
 
-    let (v, _) = env.json(&["add", "--topic", "cmake"], &lesson_with("CMake cannot find HDF5 unless HDF5_ROOT is set again"));
+    let (v, _) = env.json(&["add", "--topic", "cmak"], &lesson_with("Something else about cmake builds"));
     let v = trusted(&["confirm", v["request"].as_str().unwrap(), "--choice", "cancel"]);
     assert_eq!(v["status"], "cancelled");
 
@@ -917,8 +907,8 @@ fn doctor_healthy_then_problems() {
     std::fs::remove_file(env.kb().join(".git/hooks/pre-commit")).unwrap();
     env.write("general/demo/a.md", FACT);
     env.git(&["config", "--unset", "receive.denyCurrentBranch"]);
-    let (v, _) = env.json(&["add", "--topic", "cmak"], PITFALL);
-    assert_eq!(v["status"], "needs_user");
+    let (v, _) = env.json(&["add", "--topic", "demp"], PITFALL);
+    assert_eq!(v["status"], "needs_user", "`demp` is a likely typo of `demo`: {v}");
     env.write(".git/rkb.lock", "otherhost 1 0");
     let o = env.rkb(&["doctor", "--format", "json"]);
     assert_eq!(o.status.code(), Some(1));
@@ -992,12 +982,11 @@ fn add_creates_a_project_with_its_remote() {
     c.current_dir(&repo);
     let v: serde_json::Value =
         serde_json::from_slice(&rkb_with(c, &["add", "--topic", "cmake", "--format", "json"], &lesson).stdout).unwrap();
-    let choice = "create projects/dftracer/cmake with remote github.com/llnl/dftracer";
-    assert_eq!(v["options"][0], choice, "{v}");
-    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
-    c.env("CLAUDECODE", "1");
-    let o = rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", choice, "--format", "json"], "");
-    assert_eq!(serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap()["status"], "written");
+    assert_eq!(v["status"], "written", "{v}");
+    assert!(
+        v["notes"].as_array().unwrap().iter().any(|n| n == "wrote projects/dftracer/README.md with the remote github.com/llnl/dftracer"),
+        "{v}"
+    );
     let note = std::fs::read_to_string(env.kb().join("projects/dftracer/README.md")).unwrap();
     assert!(note.starts_with("---\nremotes:\n  - github.com/llnl/dftracer\nroot_commit: "), "{note}");
     let files = stdout(&env.git(&["show", "--name-only", "--format=", "HEAD"]));
@@ -1006,6 +995,16 @@ fn add_creates_a_project_with_its_remote() {
         ["projects/dftracer/README.md", "projects/dftracer/cmake/cmake-cannot-find-hdf5-unless-hdf5-root-is-set.md"]
     );
     assert!(env.rkb(&["lint"]).status.success());
+
+    let other = Env::new();
+    other.init();
+    let repo = project_repo(&other, "git@github.com:someone/other-tool.git");
+    let mut c = other.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.current_dir(&repo);
+    let v: serde_json::Value =
+        serde_json::from_slice(&rkb_with(c, &["add", "--topic", "cmake", "--format", "json"], &lesson).stdout).unwrap();
+    assert_eq!(v["status"], "written", "{v}");
+    assert!(!other.kb().join("projects/dftracer/README.md").exists());
 }
 
 #[test]
@@ -1624,7 +1623,7 @@ fn import_without_duplicates_and_stop_on_change() {
     for (rel, title) in [
         ("cmake/a.md", "Toolchain files must be set before project"),
         ("cmake/b.md", "Generator expressions run at build time"),
-        ("cmake/c.md", "FetchContent downloads during configure"),
+        ("ninj/c.md", "Ninja rebuilds after a clock change"),
     ] {
         let p = dir2.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -1632,11 +1631,12 @@ fn import_without_duplicates_and_stop_on_change() {
     }
     let (report, _) = env.json(&["import", dir2.to_str().unwrap()], "");
     assert_eq!(report["options"], serde_json::json!(["import all", "cancel"]));
-    add_ok(&env, "cmake", &lesson_with("FetchContent downloads during configure"));
+    // `ninj` is new and far from every topic at report time; `ninja` created now makes it a likely typo.
+    add_ok(&env, "ninja", &lesson_with("Ninja needs a build.ninja file"));
     let (v, code) = confirm_on_tty(&env, report["request"].as_str().unwrap(), "import all");
     assert_eq!((v["status"].as_str(), code), (Some("stopped"), Some(1)), "{v}");
     assert_eq!(v["added"].as_array().unwrap().len(), 2);
-    assert_eq!(v["not_added"][0]["source"], "cmake/c.md");
+    assert_eq!(v["not_added"][0]["source"], "ninj/c.md");
     assert!(v["not_added"][0]["reason"].as_str().unwrap().contains("changed since the report"), "{v}");
 }
 
@@ -1700,4 +1700,15 @@ fn sync_through_a_bundle_file() {
 
     let o = env.rkb(&["sync", "--remote", "origin", "--bundle", bundle]);
     assert_eq!(o.status.code(), Some(2), "{}", stdout(&o));
+}
+
+#[test]
+fn import_adds_a_lesson_that_became_a_duplicate() {
+    let env = kb_with_topics();
+    let dir = import_dir(&env, &[("cmake/a.md", &lesson_with("Presets replace long cmake command lines"))]);
+    let (report, _) = env.json(&["import", dir.to_str().unwrap()], "");
+    add_ok(&env, "cmake", &lesson_with("Presets replace long cmake command lines"));
+    let (v, code) = confirm_on_tty(&env, report["request"].as_str().unwrap(), "import all");
+    assert_eq!((v["status"].as_str(), code), (Some("done"), Some(0)), "{v}");
+    assert_eq!(v["added"][0]["path"], "general/cmake/presets-replace-long-cmake-command-lines-2.md");
 }
