@@ -158,3 +158,35 @@ fn doctor_human(c: bool, checks: &[Check], failed: usize, warned: usize) -> Stri
     out.push_str(&format!("\n{failed} failed, {warned} warnings"));
     out
 }
+
+/// `rkb review`: one block per candidate with every reason and the use dates.
+pub fn review(candidates: &[rkb_core::review::Candidate], c: bool) -> Output {
+    if candidates.is_empty() {
+        return Output {
+            data: json!({ "candidates": [], "help": ["Nothing to review"] }),
+            human: "Nothing to review: no current lesson has a review reason.".into(),
+            exit: 0,
+            raw: false,
+        };
+    }
+    let mut human = String::new();
+    for k in candidates {
+        human.push_str(&format!("{}  {}\n  {}\n", paint(c, "1", &k.title), paint(c, "2", &k.id), paint(c, "2", &k.path)));
+        for r in &k.reasons {
+            let kind = serde_json::to_value(r.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+            human.push_str(&format!("  {} {}\n", paint(c, "33", &format!("{kind:<14}")), r.detail));
+        }
+        let used = format!(
+            "  last worked {}, last failed {}",
+            k.last_worked.as_deref().unwrap_or("never"),
+            k.last_failed.as_deref().unwrap_or("never")
+        );
+        human.push_str(&format!("{}\n\n", paint(c, "2", &used)));
+    }
+    human.push_str(&format!("{}\nArchive with: rkb archive <id> --reason \"<why>\"", plural(candidates.len(), "candidate")));
+    let data = json!({
+        "candidates": candidates,
+        "help": ["Show the candidates to the user; archive only the ones they agree to, with `rkb archive <id> --reason \"<why>\"`"],
+    });
+    Output { data, human, exit: 0, raw: false }
+}

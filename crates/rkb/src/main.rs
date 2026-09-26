@@ -161,6 +161,12 @@ enum Cmd {
         #[arg(long)]
         reason: String,
     },
+    /// List lessons that may no longer matter (retired place, unsupported versions, long stale, missing commit). Changes nothing.
+    #[command(after_help = "Example:\n  rkb review\n  rkb review systems/quartz")]
+    Review {
+        /// Only lessons under this folder.
+        folder: Option<String>,
+    },
     /// Mark a wrong lesson as replaced by another. Asks the user, because search then hides it.
     #[command(after_help = "Example:\n  rkb supersede 7f3a9c2b41 --by 0a1b2c3d4e --reason \"the flag is wrong on 1.14\"")]
     Supersede {
@@ -331,6 +337,11 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Add { topic, kind, template } => writes::add(&env, topic, kind, template),
         Cmd::Edit { id, base } => writes::edit(&env, id, base),
         Cmd::Flag { id, reason } => writes::flag(&env, id, reason),
+        Cmd::Review { folder } => {
+            kb::open(&root)?;
+            let c = rkb_core::review::review(&root, &env.state, folder.as_deref())?;
+            Ok(session::review(&c, colored))
+        }
         Cmd::Supersede { id, by, reason } => writes::lifecycle(&env, rkb_core::request::Action::Supersede { id, by, reason }),
         Cmd::Archive { target, reason } => writes::lifecycle(&env, rkb_core::request::Action::Archive { target, reason }),
         Cmd::Unarchive { id } => writes::lifecycle(&env, rkb_core::request::Action::Unarchive { id }),

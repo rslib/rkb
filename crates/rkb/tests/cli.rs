@@ -1778,3 +1778,66 @@ fn supersede_archive_unarchive() {
     assert!(lint.status.success(), "{}", stdout(&lint));
     assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
 }
+
+#[test]
+fn review_lists_candidates_with_reasons() {
+    let env = fixture_kb();
+    let (v, code) = env.json(&["review"], "");
+    assert_eq!((v["candidates"].clone(), code), (serde_json::json!([]), Some(0)), "{v}");
+    assert!(stdout(&env.rkb(&["review", "--format", "human"])).contains("Nothing to review"));
+
+    let note = std::fs::read_to_string(env.kb().join("systems/tuolumne/README.md")).unwrap();
+    env.write("systems/tuolumne/README.md", &note.replacen("---\n", "---\nretired: true\n", 1));
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write("kb.toml", &format!("{toml}\n[facts.hdf5]\noldest_supported = \"1.12\"\n"));
+    let with_when = |id: &str, title: &str, when: &str| fact(id, title, "x").replacen("verified:", &format!("when:\n{when}\nverified:"), 1);
+    env.write("general/cpp/old-hdf5.md", &with_when("0c1b2c3d4e", "Old HDF5 trick", "  hdf5: \"1.8:1.10.7\""));
+    env.write("general/cpp/open-hdf5.md", &with_when("0d1b2c3d4e", "Open HDF5 range", "  hdf5: \"1.10:\""));
+    env.write(
+        "projects/dftracer/cmake/pinned.md",
+        &with_when("0e1b2c3d4e", "Pinned to a commit", "  project: dftracer\n  since: 0123abcd"),
+    );
+    env.git(&["add", "-A"]);
+    assert!(env.git(&["commit", "-q", "-m", "setup"]).status.success());
+
+    let repo = project_repo(&env, "git@github.com:llnl/dftracer.git");
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.current_dir(&repo);
+    assert!(rkb_with(c, &["context"], "").status.success(), "records the checkout");
+
+    let old = (jiff::Zoned::now() - jiff::SignedDuration::from_hours(24 * 120)).strftime("%Y-%m-%dT12:00:00").to_string();
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("GIT_COMMITTER_DATE", &old).env("GIT_AUTHOR_DATE", &old);
+    assert!(rkb_with(c, &["flag", "5d2e8a1c90", "--reason", "unsure"], "").status.success());
+    let before = stdout(&env.git(&["rev-parse", "HEAD"]));
+
+    let (v, code) = env.json(&["review"], "");
+    assert_eq!(code, Some(0), "{v}");
+    let by_id = |id: &str| v["candidates"].as_array().unwrap().iter().find(|c| c["id"] == id).cloned();
+    let reasons = |id: &str| -> Vec<(String, String)> {
+        by_id(id).unwrap_or_else(|| panic!("{id} missing: {v}"))["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["kind"].as_str().unwrap().to_string(), r["detail"].as_str().unwrap().to_string()))
+            .collect()
+    };
+    assert_eq!(reasons("c04e11a9f3"), [("retired".to_string(), "systems/tuolumne".to_string())]);
+    assert_eq!(reasons("0c1b2c3d4e"), [("unsupported".to_string(), "hdf5 1.8:1.10.7 < 1.12".to_string())]);
+    assert!(by_id("0d1b2c3d4e").is_none() && by_id("7f3a9c2b41").is_none(), "open and current ranges are fine: {v}");
+    let stale = reasons("5d2e8a1c90");
+    assert!(stale[0].0 == "long_stale" && stale[0].1.starts_with("stale 12"), "{stale:?}");
+    assert_eq!(reasons("0e1b2c3d4e"), [("missing_commit".to_string(), "since 0123abcd".to_string())]);
+    assert!(by_id("c04e11a9f3").unwrap()["last_worked"].is_null());
+
+    let (v, _) = env.json(&["review", "systems"], "");
+    assert_eq!(v["candidates"].as_array().unwrap().len(), 1);
+    let (v, code) = env.json(&["review", "nowhere"], "");
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("not_found"), Some(1)));
+    assert_eq!(stdout(&env.git(&["rev-parse", "HEAD"])), before);
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
+    assert!(
+        !env.dir.path().join("state/rkb/requests").exists()
+            || std::fs::read_dir(env.dir.path().join("state/rkb/requests")).unwrap().next().is_none()
+    );
+}

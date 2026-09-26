@@ -131,6 +131,11 @@ impl Range {
         }
     }
 
+    /// Whether every version in the range is older than `v`: the upper bound is below it and not a prefix of it.
+    pub fn older_than(&self, v: &Version) -> bool {
+        self.hi.as_ref().is_some_and(|hi| hi < v && !hi.is_prefix_of(v))
+    }
+
     pub fn contains(&self, v: &Version) -> bool {
         let above_lo = self.lo.as_ref().is_none_or(|lo| v >= lo || lo.is_prefix_of(v));
         let below_hi = self.hi.as_ref().is_none_or(|hi| v <= hi || hi.is_prefix_of(v));
@@ -419,6 +424,17 @@ pub fn evaluate(when: &Mapping, facts: &Facts) -> Applies {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_older_than() {
+        let v = |t: &str| Version::parse(t).unwrap();
+        let r = |t: &str| Range::parse(t).unwrap();
+        assert!(r("1.8:1.10.7").older_than(&v("1.12")));
+        assert!(r("1.10").older_than(&v("1.12")));
+        assert!(!r("1.12").older_than(&v("1.12.1")), "1.12 is a prefix of 1.12.1");
+        assert!(!r("1.10:").older_than(&v("1.12")));
+        assert!(!r("1.8:1.14").older_than(&v("1.12")));
+    }
 
     fn v(s: &str) -> Version {
         Version::parse(s).unwrap_or_else(|| panic!("{s}"))

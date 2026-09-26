@@ -199,6 +199,13 @@ pub fn current(root: &Path, snap: &Snapshot, repo: Option<Repo>, hints: &Hints, 
 
 /// Adds the repository's top-level path to `project` in `checkouts.toml` once.
 /// Returns whether the file changed.
+/// The recorded checkout paths of `project` on this machine, in the order they were recorded.
+pub fn checkouts(state: &Path, project: &str) -> Vec<std::path::PathBuf> {
+    let table: toml::Table =
+        std::fs::read_to_string(state.join("checkouts.toml")).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default();
+    table.get(project).and_then(|v| v.as_array()).into_iter().flatten().filter_map(|v| v.as_str()).map(std::path::PathBuf::from).collect()
+}
+
 pub fn record_checkout(state: &Path, project: &str, top: &Path) -> Result<bool> {
     let path = state.join("checkouts.toml");
     let mut table: toml::Table = std::fs::read_to_string(&path).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default();
@@ -219,6 +226,15 @@ pub fn record_checkout(state: &Path, project: &str, top: &Path) -> Result<bool> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkouts_are_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        record_checkout(dir.path(), "dftracer", Path::new("/a")).unwrap();
+        record_checkout(dir.path(), "dftracer", Path::new("/b")).unwrap();
+        assert_eq!(checkouts(dir.path(), "dftracer"), [std::path::PathBuf::from("/a"), std::path::PathBuf::from("/b")]);
+        assert!(checkouts(dir.path(), "other").is_empty());
+    }
 
     fn norm(url: &str) -> String {
         normalize(url, &mut |h: &str| (h == "gh").then(|| "github.com".to_string()))

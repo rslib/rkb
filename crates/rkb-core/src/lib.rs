@@ -21,6 +21,7 @@ pub mod lock;
 pub mod matching;
 pub mod paths;
 pub mod request;
+pub mod review;
 pub mod search;
 pub mod state;
 pub mod sync;
