@@ -54,6 +54,12 @@ pub enum Action {
         system: String,
         then_verify: bool,
     },
+    /// Approve the fact command `[facts.<key>]` of `kb.toml` on this system.
+    ApproveFact {
+        key: String,
+        sha256: String,
+        system: String,
+    },
     BreakLock {
         path: String,
         holder: String,

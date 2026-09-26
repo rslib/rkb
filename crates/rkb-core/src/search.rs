@@ -35,6 +35,95 @@ pub struct Options {
     /// Show superseded and archived lessons too.
     pub every_status: bool,
     pub limit: usize,
+    /// Whether approved `Probe` scripts of the top results may run, or only their cached results count.
+    pub probes: ProbeMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProbeMode {
+    #[default]
+    Off,
+    /// Use cached probe results only, as hooks do.
+    Cached,
+    /// Run approved probes that have no fresh cached result, within `probe.budget_s`.
+    Run,
+}
+
+pub const PROBE_TOP: usize = 10;
+pub const DEFAULT_PROBE_BUDGET_S: i64 = 5;
+
+/// Probe results by lesson id for `lessons`, from the cache and, with `ProbeMode::Run`, by running them in parallel.
+fn probe_results(root: &Path, place: &Place, lessons: &[&Lesson], mode: ProbeMode) -> HashMap<String, crate::script::Result> {
+    use crate::script::{self, Kind};
+    let mut out = HashMap::new();
+    if mode == ProbeMode::Off {
+        return out;
+    }
+    let system = crate::approval::system_key(place);
+    let config_dir = crate::paths::config_dir();
+    let ttl = crate::facts::ttl(root);
+    let mut to_run = vec![];
+    for l in lessons {
+        let Some(text) = script::of(l, Kind::Probe) else { continue };
+        let sha = script::hash(&text);
+        if !crate::approval::is_approved(&config_dir, &sha, &system) {
+            continue;
+        }
+        let key = crate::facts::cache_key(&sha, &system);
+        match crate::facts::get(&key, ttl) {
+            Some(Some(v)) if v == "pass" => {
+                out.insert(l.frontmatter.id.clone(), script::Result::Pass);
+            }
+            Some(Some(v)) if v == "fail" => {
+                out.insert(l.frontmatter.id.clone(), script::Result::Fail);
+            }
+            Some(_) => {}
+            None if mode == ProbeMode::Run => to_run.push((l, text, key)),
+            None => {}
+        }
+    }
+    if to_run.is_empty() {
+        return out;
+    }
+    let kb: crate::config::KbConfig =
+        std::fs::read_to_string(root.join("kb.toml")).ok().and_then(|t| crate::config::parse(&t).ok()).unwrap_or_default();
+    let budget = kb.probe.as_ref().and_then(|t| t.get("budget_s")).and_then(|v| v.as_integer()).unwrap_or(DEFAULT_PROBE_BUDGET_S);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(budget.max(1) as u64);
+    let state = crate::paths::state_dir();
+    let ran: Vec<(String, script::Run)> = std::thread::scope(|s| {
+        let handles: Vec<_> = to_run
+            .iter()
+            .map(|(l, text, key)| {
+                let state = &state;
+                s.spawn(move || {
+                    let project_root = l
+                        .path
+                        .strip_prefix("projects/")
+                        .and_then(|p| p.split('/').next())
+                        .and_then(|p| crate::matching::checkouts(state, p).into_iter().find(|c| c.is_dir()));
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    let run = script::run(text, project_root.as_deref(), left);
+                    // A run cut off by the budget says nothing about the lesson, so it is not cached.
+                    if run.code.is_some() {
+                        let value = match run.result {
+                            script::Result::Pass => Some("pass"),
+                            script::Result::Fail => Some("fail"),
+                            script::Result::Unknown => None,
+                        };
+                        crate::facts::put(key, value);
+                    }
+                    (l.frontmatter.id.clone(), run)
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    for (id, run) in ran {
+        if run.result != script::Result::Unknown {
+            out.insert(id, run.result);
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -312,17 +401,35 @@ pub fn search(root: &Path, place: &Place, facts: &Facts, mode: &Mode, opts: &Opt
     };
 
     let by_id: HashMap<&str, &&Lesson> = lessons.iter().map(|l| (l.frontmatter.id.as_str(), l)).collect();
+    let evaluated: Vec<(Hit, crate::conditions::Applies)> = ordered
+        .into_iter()
+        .map(|h| {
+            let a = evaluate(&by_id[h.id.as_str()].frontmatter.when, facts);
+            (h, a)
+        })
+        .collect();
+    let top: Vec<&Lesson> =
+        evaluated.iter().filter(|(_, a)| a.result != Verdict::No).take(PROBE_TOP).map(|(h, _)| *by_id[h.id.as_str()]).collect();
+    let probes = probe_results(root, place, &top, opts.probes);
+
     let mut out = Results::default();
-    for mut h in ordered {
+    for (mut h, applies) in evaluated {
         if out.hits.len() >= opts.limit {
             break;
         }
-        let applies = evaluate(&by_id[h.id.as_str()].frontmatter.when, facts);
-        h.applies = applies.result;
-        if applies.result == Verdict::No && !opts.all {
+        let mut no_keys: Vec<String> = applies.keys.iter().filter(|k| k.result == Verdict::No).map(|k| k.key.clone()).collect();
+        h.applies = match probes.get(&h.id) {
+            Some(crate::script::Result::Pass) => Verdict::Yes,
+            Some(crate::script::Result::Fail) => {
+                no_keys = vec!["probe".to_string()];
+                Verdict::No
+            }
+            _ => applies.result,
+        };
+        if h.applies == Verdict::No && !opts.all {
             out.hidden += 1;
-            for k in applies.keys.iter().filter(|k| k.result == Verdict::No) {
-                *out.hidden_by.entry(k.key.clone()).or_default() += 1;
+            for k in no_keys {
+                *out.hidden_by.entry(k).or_default() += 1;
             }
             continue;
         }
@@ -412,7 +519,7 @@ mod tests {
     }
 
     fn opts() -> Options {
-        Options { all: false, every_status: false, limit: 10 }
+        Options { all: false, every_status: false, limit: 10, probes: ProbeMode::Off }
     }
 
     fn ids(r: &Results) -> Vec<&str> {

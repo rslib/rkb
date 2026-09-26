@@ -192,6 +192,8 @@ h5cc -showconfig | grep -q "HDF5 Version: 1.14"
 - No script runs until the user approves its exact text on this machine. `rkb approve <id> check` and `rkb verify <id>` return `needs_user` with the whole script; show it to the user. Any edit to the script needs a new approval.
 - `rkb verify <id>` runs the approved `Check`: a fail makes the lesson `stale`, a pass on a stale lesson makes it `active`, and a pass marks it `verified_how: checked`. Never write `verified_how: checked` yourself; lint refuses it.
 - `rkb verify --auto` runs every approved check without asking, for cron.
+- A `Probe` tells search whether the lesson applies here. When it is approved, search runs it for the top results: a fail hides the lesson (`hidden: ... (applies=no: probe)`), a pass marks it `applies: yes`.
+- A fact command in `kb.toml` gives a `when` key its value on this machine, for example `[facts.hdf5] cmd = "h5cc -showconfig | sed -n 's/.*HDF5 Version: //p'"`. It must print one line and exit 0. It runs only after `rkb approve facts.hdf5`, which returns `needs_user` with the command; results are cached for a day per system and loaded modules.
 
 ## Writing style
 

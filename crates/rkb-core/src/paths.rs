@@ -13,6 +13,11 @@ pub fn state_dir() -> PathBuf {
     xdg(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"), ".local/state")
 }
 
+/// Deletable caches such as fact results. Never synced.
+pub fn cache_dir() -> PathBuf {
+    xdg(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"), ".cache")
+}
+
 /// Per-machine config such as `trust.toml`. Never synced.
 pub fn config_dir() -> PathBuf {
     xdg(std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME"), ".config")

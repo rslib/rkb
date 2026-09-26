@@ -202,11 +202,13 @@ enum Cmd {
         slug: String,
     },
     /// Approve a lesson's Check or Probe script to run on this machine. Asks the user and shows the whole script.
-    #[command(after_help = "Example:\n  rkb approve 7f3a9c2b41 check")]
+    #[command(after_help = "Example:\n  rkb approve 7f3a9c2b41 check\n  rkb approve facts.hdf5")]
     Approve {
+        /// A lesson id, or `facts.<key>` for a fact command in kb.toml.
         id: String,
+        /// For a lesson: check or probe.
         #[arg(value_parser = ["check", "probe"])]
-        kind: String,
+        kind: Option<String>,
     },
     /// Run a lesson's approved Check and update its status: a fail makes it stale, a pass makes it checked.
     #[command(after_help = "Example:\n  rkb verify 7f3a9c2b41\n  rkb verify --auto")]
@@ -351,8 +353,9 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
                 (Some(q), _, _) => rkb_core::search::Mode::Ranked(q),
                 _ => unreachable!("clap requires one"),
             };
+            rkb_core::facts::refresh(&root, &env.place.clone().unwrap_or_default());
             let facts = rkb_core::conditions::Facts::gather(&root, &env.place.clone().unwrap_or_default(), with);
-            let opts = rkb_core::search::Options { all, every_status: status.is_some(), limit };
+            let opts = rkb_core::search::Options { all, every_status: status.is_some(), limit, probes: rkb_core::search::ProbeMode::Run };
             searching::search(&env, &facts, mode, opts)
         }
         Cmd::Find { words, limit } => {
@@ -389,10 +392,24 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Rename { id, slug } => writes::lifecycle(&env, rkb_core::request::Action::Rename { id, slug }),
         Cmd::Approve { id, kind } => {
             kb::open(&root)?;
-            let kind = rkb_core::script::Kind::parse(&kind).expect("clap checks the kind");
-            let o = match rkb_core::verify::approve_request(&env.ctx(), &id, kind, false)? {
-                Some(req) => rkb_core::write::Outcome::NeedsUser(req),
-                None => rkb_core::write::Outcome::Info(format!("The {} script of {id} is already approved here", kind.name())),
+            let o = if let Some(key) = id.strip_prefix("facts.") {
+                match rkb_core::verify::approve_fact_request(&env.ctx(), key)? {
+                    Some(req) => rkb_core::write::Outcome::NeedsUser(req),
+                    None => rkb_core::write::Outcome::Info(format!("The fact command {id} is already approved here")),
+                }
+            } else {
+                let kind = kind.ok_or_else(|| {
+                    CliError::new(
+                        output::ErrorCode::Usage,
+                        "rkb approve needs check or probe for a lesson",
+                        "run `rkb approve <id> check`, or `rkb approve facts.<key>`",
+                    )
+                })?;
+                let kind = rkb_core::script::Kind::parse(&kind).expect("clap checks the kind");
+                match rkb_core::verify::approve_request(&env.ctx(), &id, kind, false)? {
+                    Some(req) => rkb_core::write::Outcome::NeedsUser(req),
+                    None => rkb_core::write::Outcome::Info(format!("The {} script of {id} is already approved here", kind.name())),
+                }
             };
             Ok(writes::outcome(&env, o))
         }
@@ -473,6 +490,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             let uses =
                 format!("hash {hash}  worked {}  failed {}", worked.as_deref().unwrap_or("never"), failed.as_deref().unwrap_or("never"));
             let place = env.place.clone().unwrap_or_default();
+            rkb_core::facts::refresh(&root, &place);
             let facts = rkb_core::conditions::Facts::gather(&root, &place, with);
             let applies = rkb_core::conditions::evaluate(&fm.when, &facts);
             let applies_color = match applies.result {

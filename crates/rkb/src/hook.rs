@@ -127,7 +127,7 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
     let query = hooks::error_query(command, error);
     let place = state::locate(&root, &cwd(p), &Hints::default(), state)?;
     let facts = Facts::gather(&root, &place, &[]);
-    let opts = Options { all: false, every_status: false, limit: 1 };
+    let opts = Options { all: false, every_status: false, limit: 1, probes: rkb_core::search::ProbeMode::Cached };
     let Some(hit) = search::search(&root, &place, &facts, &Mode::Ranked(query.clone()), &opts)?.hits.into_iter().next() else {
         return Ok(None);
     };

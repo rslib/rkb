@@ -84,7 +84,13 @@ pub fn run(root: &Path, queries: &[Query]) -> Result<Report> {
             QueryMode::Search => Mode::Ranked(q.text.clone()),
             QueryMode::Literal => Mode::Literal(q.text.clone()),
         };
-        let res = search(root, &place, &facts, &mode, &Options { all: false, every_status: false, limit: DEPTH })?;
+        let res = search(
+            root,
+            &place,
+            &facts,
+            &mode,
+            &Options { all: false, every_status: false, limit: DEPTH, probes: crate::search::ProbeMode::Off },
+        )?;
         let rank = res.hits.iter().position(|h| q.expect.contains(&h.id)).map(|i| i + 1);
         rows.push(Row { text: q.text.clone(), rank });
     }

@@ -84,7 +84,19 @@ pub fn hash(text: &str) -> String {
 /// Runs the script with `bash -l` in a new temporary folder and maps its exit: 0 pass, 1 fail, anything else unknown.
 /// On a timeout the whole process group is killed.
 pub fn run(text: &str, project_root: Option<&Path>, timeout: Duration) -> Run {
-    let unknown = Run { result: Result::Unknown, code: None };
+    run_capture_inner(text, project_root, timeout, false).0
+}
+
+/// Most output a fact command may hand back; the rest is cut.
+pub const MAX_OUTPUT: usize = 4096;
+
+/// As `run`, and also hands back the script's standard output, cut to `MAX_OUTPUT` bytes.
+pub fn run_capture(text: &str, project_root: Option<&Path>, timeout: Duration) -> (Run, String) {
+    run_capture_inner(text, project_root, timeout, true)
+}
+
+fn run_capture_inner(text: &str, project_root: Option<&Path>, timeout: Duration, capture: bool) -> (Run, String) {
+    let unknown = (Run { result: Result::Unknown, code: None }, String::new());
     let mut id = [0u8; 6];
     if getrandom::fill(&mut id).is_err() {
         return unknown;
@@ -93,18 +105,20 @@ pub fn run(text: &str, project_root: Option<&Path>, timeout: Duration) -> Run {
     if std::fs::create_dir(&dir).is_err() {
         return unknown;
     }
-    let out = run_in(&dir, text, project_root, timeout);
+    let out = run_in(&dir, text, project_root, timeout, capture);
     let _ = std::fs::remove_dir_all(&dir);
     out.unwrap_or(unknown)
 }
 
-fn run_in(dir: &Path, text: &str, project_root: Option<&Path>, timeout: Duration) -> Option<Run> {
+fn run_in(dir: &Path, text: &str, project_root: Option<&Path>, timeout: Duration, capture: bool) -> Option<(Run, String)> {
     use std::os::unix::process::CommandExt;
     let file = dir.join("script.sh");
     // Options go in the file, not on the command line, so `-e` never applies to the login profile.
     std::fs::File::create(&file).ok()?.write_all(format!("set -eo pipefail\n{text}").as_bytes()).ok()?;
     let mut cmd = Command::new("bash");
-    cmd.arg("-l").arg(&file).current_dir(dir).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0);
+    let out_file = dir.join(".rkb-stdout");
+    let stdout = if capture { Stdio::from(std::fs::File::create(&out_file).ok()?) } else { Stdio::null() };
+    cmd.arg("-l").arg(&file).current_dir(dir).stdin(Stdio::null()).stdout(stdout).stderr(Stdio::null()).process_group(0);
     match project_root {
         Some(p) => cmd.env("PROJECT_ROOT", p),
         None => cmd.env_remove("PROJECT_ROOT"),
@@ -119,7 +133,13 @@ fn run_in(dir: &Path, text: &str, project_root: Option<&Path>, timeout: Duration
                 Some(1) => Result::Fail,
                 _ => Result::Unknown,
             };
-            return Some(Run { result, code });
+            let mut output = String::new();
+            if capture {
+                let mut bytes = std::fs::read(&out_file).unwrap_or_default();
+                bytes.truncate(MAX_OUTPUT);
+                output = String::from_utf8_lossy(&bytes).into_owned();
+            }
+            return Some((Run { result, code }, output));
         }
         if start.elapsed() >= timeout {
             let _ = Command::new("kill").arg("-KILL").arg(format!("-{}", child.id())).stderr(Stdio::null()).status();
@@ -162,6 +182,15 @@ mod tests {
         assert_eq!(run("false | true\n", None, t).result, Result::Fail, "pipefail is on");
         assert_eq!(run("test \"$PROJECT_ROOT\" = /somewhere\n", Some(Path::new("/somewhere")), t).result, Result::Pass);
         assert_eq!(run("test -f script.sh\n", None, t).result, Result::Pass, "runs in its own folder");
+    }
+
+    #[test]
+    fn captures_output() {
+        let t = Duration::from_secs(20);
+        let (r, out) = run_capture("echo 1.14.3\n", None, t);
+        assert_eq!((r.result, out.as_str()), (Result::Pass, "1.14.3\n"));
+        let (_, big) = run_capture("head -c 10000 /dev/zero | tr '\\0' x\n", None, t);
+        assert_eq!(big.len(), MAX_OUTPUT);
     }
 
     #[test]

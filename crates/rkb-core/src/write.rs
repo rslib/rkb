@@ -250,7 +250,7 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
         Action::Unarchive { id } => unarchive(&snap, id)?,
         Action::Move { id, folder } => return saved(ctx, relocate(ctx, snap, action, approved, id, Some(folder), None)?),
         Action::Rename { id, slug } => return saved(ctx, relocate(ctx, snap, action, approved, id, None, Some(slug))?),
-        Action::BreakLock { .. } | Action::Install { .. } | Action::Import { .. } | Action::Approve { .. } => {
+        Action::BreakLock { .. } | Action::Install { .. } | Action::Import { .. } | Action::Approve { .. } | Action::ApproveFact { .. } => {
             unreachable!("confirm handles these itself")
         }
     };
@@ -284,6 +284,9 @@ pub fn confirm(ctx: &Ctx, req: &Request, choice: &str) -> Result<Outcome> {
     };
     request::remove(&ctx.state.join("requests"), &req.id);
     let Some(decision) = &c.decision else { return Ok(Outcome::Cancelled) };
+    if let Action::ApproveFact { key, sha256, system } = &req.action {
+        return crate::verify::approve_fact(ctx, key, sha256, system);
+    }
     if let Action::Approve { id, script, sha256, system, then_verify } = &req.action {
         return crate::verify::approve(ctx, id, *script, sha256, system, *then_verify);
     }

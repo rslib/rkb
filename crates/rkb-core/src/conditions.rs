@@ -262,7 +262,8 @@ pub struct Facts {
 impl Facts {
     /// Collects the facts of `place`: `--with` pairs first, then built-ins, then the system note's `facts`.
     pub fn gather(root: &Path, place: &crate::matching::Place, with: &[(String, String)]) -> Facts {
-        let mut values = BTreeMap::new();
+        // Lowest priority first: fact commands, then the system note, the built-ins and `--with`.
+        let mut values: BTreeMap<String, String> = crate::facts::cached(root, place).into_iter().collect();
         if let Some(s) = &place.system {
             let note = std::fs::read_to_string(root.join("systems").join(&s.name).join("README.md")).unwrap_or_default();
             if let Ok(n) = crate::config::parse_note::<crate::config::SystemNote>(&note) {

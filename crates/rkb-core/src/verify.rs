@@ -76,6 +76,57 @@ pub fn approve_request(ctx: &Ctx, id: &str, kind: Kind, then_verify: bool) -> Re
     Ok(Some(req))
 }
 
+fn fact_command(ctx: &Ctx, key: &str) -> Result<String> {
+    crate::facts::commands(ctx.root)
+        .into_iter()
+        .find_map(|(k, t)| (k == key).then_some(t))
+        .ok_or_else(|| Error::Refused(format!("kb.toml has no `cmd` under [facts.{key}]")))
+}
+
+/// The request to approve a fact command here, or `None` when that exact command is already approved.
+pub fn approve_fact_request(ctx: &Ctx, key: &str) -> Result<Option<Request>> {
+    let text = fact_command(ctx, key)?;
+    let sha = script::hash(&text);
+    let system = approval::system_key(&place(ctx));
+    if approval::is_approved(&crate::paths::config_dir(), &sha, &system) {
+        return Ok(None);
+    }
+    let question = format!(
+        "Approve the fact command facts.{key} on {system}? rkb runs it with `bash -l` when it needs the fact, at most once per cache period:\n```bash\n{text}```\nsha256 {sha}"
+    );
+    let req = Request {
+        id: request::new_id(),
+        created: request::now(),
+        action: Action::ApproveFact { key: key.to_string(), sha256: sha, system },
+        approved: vec![],
+        question,
+        choices: vec![
+            Choice { text: format!("approve facts.{key}"), decision: Some(Decision::Approve) },
+            Choice { text: "cancel".into(), decision: None },
+        ],
+    };
+    request::save(&ctx.state.join("requests"), &req)?;
+    Ok(Some(req))
+}
+
+/// Records a confirmed fact command approval, when `kb.toml` still has the command the request showed.
+pub fn approve_fact(ctx: &Ctx, key: &str, sha256: &str, system: &str) -> Result<Outcome> {
+    if script::hash(&fact_command(ctx, key)?) != sha256 {
+        return Err(Error::Refused(format!("the command of facts.{key} changed since the request; run `rkb approve facts.{key}` again")));
+    }
+    approval::add(
+        &crate::paths::config_dir(),
+        Approval {
+            sha256: sha256.into(),
+            system: system.into(),
+            lesson: format!("facts.{key}"),
+            kind: "fact".into(),
+            date: ctx.today.to_string(),
+        },
+    )?;
+    Ok(Outcome::Info(format!("Approved the fact command facts.{key} on {system}")))
+}
+
 /// Records a confirmed approval, when the script is still the one the request showed; then runs the check if asked.
 pub fn approve(ctx: &Ctx, id: &str, kind: Kind, sha256: &str, system: &str, then_verify: bool) -> Result<Outcome> {
     let snap = Snapshot::from_dir(ctx.root)?;
@@ -147,6 +198,7 @@ pub fn one(ctx: &Ctx, id: &str, auto: bool) -> Result<(CheckStatus, Outcome)> {
     let text = script::of(l, Kind::Check)
         .ok_or_else(|| Error::Refused(format!("lesson {id} has no Check script: one fenced sh or bash block under `## Check`")))?;
     let here = place(ctx);
+    crate::facts::refresh(ctx.root, &here);
     let applies = evaluate(&l.frontmatter.when, &Facts::gather(ctx.root, &here, &[]));
     if applies.result == Verdict::No {
         return Ok((CheckStatus::Skipped, Outcome::Info(format!("Skipped {id}: it does not apply here ({})", applies.summary()))));

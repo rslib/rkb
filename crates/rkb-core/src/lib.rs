@@ -8,6 +8,7 @@ pub mod config;
 pub mod doctor;
 pub mod error;
 pub mod eval;
+pub mod facts;
 pub mod git;
 pub mod hooks;
 pub mod import;

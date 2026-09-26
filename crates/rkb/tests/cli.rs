@@ -2016,3 +2016,108 @@ fn approve_and_verify_checks() {
         "--auto never asks"
     );
 }
+
+fn with_when(title: &str, when: &str) -> String {
+    lesson_with(title).replacen("verified_how:", &format!("when:\n{when}\nverified_how:"), 1)
+}
+
+fn with_probe(title: &str, when: Option<&str>, script: &str) -> String {
+    let base = match when {
+        Some(w) => with_when(title, w),
+        None => lesson_with(title),
+    };
+    format!("{}\n## Probe\n```bash\n{script}\n```\n", base.trim_end())
+}
+
+fn search_ids(v: &serde_json::Value) -> Vec<String> {
+    v["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn fact_commands_decide_applies_and_are_cached() {
+    let env = kb_with_topics();
+    let count = env.dir.path().join("fact-runs");
+    let old = add_ok(&env, "cmake", &with_when("Old HDF5 API trick", "  hdf5: \":1.12\""));
+    let old_id = old["id"].as_str().unwrap().to_string();
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write("kb.toml", &format!("{toml}\n[facts.hdf5]\ncmd = \"echo run >> \\\"$RKB_TEST_COUNT\\\"; echo 1.14.3\"\n"));
+    let search = |extra: &[(&str, &str)]| {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.env("RKB_TEST_COUNT", &count);
+        for (k, v) in extra {
+            c.env(k, v);
+        }
+        let o = rkb_with(c, &["search", "Old HDF5 API trick", "--format", "json"], "");
+        serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)))
+    };
+    let runs = || std::fs::read_to_string(&count).map(|t| t.lines().count()).unwrap_or(0);
+
+    let v = search(&[]);
+    assert_eq!(search_ids(&v), std::slice::from_ref(&old_id), "unapproved: the key stays unknown: {v}");
+    assert_eq!(v["results"][0]["applies"], "unknown");
+    assert_eq!(runs(), 0, "an unapproved command never runs");
+
+    let (v, code) = env.json(&["approve", "facts.hdf5"], "");
+    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{v}");
+    assert!(v["question"].as_str().unwrap().contains("echo 1.14.3"));
+    let (c, _) = confirm_on_tty(&env, v["request"].as_str().unwrap(), "approve facts.hdf5");
+    assert_eq!(c["status"], "done", "{c}");
+
+    let v = search(&[]);
+    assert!(search_ids(&v).is_empty(), "{v}");
+    assert_eq!((v["hidden"].as_u64(), v["hidden_by"]["hdf5"].as_u64()), (Some(1), Some(1)), "{v}");
+    assert_eq!(runs(), 1);
+    search(&[]);
+    assert_eq!(runs(), 1, "cache hit");
+    search(&[("LOADEDMODULES", "hdf5/1.14")]);
+    assert_eq!(runs(), 2, "other modules, other cache entry");
+    let hook_before = runs();
+    let payload = serde_json::json!({ "session_id": "f1", "cwd": env.kb(), "tool_name": "Bash", "tool_input": { "command": "h5cc x" }, "error": "Exit code 1\nerror: Old HDF5 API trick\n" });
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_TEST_COUNT", &count).env("LOADEDMODULES", "brand/new");
+    rkb_with(c, &["hook", "tool-failed"], &payload.to_string());
+    assert_eq!(runs(), hook_before, "hooks never run fact commands");
+}
+
+#[test]
+fn probes_decide_applies_in_search() {
+    let env = kb_with_topics();
+    let marker = env.dir.path().join("probe-ran");
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write("kb.toml", &format!("{toml}\n[probe]\nbudget_s = 2\n"));
+    let fail = add_ok(&env, "cmake", &with_probe("Probe demo alpha", None, "exit 1"));
+    let pass = add_ok(&env, "cmake", &with_probe("Probe demo beta", Some("  gpu: a100"), "exit 0"));
+    let slow = add_ok(&env, "cmake", &with_probe("Probe demo gamma", None, "sleep 30"));
+    let marked = add_ok(&env, "cpp", &with_probe("Marker probe lesson", None, "touch \"$RKB_TEST_MARK\"\nexit 0"));
+    for l in [&fail, &pass, &slow, &marked] {
+        let id = l["id"].as_str().unwrap();
+        let (v, _) = env.json(&["approve", id, "probe"], "");
+        let (c, _) = confirm_on_tty(&env, v["request"].as_str().unwrap(), &format!("approve {id} probe"));
+        assert_eq!(c["status"], "done", "{c}");
+    }
+
+    let payload = serde_json::json!({ "session_id": "p1", "cwd": env.kb(), "tool_name": "Bash", "tool_input": { "command": "make" }, "error": "Exit code 1\nerror: Marker probe lesson\n" });
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_TEST_MARK", &marker);
+    rkb_with(c, &["hook", "tool-failed"], &payload.to_string());
+    assert!(!marker.exists(), "hooks never run probes");
+
+    let started = std::time::Instant::now();
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_TEST_MARK", &marker);
+    let o = rkb_with(c, &["search", "probe demo", "--format", "json"], "");
+    let elapsed = started.elapsed();
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert!(elapsed < std::time::Duration::from_secs(6), "the budget caps probes: {elapsed:?}");
+    let ids = search_ids(&v);
+    assert!(!ids.contains(&fail["id"].as_str().unwrap().to_string()), "{v}");
+    assert_eq!(v["hidden_by"]["probe"], 1, "{v}");
+    let result = |id: &str| v["results"].as_array().unwrap().iter().find(|r| r["id"] == id).cloned().unwrap_or_else(|| panic!("{id}: {v}"));
+    assert_eq!(result(pass["id"].as_str().unwrap())["applies"], "yes", "a passing probe beats unknown");
+    assert_eq!(result(slow["id"].as_str().unwrap())["applies"], "yes", "no when and a cut probe: applies stays as it was");
+
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_TEST_MARK", &marker);
+    rkb_with(c, &["search", "Marker probe lesson", "--format", "json"], "");
+    assert!(marker.exists(), "search runs approved probes");
+}
