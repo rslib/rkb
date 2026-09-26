@@ -161,6 +161,29 @@ enum Cmd {
         #[arg(long)]
         reason: String,
     },
+    /// Mark a wrong lesson as replaced by another. Asks the user, because search then hides it.
+    #[command(after_help = "Example:\n  rkb supersede 7f3a9c2b41 --by 0a1b2c3d4e --reason \"the flag is wrong on 1.14\"")]
+    Supersede {
+        id: String,
+        /// The lesson that replaces it.
+        #[arg(long)]
+        by: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Hide a lesson, or every lesson under a folder, that is still true but no longer relevant. Asks the user.
+    #[command(
+        after_help = "Example:\n  rkb archive 7f3a9c2b41 --reason \"quartz retired 2027-01\"\n  rkb archive systems/quartz --reason \"quartz retired 2027-01\""
+    )]
+    Archive {
+        /// A lesson id or a folder such as systems/quartz.
+        target: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Bring an archived lesson back into search.
+    #[command(after_help = "Example:\n  rkb unarchive 7f3a9c2b41")]
+    Unarchive { id: String },
     /// Record that you applied a lesson and whether it worked.
     #[command(after_help = "Example:\n  rkb used 7f3a9c2b41 --worked\n  rkb used 7f3a9c2b41 --failed --reason \"still fails on 1.14.3\"")]
     Used {
@@ -308,6 +331,9 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Add { topic, kind, template } => writes::add(&env, topic, kind, template),
         Cmd::Edit { id, base } => writes::edit(&env, id, base),
         Cmd::Flag { id, reason } => writes::flag(&env, id, reason),
+        Cmd::Supersede { id, by, reason } => writes::lifecycle(&env, rkb_core::request::Action::Supersede { id, by, reason }),
+        Cmd::Archive { target, reason } => writes::lifecycle(&env, rkb_core::request::Action::Archive { target, reason }),
+        Cmd::Unarchive { id } => writes::lifecycle(&env, rkb_core::request::Action::Unarchive { id }),
         Cmd::Used { id, failed, reason, .. } => writes::used(&env, id, failed, reason),
         Cmd::Log { id } => writes::log(&env, id),
         Cmd::Confirm { request, choice } => writes::confirm(&env, request, choice),

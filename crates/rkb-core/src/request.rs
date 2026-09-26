@@ -16,6 +16,9 @@ pub enum Action {
     Add { text: String, topic: String },
     Edit { id: String, text: String, base: String },
     Flag { id: String, reason: String },
+    Supersede { id: String, by: String, reason: String },
+    Archive { target: String, reason: String },
+    Unarchive { id: String },
     BreakLock { path: String, holder: String },
     Install { harnesses: Vec<crate::install::Harness>, uninstall: bool },
     Import { items: Vec<ImportItem> },
@@ -52,6 +55,8 @@ pub enum Decision {
     Install,
     ImportAll,
     SkipDuplicates,
+    Supersede,
+    Archive,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

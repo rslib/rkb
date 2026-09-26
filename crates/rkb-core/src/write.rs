@@ -47,6 +47,10 @@ pub struct Written {
 pub enum Note {
     /// A scope or topic folder the write created.
     NewFolder(String),
+    /// A lesson this write archived.
+    Archived(String),
+    /// A lesson this write brought back from the archive.
+    Unarchived(String),
     /// A project folder note that records the current repository's remote.
     ProjectNote { path: String, remote: String },
     /// An existing lesson in the same topic that looks like the new one.
@@ -57,6 +61,8 @@ impl Note {
     pub fn message(&self) -> String {
         match self {
             Note::NewFolder(f) => format!("created the folder {f}"),
+            Note::Archived(p) => format!("archived {p}; search hides it now"),
+            Note::Unarchived(p) => format!("{p} is active again and back in search"),
             Note::ProjectNote { path, remote } => format!("wrote {path} with the remote {remote}"),
             Note::Similar { id, title, path } => format!(
                 "looks like {id} \"{title}\" ({path}); merge them with `rkb show {id}` and `rkb edit {id} --base <hash>` if they say the same"
@@ -219,6 +225,8 @@ pub(crate) struct Prepared {
     /// Other new files committed with the lesson, such as a created folder note.
     extra: Vec<(String, String)>,
     pub(crate) notes: Vec<Note>,
+    /// A commit message other than `<kind>(<folder>): <title> [<id>]`, as for a folder archive.
+    message: Option<String>,
 }
 
 /// Runs one write: prepare, check each decision point, validate, write, commit.
@@ -231,6 +239,9 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
         Action::Add { text, topic } => add(ctx, &kb, &snap, action, approved, text, topic)?,
         Action::Edit { id, text, base } => edit(&kb, &snap, action, approved, id, text, base)?,
         Action::Flag { id, reason } => flag(&snap, id, reason)?,
+        Action::Supersede { id, by, reason } => supersede(&snap, action, approved, id, by, reason)?,
+        Action::Archive { target, reason } => archive(ctx, &snap, action, approved, target, reason)?,
+        Action::Unarchive { id } => unarchive(&snap, id)?,
         Action::BreakLock { .. } | Action::Install { .. } | Action::Import { .. } => {
             unreachable!("confirm handles these itself")
         }
@@ -402,7 +413,7 @@ pub(crate) fn add(
             notes.push(Note::ProjectNote { path: note, remote: remotes.first().cloned().unwrap_or_default() });
         }
     }
-    Ok(Ok(Prepared { kind: "add", id, path, title, text: lesson::write(&fm, body_text), extra, notes }))
+    Ok(Ok(Prepared { kind: "add", id, path, title, text: lesson::write(&fm, body_text), extra, notes, message: None }))
 }
 
 /// The current repository, when a new project folder is being made from inside an unmatched checkout.
@@ -509,7 +520,16 @@ fn edit(kb: &KbConfig, snap: &Snapshot, action: &Action, approved: &[Decision], 
         return Ok(Err(step));
     }
     let title = title_of(&new.body).unwrap_or_default();
-    Ok(Ok(Prepared { kind: "edit", id: id.to_string(), path: old.path.clone(), title, text: out, extra: vec![], notes: vec![] }))
+    Ok(Ok(Prepared {
+        kind: "edit",
+        id: id.to_string(),
+        path: old.path.clone(),
+        title,
+        text: out,
+        extra: vec![],
+        notes: vec![],
+        message: None,
+    }))
 }
 
 fn flag(snap: &Snapshot, id: &str, reason: &str) -> Result<Step> {
@@ -529,7 +549,162 @@ fn flag(snap: &Snapshot, id: &str, reason: &str) -> Result<Step> {
         return Ok(Err(Outcome::Unchanged { id: id.to_string(), path: old.path.clone() }));
     }
     let title = title_of(&old.body).unwrap_or_default();
-    Ok(Ok(Prepared { kind: "flag", id: id.to_string(), path: old.path.clone(), title, text: out, extra: vec![], notes: vec![] }))
+    Ok(Ok(Prepared {
+        kind: "flag",
+        id: id.to_string(),
+        path: old.path.clone(),
+        title,
+        text: out,
+        extra: vec![],
+        notes: vec![],
+        message: None,
+    }))
+}
+
+/// `body` with a `## <heading>` section appended.
+fn with_section(body: &str, heading: &str, text: &str) -> String {
+    format!("{}\n\n## {heading}\n{}\n", body.trim_end(), text.trim())
+}
+
+/// `body` without its `## <heading>` section, which ends at the next `## ` heading or the end.
+fn without_section(body: &str, heading: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let Some(start) = lines.iter().position(|l| l.trim_end() == format!("## {heading}")) else { return body.to_string() };
+    let end = lines[start + 1..].iter().position(|l| l.starts_with("## ")).map_or(lines.len(), |i| start + 1 + i);
+    let kept: Vec<&str> = lines[..start].iter().chain(&lines[end..]).copied().collect();
+    format!("{}\n", kept.join("\n").trim_end())
+}
+
+/// The path of `to` relative to the folder of `from`; both are knowledge-base paths.
+fn relative(from: &str, to: &str) -> String {
+    let from_dir: Vec<&str> = from.split('/').collect::<Vec<_>>()[..from.split('/').count() - 1].to_vec();
+    let to_parts: Vec<&str> = to.split('/').collect();
+    let common = from_dir.iter().zip(&to_parts).take_while(|(a, b)| a == b).count();
+    let mut out = "../".repeat(from_dir.len() - common);
+    out.push_str(&to_parts[common..].join("/"));
+    out
+}
+
+fn current_or_refuse(l: &Lesson, what: &str) -> Result<()> {
+    if l.frontmatter.status.is_current() {
+        Ok(())
+    } else {
+        Err(refused(format!("lesson {} is {}; {what}", l.frontmatter.id, l.frontmatter.status.as_str())))
+    }
+}
+
+fn supersede(snap: &Snapshot, action: &Action, approved: &[Decision], id: &str, by: &str, reason: &str) -> Result<Step> {
+    let (lessons, _) = snap.lessons();
+    let old = find(&lessons, id)?;
+    let new = find(&lessons, by)?;
+    if id == by {
+        return Err(refused("a lesson cannot supersede itself; give another lesson with --by"));
+    }
+    if reason.trim().is_empty() {
+        return Err(refused("give a reason with --reason"));
+    }
+    current_or_refuse(old, "only an active or stale lesson can be superseded")?;
+    current_or_refuse(new, "the replacement must be active or stale")?;
+    let old_title = title_of(&old.body).unwrap_or_default();
+    let new_title = title_of(&new.body).unwrap_or_default();
+    if !approved.contains(&Decision::Supersede) {
+        let question = format!(
+            "Supersede {id} \"{old_title}\" ({}) by {by} \"{new_title}\" ({})? Search will hide {id}.\nReason: {}",
+            old.path,
+            new.path,
+            reason.trim()
+        );
+        let choices = vec![Choice { text: format!("supersede {id}"), decision: Some(Decision::Supersede) }];
+        return ask(action, approved, question, choices).map(Err);
+    }
+    let mut fm = old.frontmatter.clone();
+    fm.status = Status::Superseded;
+    fm.superseded_by = Some(by.to_string());
+    fm.stale_reason = None;
+    let text = format!("{}\n\nReplaced by [{new_title}]({}).", reason.trim(), relative(&old.path, &new.path));
+    let body = with_section(&old.body, "Why superseded", &text);
+    Ok(Ok(Prepared {
+        kind: "supersede",
+        id: id.to_string(),
+        path: old.path.clone(),
+        title: old_title,
+        text: lesson::write(&fm, &body),
+        extra: vec![],
+        notes: vec![],
+        message: None,
+    }))
+}
+
+fn archive(ctx: &Ctx, snap: &Snapshot, action: &Action, approved: &[Decision], target: &str, reason: &str) -> Result<Step> {
+    let (lessons, _) = snap.lessons();
+    if reason.trim().is_empty() {
+        return Err(refused("give a reason with --reason"));
+    }
+    let folder = target.trim_end_matches('/');
+    let chosen: Vec<&Lesson> = match find(&lessons, target) {
+        Ok(l) => {
+            current_or_refuse(l, "only an active or stale lesson can be archived")?;
+            vec![l]
+        }
+        Err(_) if !folder.is_empty() && !folder.split('/').any(|p| p == ".." || p == ".") && ctx.root.join(folder).is_dir() => {
+            let current: Vec<&Lesson> =
+                lessons.iter().filter(|l| l.path.starts_with(&format!("{folder}/")) && l.frontmatter.status.is_current()).collect();
+            if current.is_empty() {
+                return Err(refused(format!("{folder} has no active or stale lesson to archive")));
+            }
+            current
+        }
+        Err(e) => return Err(e),
+    };
+    if !approved.contains(&Decision::Archive) {
+        let mut question = format!("Archive {} lesson(s) under {target}? Search will hide them.\nReason: {}", chosen.len(), reason.trim());
+        for l in &chosen {
+            question.push_str(&format!("\n- {} {} ({})", l.frontmatter.id, title_of(&l.body).unwrap_or_default(), l.path));
+        }
+        let choices = vec![Choice { text: format!("archive {target}"), decision: Some(Decision::Archive) }];
+        return ask(action, approved, question, choices).map(Err);
+    }
+    let texts: Vec<(String, String)> = chosen
+        .iter()
+        .map(|l| {
+            let mut fm = l.frontmatter.clone();
+            fm.status = Status::Archived;
+            fm.stale_reason = None;
+            (l.path.clone(), lesson::write(&fm, &with_section(&l.body, "Why archived", reason)))
+        })
+        .collect();
+    let single = chosen.len() == 1 && chosen[0].frontmatter.id == target;
+    let first = chosen[0];
+    Ok(Ok(Prepared {
+        kind: "archive",
+        id: if single { first.frontmatter.id.clone() } else { String::new() },
+        path: texts[0].0.clone(),
+        title: title_of(&first.body).unwrap_or_default(),
+        text: texts[0].1.clone(),
+        extra: texts[1..].to_vec(),
+        notes: if single { vec![] } else { chosen.iter().map(|l| Note::Archived(l.path.clone())).collect() },
+        message: (!single).then(|| format!("archive({folder}): {} lessons", chosen.len())),
+    }))
+}
+
+fn unarchive(snap: &Snapshot, id: &str) -> Result<Step> {
+    let (lessons, _) = snap.lessons();
+    let old = find(&lessons, id)?;
+    if old.frontmatter.status != Status::Archived {
+        return Err(refused(format!("lesson {id} is {}; only an archived lesson can be unarchived", old.frontmatter.status.as_str())));
+    }
+    let mut fm = old.frontmatter.clone();
+    fm.status = Status::Active;
+    Ok(Ok(Prepared {
+        kind: "unarchive",
+        id: id.to_string(),
+        path: old.path.clone(),
+        title: title_of(&old.body).unwrap_or_default(),
+        text: lesson::write(&fm, &without_section(&old.body, "Why archived")),
+        extra: vec![],
+        notes: vec![Note::Unarchived(old.path.clone())],
+        message: None,
+    }))
 }
 
 /// Puts the prepared files into `snap` and returns the lint errors that concern them.
@@ -563,7 +738,7 @@ pub(crate) fn finish(ctx: &Ctx, mut snap: Snapshot, p: Prepared) -> Result<Outco
     }
 
     let folder = p.path.rsplit_once('/').map_or("", |(d, _)| d);
-    let message = format!("{}({folder}): {} [{}]", p.kind, p.title, p.id);
+    let message = p.message.clone().unwrap_or_else(|| format!("{}({folder}): {} [{}]", p.kind, p.title, p.id));
     let paths: Vec<&str> = written.iter().map(|s| s.as_str()).collect();
     let mut add_args = vec!["add", "--"];
     add_args.extend(&paths);
@@ -577,6 +752,19 @@ pub(crate) fn finish(ctx: &Ctx, mut snap: Snapshot, p: Prepared) -> Result<Outco
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sections_and_relative_links() {
+        let body = "\n# T\n\n## Fix\nDo it.\n";
+        let with = with_section(body, "Why archived", "Retired.");
+        assert_eq!(with, "\n# T\n\n## Fix\nDo it.\n\n## Why archived\nRetired.\n");
+        assert_eq!(without_section(&with, "Why archived"), "\n# T\n\n## Fix\nDo it.\n");
+        let middle = "\n# T\n\n## Why archived\nx\n\n## Fix\nDo it.\n";
+        assert_eq!(without_section(middle, "Why archived"), "\n# T\n\n## Fix\nDo it.\n");
+        assert_eq!(relative("general/cpp/a.md", "general/cpp/b.md"), "b.md");
+        assert_eq!(relative("general/cpp/a.md", "general/git/b.md"), "../git/b.md");
+        assert_eq!(relative("projects/x/cmake/a.md", "general/cmake/b.md"), "../../../general/cmake/b.md");
+    }
 
     #[test]
     fn ids_are_plain_yaml_strings() {

@@ -236,6 +236,11 @@ pub fn flag(env: &Env, id: String, reason: String) -> Result<Output, CliError> {
     Ok(outcome(env, o))
 }
 
+pub fn lifecycle(env: &Env, action: Action) -> Result<Output, CliError> {
+    kb::open(&env.root)?;
+    Ok(outcome(env, write::apply(&env.ctx(), &action, &[])?))
+}
+
 pub fn used(env: &Env, id: String, failed: bool, reason: Option<String>) -> Result<Output, CliError> {
     kb::open(&env.root)?;
     kb::find(&env.root, &id)?;

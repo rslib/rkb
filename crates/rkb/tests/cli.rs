@@ -1712,3 +1712,69 @@ fn import_adds_a_lesson_that_became_a_duplicate() {
     assert_eq!((v["status"].as_str(), code), (Some("done"), Some(0)), "{v}");
     assert_eq!(v["added"][0]["path"], "general/cmake/presets-replace-long-cmake-command-lines-2.md");
 }
+
+fn trusted_confirm(env: &Env, request: &str, choice: &str) -> serde_json::Value {
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("CLAUDECODE", "1");
+    let o = rkb_with(c, &["confirm", request, "--choice", choice, "--format", "json"], "");
+    serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)))
+}
+
+#[test]
+fn supersede_archive_unarchive() {
+    let env = fixture_kb();
+    env.trust_claude();
+    let before = commit_count(&env);
+
+    let (v, code) = env.json(&["supersede", "5d2e8a1c90", "--by", "9a4c7e2b10", "--reason", "the regex advice is wrong now"], "");
+    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{v}");
+    assert_eq!(v["options"], serde_json::json!(["supersede 5d2e8a1c90", "cancel"]));
+    let q = v["question"].as_str().unwrap();
+    assert!(q.contains("5d2e8a1c90") && q.contains("9a4c7e2b10") && q.contains("Search will hide"), "{q}");
+    assert_eq!(commit_count(&env), before, "nothing before confirm");
+    let v = trusted_confirm(&env, v["request"].as_str().unwrap(), "supersede 5d2e8a1c90");
+    assert_eq!(v["status"], "written", "{v}");
+    let text = std::fs::read_to_string(env.kb().join("general/cpp/avoid-std-regex-in-hot-loops.md")).unwrap();
+    assert!(text.contains("status: superseded") && text.contains("superseded_by: 9a4c7e2b10"), "{text}");
+    assert!(
+        text.contains("## Why superseded\nthe regex advice is wrong now") && text.contains("(../git/prefer-subject-only-commits.md)"),
+        "{text}"
+    );
+    assert!(head_subject(&env).starts_with("supersede(general/cpp): "));
+    let (s, _) = env.json(&["search", "--literal", "std::regex"], "");
+    assert!(s["results"].as_array().unwrap().iter().all(|r| r["id"] != "5d2e8a1c90"), "search hides it: {s}");
+
+    let (v, code) = env.json(&["archive", "projects/dftracer", "--reason", "the project moved on"], "");
+    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{v}");
+    let q = v["question"].as_str().unwrap();
+    assert!(q.contains("7f3a9c2b41") && q.contains("2b81d05e77"), "{q}");
+    let v = trusted_confirm(&env, v["request"].as_str().unwrap(), "archive projects/dftracer");
+    assert_eq!(v["status"], "written", "{v}");
+    assert_eq!(head_subject(&env), "archive(projects/dftracer): 2 lessons");
+    let files = stdout(&env.git(&["show", "--name-only", "--format=", "HEAD"]));
+    assert_eq!(files.trim().lines().count(), 2, "{files}");
+    let cmake = env.kb().join("projects/dftracer/cmake/cmake-needs-hdf5-root.md");
+    assert!(std::fs::read_to_string(&cmake).unwrap().contains("status: archived\n"));
+    assert!(std::fs::read_to_string(&cmake).unwrap().contains("## Why archived\nthe project moved on"));
+    let (v, code) = env.json(&["archive", "projects/dftracer", "--reason", "again"], "");
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("refused"), Some(1)), "{v}");
+
+    let (v, code) = env.json(&["supersede", "c04e11a9f3", "--by", "7f3a9c2b41", "--reason", "x"], "");
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("refused"), Some(1)), "the replacement is archived: {v}");
+
+    let (v, code) = env.json(&["unarchive", "7f3a9c2b41"], "");
+    assert_eq!((v["status"].as_str(), code), (Some("written"), Some(0)), "no question: {v}");
+    assert!(v["notes"][0].as_str().unwrap().contains("back in search"));
+    let text = std::fs::read_to_string(&cmake).unwrap();
+    assert!(text.contains("status: active\n") && !text.contains("Why archived"), "{text}");
+    let (v, _) = env.json(&["unarchive", "5d2e8a1c90"], "");
+    assert_eq!(v["error"]["code"], "refused", "a superseded lesson is not archived: {v}");
+
+    let (v, _) = env.json(&["archive", "c04e11a9f3", "--reason", "tuolumne retired"], "");
+    trusted_confirm(&env, v["request"].as_str().unwrap(), "archive c04e11a9f3");
+    assert!(head_subject(&env).starts_with("archive(systems/tuolumne/lustre): ") && head_subject(&env).ends_with("[c04e11a9f3]"));
+    assert!(env.kb().join("systems/tuolumne/lustre/lustre-needs-striping-for-large-files.md").exists(), "files never move");
+    let lint = env.rkb(&["lint"]);
+    assert!(lint.status.success(), "{}", stdout(&lint));
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
+}
