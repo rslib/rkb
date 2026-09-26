@@ -19,6 +19,8 @@ pub enum Action {
     Supersede { id: String, by: String, reason: String },
     Archive { target: String, reason: String },
     Unarchive { id: String },
+    Move { id: String, folder: String },
+    Rename { id: String, slug: String },
     BreakLock { path: String, holder: String },
     Install { harnesses: Vec<crate::install::Harness>, uninstall: bool },
     Import { items: Vec<ImportItem> },

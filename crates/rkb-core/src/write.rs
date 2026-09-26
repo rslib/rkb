@@ -10,7 +10,7 @@ use crate::body;
 use crate::config::{self, KbConfig, TopicNote};
 use crate::error::{Error, Result, io};
 use crate::git;
-use crate::kb::{FileKind, NoteRole, Snapshot, note_chain, note_role};
+use crate::kb::{FileKind, NoteRole, Snapshot, classify, note_chain, note_role};
 use crate::lesson::{self, Frontmatter, Lesson, LessonType, Status, VerifiedHow};
 use crate::lint::{self, LintEnv, Severity};
 use crate::lock;
@@ -49,6 +49,8 @@ pub enum Note {
     NewFolder(String),
     /// A lesson this write archived.
     Archived(String),
+    /// Another file whose links a move or rename rewrote.
+    LinksUpdated(String),
     /// A lesson this write brought back from the archive.
     Unarchived(String),
     /// A project folder note that records the current repository's remote.
@@ -62,6 +64,7 @@ impl Note {
         match self {
             Note::NewFolder(f) => format!("created the folder {f}"),
             Note::Archived(p) => format!("archived {p}; search hides it now"),
+            Note::LinksUpdated(p) => format!("updated links in {p}"),
             Note::Unarchived(p) => format!("{p} is active again and back in search"),
             Note::ProjectNote { path, remote } => format!("wrote {path} with the remote {remote}"),
             Note::Similar { id, title, path } => format!(
@@ -242,18 +245,24 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
         Action::Supersede { id, by, reason } => supersede(&snap, action, approved, id, by, reason)?,
         Action::Archive { target, reason } => archive(ctx, &snap, action, approved, target, reason)?,
         Action::Unarchive { id } => unarchive(&snap, id)?,
+        Action::Move { id, folder } => return saved(ctx, relocate(ctx, snap, action, approved, id, Some(folder), None)?),
+        Action::Rename { id, slug } => return saved(ctx, relocate(ctx, snap, action, approved, id, None, Some(slug))?),
         Action::BreakLock { .. } | Action::Install { .. } | Action::Import { .. } => {
             unreachable!("confirm handles these itself")
         }
     };
     match prepared {
         Ok(p) => finish(ctx, snap, p),
-        Err(Outcome::NeedsUser(req)) => {
-            request::save(&ctx.state.join("requests"), &req)?;
-            Ok(Outcome::NeedsUser(req))
-        }
-        Err(outcome) => Ok(outcome),
+        Err(outcome) => saved(ctx, outcome),
     }
+}
+
+/// Saves the request of a `NeedsUser` outcome, so `rkb confirm` can find it.
+fn saved(ctx: &Ctx, o: Outcome) -> Result<Outcome> {
+    if let Outcome::NeedsUser(req) = &o {
+        request::save(&ctx.state.join("requests"), req)?;
+    }
+    Ok(o)
 }
 
 /// Takes the knowledge base's write lock with `lock.stale_s` and `lock.wait_s` from `kb.toml`.
@@ -707,6 +716,164 @@ fn unarchive(snap: &Snapshot, id: &str) -> Result<Step> {
     }))
 }
 
+/// `text` of a file at `from` that moves to `to`, with every relative link rewritten so it resolves to the same file,
+/// where `moved` maps old paths to new ones. Links in code and links with a scheme stay as they are.
+pub(crate) fn rewrite_links(text: &str, from: &str, to: &str, moved: &BTreeMap<String, String>) -> String {
+    let b = body::scan(text);
+    let mut lines: Vec<String> = text.split_inclusive('\n').map(String::from).collect();
+    for link in &b.links {
+        let Some(Some(old_target)) = lint::resolve(from, &link.target) else { continue };
+        let new_target = moved.get(&old_target).cloned().unwrap_or_else(|| old_target.clone());
+        if from == to && new_target == old_target {
+            continue;
+        }
+        let tail = link.target.find(['#', '?']).map_or("", |i| &link.target[i..]);
+        let new = format!("{}{tail}", relative(to, &new_target));
+        let Some(line) = lines.get_mut(link.line - 1) else { continue };
+        for (a, b) in [
+            (format!("]({})", link.target), format!("]({new})")),
+            (format!("](<{}>", link.target), format!("](<{new}>")),
+            (format!("]({} ", link.target), format!("]({new} ")),
+        ] {
+            if line.contains(&a) {
+                *line = line.replacen(&a, &b, 1);
+                break;
+            }
+        }
+    }
+    lines.concat()
+}
+
+fn valid_slug(slug: &str) -> bool {
+    !slug.is_empty() && slug.split('-').all(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()))
+}
+
+/// Moves a lesson to `folder` or renames it to `slug`, with its assets, and rewrites every link to them in one commit.
+fn relocate(
+    ctx: &Ctx,
+    snap: Snapshot,
+    action: &Action,
+    approved: &[Decision],
+    id: &str,
+    folder: Option<&str>,
+    slug: Option<&str>,
+) -> Result<Outcome> {
+    let (lessons, _) = snap.lessons();
+    let old = find(&lessons, id)?;
+    let (old_dir, old_file) = old.path.rsplit_once('/').expect("lessons live in folders");
+    let old_stem = old_file.trim_end_matches(".md");
+    let new_dir = folder.map(|f| f.trim_end_matches('/')).unwrap_or(old_dir);
+    let new_stem = slug.unwrap_or(old_stem);
+    if new_dir.is_empty() || new_dir.split('/').any(|p| p.is_empty() || p == ".." || p == "." || p.starts_with('.')) {
+        return Err(refused(format!("`{new_dir}` is not a folder of the knowledge base")));
+    }
+    if !valid_slug(new_stem) {
+        return Err(refused(format!("`{new_stem}` is not a valid slug; use lowercase letters, digits and `-`")));
+    }
+    if new_dir == old_dir && new_stem == old_stem {
+        return Err(refused(format!("{} is already there", old.path)));
+    }
+    let new_path = format!("{new_dir}/{new_stem}.md");
+    if snap.files.contains_key(&new_path) || ctx.root.join(&new_path).exists() {
+        return Err(refused(format!("{new_path} already exists")));
+    }
+
+    let mut notes = vec![];
+    let folder_exists = ctx.root.join(new_dir).is_dir();
+    if !folder_exists {
+        let decided = approved.iter().any(|d| matches!(d, Decision::CreateFolder { path } if path == new_dir));
+        if let Some(use_topic) = approved.iter().find_map(|d| match d {
+            Decision::UseTopic { path } => Some(path.clone()),
+            _ => None,
+        }) {
+            return relocate(ctx, snap, action, &[], id, Some(&use_topic), None);
+        }
+        let (scope, name) = new_dir.rsplit_once('/').unwrap_or(("", new_dir));
+        let topics = topics_in(ctx.root, scope);
+        let limit = (name.chars().count() / 4).max(1);
+        if !decided && topics.iter().any(|t| t != name && crate::text::edit_distance(name, t) <= limit) {
+            let question = format!(
+                "Topic folder {new_dir} does not exist, and its name is close to an existing topic. Create it, or use the existing one?"
+            );
+            let mut choices =
+                vec![Choice { text: format!("create {new_dir}"), decision: Some(Decision::CreateFolder { path: new_dir.to_string() }) }];
+            for t in closest(name, &topics) {
+                let path = format!("{scope}/{t}");
+                choices.push(Choice { text: format!("use {path}"), decision: Some(Decision::UseTopic { path }) });
+            }
+            return ask(action, approved, question, choices);
+        }
+        notes.push(Note::NewFolder(new_dir.to_string()));
+    }
+
+    let old_assets = format!("{old_dir}/{old_stem}.assets/");
+    let mut moved: BTreeMap<String, String> = BTreeMap::new();
+    moved.insert(old.path.clone(), new_path.clone());
+    for path in snap.files.keys().filter(|p| p.starts_with(&old_assets)) {
+        moved.insert(path.clone(), format!("{new_dir}/{new_stem}.assets/{}", &path[old_assets.len()..]));
+    }
+
+    let mut next = Snapshot { files: snap.files.clone() };
+    let mut changed: Vec<(String, String)> = vec![];
+    for (path, data) in &snap.files {
+        if moved.contains_key(path) || !matches!(classify(path), FileKind::Lesson | FileKind::FolderNote) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(data);
+        let new_text = rewrite_links(&text, path, path, &moved);
+        if new_text != text {
+            next.files.insert(path.clone(), new_text.clone().into_bytes());
+            changed.push((path.clone(), new_text));
+            notes.push(Note::LinksUpdated(path.clone()));
+        }
+    }
+    let lesson_text = rewrite_links(&String::from_utf8_lossy(&snap.files[&old.path]), &old.path, &new_path, &moved);
+    for (from, to) in &moved {
+        let data = next.files.remove(from).unwrap_or_default();
+        next.files.insert(to.clone(), if from == &old.path { lesson_text.clone().into_bytes() } else { data });
+    }
+    let focus: BTreeSet<String> = moved.values().cloned().chain(changed.iter().map(|(p, _)| p.clone())).collect();
+    let blocking: Vec<_> = lint::lint(&next, ctx.env, Some(&focus))
+        .into_iter()
+        .filter(|f| f.severity == Severity::Error && (focus.contains(&f.path) || f.path.starts_with(&format!("{new_dir}/"))))
+        .collect();
+    if !blocking.is_empty() {
+        return Err(Error::Invalid(blocking));
+    }
+
+    let write_file = |rel: &str, text: &str| -> Result<()> {
+        let abs = ctx.root.join(rel);
+        let dir = abs.parent().unwrap();
+        std::fs::create_dir_all(dir).map_err(io(dir))?;
+        let tmp = dir.join(format!(".{}.rkb-tmp", abs.file_name().unwrap().to_string_lossy()));
+        std::fs::write(&tmp, text).map_err(io(&tmp))?;
+        std::fs::rename(&tmp, &abs).map_err(io(&abs))
+    };
+    for (path, text) in &changed {
+        write_file(path, text)?;
+    }
+    write_file(&new_path, &lesson_text)?;
+    for (from, to) in moved.iter().filter(|(f, _)| **f != old.path) {
+        let (src, dst) = (ctx.root.join(from), ctx.root.join(to));
+        std::fs::create_dir_all(dst.parent().unwrap()).map_err(io(dst.parent().unwrap()))?;
+        std::fs::rename(&src, &dst).map_err(io(&src))?;
+    }
+    std::fs::remove_file(ctx.root.join(&old.path)).map_err(io(ctx.root.join(&old.path)))?;
+    let _ = std::fs::remove_dir(ctx.root.join(&old_assets));
+
+    let kind = if folder.is_some() { "move" } else { "rename" };
+    let title = title_of(&old.body).unwrap_or_default();
+    let message = format!("{kind}({new_dir}): {title} [{id}]");
+    let paths: Vec<&str> = moved.keys().chain(moved.values()).chain(changed.iter().map(|(p, _)| p)).map(String::as_str).collect();
+    let mut add_args = vec!["add", "-A", "--"];
+    add_args.extend(&paths);
+    git::run(ctx.root, &add_args)?;
+    git::commit_paths(ctx.root, &message, &paths)?;
+    let commit = String::from_utf8_lossy(&git::run(ctx.root, &["rev-parse", "--short", "HEAD"])?).trim().to_string();
+    let diff = String::from_utf8_lossy(&git::run(ctx.root, &["show", "-M", "--format=", &commit])?).into_owned();
+    Ok(Outcome::Written(Written { kind, id: id.to_string(), path: new_path, title, commit, diff, notes }))
+}
+
 /// Puts the prepared files into `snap` and returns the lint errors that concern them.
 pub(crate) fn stage(snap: &mut Snapshot, env: &LintEnv, p: &Prepared) -> Vec<lint::Finding> {
     snap.files.insert(p.path.clone(), p.text.clone().into_bytes());
@@ -752,6 +919,34 @@ pub(crate) fn finish(ctx: &Ctx, mut snap: Snapshot, p: Prepared) -> Result<Outco
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_follow_a_move() {
+        let moved: BTreeMap<String, String> =
+            [("general/cpp/a.md", "general/build/a.md"), ("general/cpp/a.assets/p.svg", "general/build/a.assets/p.svg")]
+                .into_iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect();
+        let inbound = "see [a](../cpp/a.md#fix), `[x](../cpp/a.md)` and [w](https://example.org/a.md)\n";
+        assert_eq!(
+            rewrite_links(inbound, "general/git/b.md", "general/git/b.md", &moved),
+            "see [a](../build/a.md#fix), `[x](../cpp/a.md)` and [w](https://example.org/a.md)\n"
+        );
+        let own = "[b](../git/b.md) ![p](a.assets/p.svg)\n";
+        assert_eq!(rewrite_links(own, "general/cpp/a.md", "general/build/a.md", &moved), own, "same depth, same relative links");
+        let deep: BTreeMap<String, String> = [("general/cpp/a.md".to_string(), "projects/x/cmake/a.md".to_string())].into_iter().collect();
+        assert_eq!(
+            rewrite_links("[b](../git/b.md)\n", "general/cpp/a.md", "projects/x/cmake/a.md", &deep),
+            "[b](../../../general/git/b.md)\n"
+        );
+        let renamed: BTreeMap<String, String> =
+            [("general/cpp/a.md", "general/cpp/c.md"), ("general/cpp/a.assets/p.svg", "general/cpp/c.assets/p.svg")]
+                .into_iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect();
+        assert_eq!(rewrite_links("![p](a.assets/p.svg)\n", "general/cpp/a.md", "general/cpp/c.md", &renamed), "![p](c.assets/p.svg)\n");
+        assert_eq!(rewrite_links("[untouched](other.md)\n", "general/git/b.md", "general/git/b.md", &moved), "[untouched](other.md)\n");
+    }
 
     #[test]
     fn sections_and_relative_links() {

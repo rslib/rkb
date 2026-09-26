@@ -187,6 +187,20 @@ enum Cmd {
         #[arg(long)]
         reason: String,
     },
+    /// Move a lesson (and its assets) to another topic folder and rewrite every link to it.
+    #[command(after_help = "Example:\n  rkb move 7f3a9c2b41 general/build")]
+    Move {
+        id: String,
+        /// The topic folder, such as general/build or projects/dftracer/cmake.
+        folder: String,
+    },
+    /// Rename a lesson file (and its assets folder) in place and rewrite every link to it.
+    #[command(after_help = "Example:\n  rkb rename 7f3a9c2b41 cmake-needs-hdf5-root")]
+    Rename {
+        id: String,
+        /// The new file name without `.md`: lowercase letters, digits and `-`.
+        slug: String,
+    },
     /// Bring an archived lesson back into search.
     #[command(after_help = "Example:\n  rkb unarchive 7f3a9c2b41")]
     Unarchive { id: String },
@@ -344,6 +358,8 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         }
         Cmd::Supersede { id, by, reason } => writes::lifecycle(&env, rkb_core::request::Action::Supersede { id, by, reason }),
         Cmd::Archive { target, reason } => writes::lifecycle(&env, rkb_core::request::Action::Archive { target, reason }),
+        Cmd::Move { id, folder } => writes::lifecycle(&env, rkb_core::request::Action::Move { id, folder }),
+        Cmd::Rename { id, slug } => writes::lifecycle(&env, rkb_core::request::Action::Rename { id, slug }),
         Cmd::Unarchive { id } => writes::lifecycle(&env, rkb_core::request::Action::Unarchive { id }),
         Cmd::Used { id, failed, reason, .. } => writes::used(&env, id, failed, reason),
         Cmd::Log { id } => writes::log(&env, id),

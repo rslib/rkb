@@ -34,6 +34,7 @@ Never write or change a lesson file with your own tools. rkb checks it, places i
 - Run `rkb review` when the user asks to clean up the knowledge base. It lists lessons that may no longer matter, with the reasons, and changes nothing. Show the list; archive only the lessons the user agrees to.
 - Run `rkb used <id> --worked` after you apply a lesson and the task succeeds. Run `rkb used <id> --failed --reason "<why>"` when it did not work; this also flags it.
 - Run `rkb log <id>` for the history of a lesson.
+- Run `rkb move <id> <topic folder>` to put a lesson in another topic, and `rkb rename <id> <slug>` to change its file name. Both rewrite every link to the lesson. Never move or rename lesson files with your own tools; the links would break.
 - To bring in existing notes (a `lessons-learned.md`, a notes folder), split them into one lesson per file in a scratch folder outside the knowledge base: `<dir>/<topic>/<name>.md`, each written from `rkb add --type <t> --template`. Keep the user's words and evidence; do not shorten. Then run `rkb import <dir>`. If it lists invalid files, fix them and run it again. Otherwise it returns one `needs_user` report: show it to the user and wait for their choice.
 
 ## When rkb needs the user

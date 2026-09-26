@@ -280,7 +280,7 @@ fn exists(snap: &Snapshot, path: &str) -> bool {
 
 /// Resolves a link target against the lesson's folder. `None` for links lint does not check,
 /// `Some(None)` for a relative link that leaves the knowledge base.
-fn resolve(from: &str, target: &str) -> Option<Option<String>> {
+pub(crate) fn resolve(from: &str, target: &str) -> Option<Option<String>> {
     if target.contains("://") || target.starts_with("mailto:") || target.starts_with('#') || target.starts_with('/') {
         return None;
     }

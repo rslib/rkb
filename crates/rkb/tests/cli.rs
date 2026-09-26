@@ -1841,3 +1841,76 @@ fn review_lists_candidates_with_reasons() {
             || std::fs::read_dir(env.dir.path().join("state/rkb/requests")).unwrap().next().is_none()
     );
 }
+
+#[test]
+fn move_and_rename_rewrite_links() {
+    let env = kb_with_topics();
+    let a = add_ok(&env, "cpp", &lesson_with("Alpha lesson about linking"));
+    let b = add_ok(&env, "git", &lesson_with("Beta lesson about history"));
+    let (a_id, a_path, b_path) =
+        (a["id"].as_str().unwrap().to_string(), a["path"].as_str().unwrap().to_string(), b["path"].as_str().unwrap().to_string());
+    let a_text = std::fs::read_to_string(env.kb().join(&a_path)).unwrap();
+    env.write(
+        &a_path,
+        &format!("{a_text}\nSee [beta](../git/beta-lesson-about-history.md).\n\n![plot](alpha-lesson-about-linking.assets/plot.svg)\n"),
+    );
+    env.write("general/cpp/alpha-lesson-about-linking.assets/plot.svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"/>\n");
+    let b_text = std::fs::read_to_string(env.kb().join(&b_path)).unwrap();
+    env.write(&b_path, &format!("{b_text}\nSee [alpha](../cpp/alpha-lesson-about-linking.md#fix).\n"));
+    env.git(&["add", "-A"]);
+    let o = env.git(&["commit", "-q", "-m", "links"]);
+    assert!(o.status.success(), "{}", stdout(&o));
+    let before = commit_count(&env);
+
+    let (v, code) = env.json(&["move", &a_id, "general/build"], "");
+    assert_eq!((v["status"].as_str(), code), (Some("written"), Some(0)), "{v}");
+    assert_eq!(v["path"], "general/build/alpha-lesson-about-linking.md");
+    let notes: Vec<&str> = v["notes"].as_array().unwrap().iter().map(|n| n.as_str().unwrap()).collect();
+    assert!(
+        notes.contains(&"created the folder general/build") && notes.contains(&format!("updated links in {b_path}").as_str()),
+        "{notes:?}"
+    );
+    assert_eq!(commit_count(&env), before + 1, "one commit");
+    assert!(head_subject(&env).starts_with("move(general/build): Alpha lesson about linking"));
+    assert!(!env.kb().join(&a_path).exists() && env.kb().join("general/build/alpha-lesson-about-linking.assets/plot.svg").exists());
+    let b_now = std::fs::read_to_string(env.kb().join(&b_path)).unwrap();
+    assert!(b_now.contains("](../build/alpha-lesson-about-linking.md#fix)"), "{b_now}");
+    let a_now = std::fs::read_to_string(env.kb().join("general/build/alpha-lesson-about-linking.md")).unwrap();
+    assert!(
+        a_now.contains("](../git/beta-lesson-about-history.md)") && a_now.contains("](alpha-lesson-about-linking.assets/plot.svg)"),
+        "{a_now}"
+    );
+    let lint = env.rkb(&["lint"]);
+    assert!(lint.status.success(), "{}", stdout(&lint));
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
+
+    let (v, code) = env.json(&["rename", &a_id, "linking-alpha"], "");
+    assert_eq!((v["status"].as_str(), code), (Some("written"), Some(0)), "{v}");
+    assert!(head_subject(&env).starts_with("rename(general/build): "));
+    let a_now = std::fs::read_to_string(env.kb().join("general/build/linking-alpha.md")).unwrap();
+    assert!(a_now.contains("](linking-alpha.assets/plot.svg)"), "{a_now}");
+    assert!(std::fs::read_to_string(env.kb().join(&b_path)).unwrap().contains("](../build/linking-alpha.md#fix)"));
+    assert!(env.rkb(&["lint"]).status.success());
+
+    let (v, code) = env.json(&["rename", b["id"].as_str().unwrap(), "../escape"], "");
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("refused"), Some(1)), "{v}");
+    assert_eq!(add_ok(&env, "git", &lesson_with("Taken"))["path"], "general/git/taken.md");
+    let head = stdout(&env.git(&["rev-parse", "HEAD"]));
+    let (v, code) = env.json(&["rename", b["id"].as_str().unwrap(), "taken"], "");
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("refused"), Some(1)), "{v}");
+    assert_eq!(stdout(&env.git(&["rev-parse", "HEAD"])), head, "nothing changed");
+
+    let proj = add_ok(&env, "cmake", &PITFALL.replace("verified_how: ran", "verified_how: ran\nwhen:\n  project: dftracer"));
+    let proj_path = proj["path"].as_str().unwrap().to_string();
+    let head = stdout(&env.git(&["rev-parse", "HEAD"]));
+    let (v, code) = env.json(&["move", proj["id"].as_str().unwrap(), "general/cmake"], "");
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("invalid_lesson"), Some(1)), "wrong scope: {v}");
+    assert!(v.to_string().contains("layout/scope"), "{v}");
+    assert_eq!(stdout(&env.git(&["rev-parse", "HEAD"])), head, "nothing changed");
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
+    assert!(env.kb().join(&proj_path).exists());
+
+    let (v, code) = env.json(&["move", &a_id, "projects/dftracer/cmake"], "");
+    assert_eq!((v["status"].as_str(), code), (Some("written"), Some(0)), "narrowing into a project is fine: {v}");
+    assert!(env.rkb(&["lint"]).status.success());
+}
