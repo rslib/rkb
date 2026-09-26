@@ -22,7 +22,7 @@ pub struct Env {
 }
 
 impl Env {
-    fn ctx(&self) -> Ctx<'_> {
+    pub(crate) fn ctx(&self) -> Ctx<'_> {
         Ctx { root: &self.root, env: &self.lint, state: &self.state, today: jiff::Zoned::now().date(), place: self.place.as_ref() }
     }
 }

@@ -178,6 +178,21 @@ Required H2 headings, in this order:
 - Put only the key lines of a log in `Evidence`. Never paste a raw log.
 - Never write personal or site data: usernames, email addresses, absolute home or scratch paths, job IDs. Use `$HOME`, `$USER`, `$PROJECT_ROOT` or `$SCRATCH`. Lint fails on a match. If a match is a false alarm, ask the user to add the exact text to `leak.allow` in `kb.toml`.
 
+## Check and Probe scripts
+
+A lesson can prove itself with a `## Check` section and tell whether it applies here with a `## Probe` section. Each holds exactly one fenced `bash` or `sh` block:
+
+```bash
+module load hdf5 2>/dev/null || exit 2
+h5cc -showconfig | grep -q "HDF5 Version: 1.14"
+```
+
+- Exit 0 means pass, exit 1 means fail. Exit 2 (or any other code) means unknown: use it when a tool or module is missing, so the lesson is not marked wrong for the wrong reason.
+- rkb runs the block with `bash -l` and `set -eo pipefail` in a new temporary folder, with `PROJECT_ROOT` set to the project's checkout when rkb knows it.
+- No script runs until the user approves its exact text on this machine. `rkb approve <id> check` and `rkb verify <id>` return `needs_user` with the whole script; show it to the user. Any edit to the script needs a new approval.
+- `rkb verify <id>` runs the approved `Check`: a fail makes the lesson `stale`, a pass on a stale lesson makes it `active`, and a pass marks it `verified_how: checked`. Never write `verified_how: checked` yourself; lint refuses it.
+- `rkb verify --auto` runs every approved check without asking, for cron.
+
 ## Writing style
 
 Write in ASD-STE100 Simplified Technical English:

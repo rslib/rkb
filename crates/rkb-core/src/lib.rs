@@ -1,6 +1,7 @@
 //! Lesson model, validation and knowledge base operations for rkb.
 //! This crate never writes to the terminal; the `rkb` binary presents its results.
 
+pub mod approval;
 pub mod body;
 pub mod conditions;
 pub mod config;
@@ -22,11 +23,13 @@ pub mod matching;
 pub mod paths;
 pub mod request;
 pub mod review;
+pub mod script;
 pub mod search;
 pub mod state;
 pub mod sync;
 pub mod text;
 pub mod usage;
+pub mod verify;
 pub mod write;
 pub mod yaml;
 

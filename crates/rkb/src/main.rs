@@ -201,6 +201,22 @@ enum Cmd {
         /// The new file name without `.md`: lowercase letters, digits and `-`.
         slug: String,
     },
+    /// Approve a lesson's Check or Probe script to run on this machine. Asks the user and shows the whole script.
+    #[command(after_help = "Example:\n  rkb approve 7f3a9c2b41 check")]
+    Approve {
+        id: String,
+        #[arg(value_parser = ["check", "probe"])]
+        kind: String,
+    },
+    /// Run a lesson's approved Check and update its status: a fail makes it stale, a pass makes it checked.
+    #[command(after_help = "Example:\n  rkb verify 7f3a9c2b41\n  rkb verify --auto")]
+    Verify {
+        #[arg(required_unless_present = "auto")]
+        id: Option<String>,
+        /// Run every approved Check that can apply here. Never asks and never makes a stale lesson active; safe for cron.
+        #[arg(long, conflicts_with = "id")]
+        auto: bool,
+    },
     /// Bring an archived lesson back into search.
     #[command(after_help = "Example:\n  rkb unarchive 7f3a9c2b41")]
     Unarchive { id: String },
@@ -301,8 +317,19 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
     let root = kb::home();
     let colored = format == Format::Human && color();
     let state = paths::state_dir();
-    let needs_place =
-        matches!(cmd, None | Some(Cmd::Context | Cmd::Doctor { .. } | Cmd::Add { .. } | Cmd::Show { .. } | Cmd::Search { .. }));
+    let needs_place = matches!(
+        cmd,
+        None | Some(
+            Cmd::Context
+                | Cmd::Doctor { .. }
+                | Cmd::Add { .. }
+                | Cmd::Show { .. }
+                | Cmd::Search { .. }
+                | Cmd::Approve { .. }
+                | Cmd::Verify { .. }
+                | Cmd::Confirm { .. }
+        )
+    );
     let place = if needs_place && kb::open(&root).is_ok() {
         let cwd = std::env::current_dir().unwrap_or_else(|_| root.clone());
         Some(rkb_core::state::locate(&root, &cwd, hints, &state)?)
@@ -360,6 +387,24 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Archive { target, reason } => writes::lifecycle(&env, rkb_core::request::Action::Archive { target, reason }),
         Cmd::Move { id, folder } => writes::lifecycle(&env, rkb_core::request::Action::Move { id, folder }),
         Cmd::Rename { id, slug } => writes::lifecycle(&env, rkb_core::request::Action::Rename { id, slug }),
+        Cmd::Approve { id, kind } => {
+            kb::open(&root)?;
+            let kind = rkb_core::script::Kind::parse(&kind).expect("clap checks the kind");
+            let o = match rkb_core::verify::approve_request(&env.ctx(), &id, kind, false)? {
+                Some(req) => rkb_core::write::Outcome::NeedsUser(req),
+                None => rkb_core::write::Outcome::Info(format!("The {} script of {id} is already approved here", kind.name())),
+            };
+            Ok(writes::outcome(&env, o))
+        }
+        Cmd::Verify { id, auto } => {
+            kb::open(&root)?;
+            if auto {
+                let s = rkb_core::verify::auto(&env.ctx())?;
+                return Ok(session::verify_summary(&s, colored));
+            }
+            let (_, o) = rkb_core::verify::one(&env.ctx(), &id.expect("clap requires an id"), false)?;
+            Ok(writes::outcome(&env, o))
+        }
         Cmd::Unarchive { id } => writes::lifecycle(&env, rkb_core::request::Action::Unarchive { id }),
         Cmd::Used { id, failed, reason, .. } => writes::used(&env, id, failed, reason),
         Cmd::Log { id } => writes::log(&env, id),

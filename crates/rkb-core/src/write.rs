@@ -51,6 +51,8 @@ pub enum Note {
     Archived(String),
     /// Another file whose links a move or rename rewrote.
     LinksUpdated(String),
+    /// The result of a check that led to this write.
+    Checked(String),
     /// A lesson this write brought back from the archive.
     Unarchived(String),
     /// A project folder note that records the current repository's remote.
@@ -65,6 +67,7 @@ impl Note {
             Note::NewFolder(f) => format!("created the folder {f}"),
             Note::Archived(p) => format!("archived {p}; search hides it now"),
             Note::LinksUpdated(p) => format!("updated links in {p}"),
+            Note::Checked(m) => m.clone(),
             Note::Unarchived(p) => format!("{p} is active again and back in search"),
             Note::ProjectNote { path, remote } => format!("wrote {path} with the remote {remote}"),
             Note::Similar { id, title, path } => format!(
@@ -247,7 +250,7 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
         Action::Unarchive { id } => unarchive(&snap, id)?,
         Action::Move { id, folder } => return saved(ctx, relocate(ctx, snap, action, approved, id, Some(folder), None)?),
         Action::Rename { id, slug } => return saved(ctx, relocate(ctx, snap, action, approved, id, None, Some(slug))?),
-        Action::BreakLock { .. } | Action::Install { .. } | Action::Import { .. } => {
+        Action::BreakLock { .. } | Action::Install { .. } | Action::Import { .. } | Action::Approve { .. } => {
             unreachable!("confirm handles these itself")
         }
     };
@@ -281,6 +284,9 @@ pub fn confirm(ctx: &Ctx, req: &Request, choice: &str) -> Result<Outcome> {
     };
     request::remove(&ctx.state.join("requests"), &req.id);
     let Some(decision) = &c.decision else { return Ok(Outcome::Cancelled) };
+    if let Action::Approve { id, script, sha256, system, then_verify } = &req.action {
+        return crate::verify::approve(ctx, id, *script, sha256, system, *then_verify);
+    }
     if let Action::Install { harnesses, uninstall } = &req.action {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
         let steps = crate::install::plan(&home, &crate::paths::config_dir(), harnesses, *uninstall);
@@ -872,6 +878,36 @@ fn relocate(
     let commit = String::from_utf8_lossy(&git::run(ctx.root, &["rev-parse", "--short", "HEAD"])?).trim().to_string();
     let diff = String::from_utf8_lossy(&git::run(ctx.root, &["show", "-M", "--format=", &commit])?).into_owned();
     Ok(Outcome::Written(Written { kind, id: id.to_string(), path: new_path, title, commit, diff, notes }))
+}
+
+/// Applies a check result to the lesson as it is now, under the lock, when its `Check` is still the script that ran.
+/// Returns `None` when there is nothing to change.
+pub(crate) fn apply_check(
+    ctx: &Ctx,
+    id: &str,
+    sha256: &str,
+    decide: impl FnOnce(&Frontmatter) -> Option<(Frontmatter, String)>,
+) -> Result<Option<Outcome>> {
+    let kb: KbConfig = std::fs::read_to_string(ctx.root.join("kb.toml")).ok().and_then(|t| config::parse(&t).ok()).unwrap_or_default();
+    let _lock = kb_lock(ctx.root, &kb)?;
+    let snap = Snapshot::from_dir(ctx.root)?;
+    let (lessons, _) = snap.lessons();
+    let l = find(&lessons, id)?;
+    if crate::script::of(l, crate::script::Kind::Check).map(|t| crate::script::hash(&t)).as_deref() != Some(sha256) {
+        return Ok(Some(Outcome::Info(format!("the Check of {id} changed while it ran; nothing was written"))));
+    }
+    let Some((fm, message)) = decide(&l.frontmatter) else { return Ok(None) };
+    let p = Prepared {
+        kind: "verify",
+        id: id.to_string(),
+        path: l.path.clone(),
+        title: title_of(&l.body).unwrap_or_default(),
+        text: lesson::write(&fm, &l.body),
+        extra: vec![],
+        notes: vec![Note::Checked(message)],
+        message: None,
+    };
+    finish(ctx, snap, p).map(Some)
 }
 
 /// Puts the prepared files into `snap` and returns the lint errors that concern them.

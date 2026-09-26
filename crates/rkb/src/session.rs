@@ -190,3 +190,19 @@ pub fn review(candidates: &[rkb_core::review::Candidate], c: bool) -> Output {
     });
     Output { data, human, exit: 0, raw: false }
 }
+
+/// `rkb verify --auto`: counts, then the ids of each group that is not empty.
+pub fn verify_summary(s: &rkb_core::verify::Summary, c: bool) -> Output {
+    let groups = [("passed", &s.passed, "32"), ("failed", &s.failed, "31"), ("unknown", &s.unknown, "33"), ("skipped", &s.skipped, "2")];
+    let mut human = groups.iter().map(|(n, v, _)| format!("{} {n}", v.len())).collect::<Vec<_>>().join(", ");
+    for (name, ids, color) in groups {
+        if !ids.is_empty() {
+            human.push_str(&format!("\n{} {}", paint(c, color, &format!("{name:<8}")), ids.join(" ")));
+        }
+    }
+    let mut data = json!({ "passed": s.passed, "failed": s.failed, "unknown": s.unknown, "skipped": s.skipped });
+    if !s.failed.is_empty() {
+        data["help"] = json!(["Failed lessons are stale now; run `rkb show <id>` to see the reason"]);
+    }
+    Output { data, human, exit: 0, raw: false }
+}

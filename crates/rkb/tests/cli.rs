@@ -1914,3 +1914,105 @@ fn move_and_rename_rewrite_links() {
     assert_eq!((v["status"].as_str(), code), (Some("written"), Some(0)), "narrowing into a project is fine: {v}");
     assert!(env.rkb(&["lint"]).status.success());
 }
+
+fn with_check(title: &str, script: &str) -> String {
+    format!("{}\n## Check\n```bash\n{script}\n```\n", lesson_with(title).trim_end())
+}
+
+fn rkb_exit(env: &Env, args: &[&str], exit_file: &Path) -> (serde_json::Value, Option<i32>) {
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_TEST_EXIT", exit_file);
+    let mut all = args.to_vec();
+    all.extend(["--format", "json"]);
+    let o = rkb_with(c, &all, "");
+    (serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o))), o.status.code())
+}
+
+fn front(env: &Env, path: &str) -> String {
+    std::fs::read_to_string(env.kb().join(path)).unwrap()
+}
+
+#[test]
+fn approve_and_verify_checks() {
+    let env = kb_with_topics();
+    let exit = env.dir.path().join("exit-code");
+    let script = "exit \"$(cat \"$RKB_TEST_EXIT\")\"";
+    let a = add_ok(&env, "cmake", &with_check("Checked lesson one", script));
+    let (a_id, a_path) = (a["id"].as_str().unwrap().to_string(), a["path"].as_str().unwrap().to_string());
+
+    let plain = add_ok(&env, "cpp", &lesson_with("No script here"));
+    let (v, code) = env.json(&["approve", plain["id"].as_str().unwrap(), "check"], "");
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("refused"), Some(1)), "{v}");
+
+    let (v, code) = env.json(&["approve", &a_id, "check"], "");
+    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{v}");
+    let q = v["question"].as_str().unwrap();
+    assert!(q.contains(script) && q.contains("sha256 ") && q.contains("host:"), "{q}");
+    assert_eq!(v["options"][0], format!("approve {a_id} check"));
+    let (c, _) = confirm_on_tty(&env, v["request"].as_str().unwrap(), &format!("approve {a_id} check"));
+    assert_eq!(c["status"], "done", "{c}");
+    assert!(std::fs::read_to_string(env.dir.path().join("config/rkb/approvals.toml")).unwrap().contains("sha256"));
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
+    let (v, _) = env.json(&["approve", &a_id, "check"], "");
+    assert!(v["message"].as_str().unwrap().contains("already approved"), "{v}");
+
+    let before = commit_count(&env);
+    std::fs::write(&exit, "2").unwrap();
+    let (v, _) = rkb_exit(&env, &["verify", &a_id], &exit);
+    assert!(v["message"].as_str().unwrap().contains("unknown"), "{v}");
+    assert_eq!(commit_count(&env), before, "unknown changes nothing");
+
+    std::fs::write(&exit, "1").unwrap();
+    let (v, code) = rkb_exit(&env, &["verify", &a_id], &exit);
+    assert_eq!((v["status"].as_str(), code), (Some("written"), Some(0)), "{v}");
+    assert!(head_subject(&env).starts_with("verify(general/cmake): "));
+    let text = front(&env, &a_path);
+    assert!(text.contains("status: stale") && text.contains("stale_reason: check failed on host:") && text.contains("(exit 1)"), "{text}");
+    let checks = std::fs::read_to_string(env.dir.path().join("state/rkb/checks.jsonl")).unwrap();
+    assert!(checks.lines().last().unwrap().contains("\"result\":\"fail\""), "{checks}");
+
+    std::fs::write(&exit, "0").unwrap();
+    let (v, _) = rkb_exit(&env, &["verify", &a_id], &exit);
+    assert_eq!(v["status"], "written", "{v}");
+    let text = front(&env, &a_path);
+    let today = jiff::Zoned::now().date().to_string();
+    assert!(
+        text.contains("status: active") && text.contains("verified_how: checked") && text.contains(&format!("verified: {today}")),
+        "{text}"
+    );
+    assert!(!text.contains("stale_reason"));
+    let lint = env.rkb(&["lint"]);
+    assert!(lint.status.success(), "{}", stdout(&lint));
+
+    let b = add_ok(&env, "cmake", &with_check("Second checked lesson", "test -n \"$RKB_TEST_EXIT\""));
+    let b_id = b["id"].as_str().unwrap().to_string();
+    let (v, code) = rkb_exit(&env, &["verify", &b_id], &exit);
+    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{v}");
+    assert!(v["question"].as_str().unwrap().starts_with("Approve and run"));
+    let tty = env.dir.path().join("tty");
+    std::fs::write(&tty, "yes\n").unwrap();
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_TTY", &tty).env("RKB_TEST_EXIT", &exit);
+    let o = rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", &format!("approve {b_id} check"), "--format", "json"], "");
+    assert!(stdout(&o).contains("pass"), "approved and ran: {}", stdout(&o));
+    assert!(std::fs::read_to_string(env.dir.path().join("state/rkb/checks.jsonl")).unwrap().contains(&b_id));
+
+    let c_lesson = add_ok(&env, "cpp", &with_check("Never approved lesson", "exit 0"));
+    let (v, _) = env.json(&["flag", &a_id, "--reason", "manual doubt"], "");
+    assert_eq!(v["status"], "written");
+    std::fs::write(&exit, "0").unwrap();
+    let (v, code) = rkb_exit(&env, &["verify", "--auto"], &exit);
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(v["passed"], serde_json::json!([a_id.clone(), b_id.clone()]), "{v}");
+    assert_eq!(v["skipped"], serde_json::json!([c_lesson["id"].as_str().unwrap()]));
+    assert!(front(&env, &a_path).contains("status: stale"), "--auto never reactivates");
+    std::fs::write(&exit, "1").unwrap();
+    let (v, _) = rkb_exit(&env, &["verify", "--auto"], &exit);
+    assert_eq!(v["failed"], serde_json::json!([a_id.clone()]), "{v}");
+    assert!(front(&env, b["path"].as_str().unwrap()).contains("status: active"), "b's script passes whatever the file says");
+    assert!(
+        !env.dir.path().join("state/rkb/requests").exists()
+            || std::fs::read_dir(env.dir.path().join("state/rkb/requests")).unwrap().next().is_none(),
+        "--auto never asks"
+    );
+}

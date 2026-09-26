@@ -13,17 +13,58 @@ pub const EXPIRY_S: u64 = 3600;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Action {
-    Add { text: String, topic: String },
-    Edit { id: String, text: String, base: String },
-    Flag { id: String, reason: String },
-    Supersede { id: String, by: String, reason: String },
-    Archive { target: String, reason: String },
-    Unarchive { id: String },
-    Move { id: String, folder: String },
-    Rename { id: String, slug: String },
-    BreakLock { path: String, holder: String },
-    Install { harnesses: Vec<crate::install::Harness>, uninstall: bool },
-    Import { items: Vec<ImportItem> },
+    Add {
+        text: String,
+        topic: String,
+    },
+    Edit {
+        id: String,
+        text: String,
+        base: String,
+    },
+    Flag {
+        id: String,
+        reason: String,
+    },
+    Supersede {
+        id: String,
+        by: String,
+        reason: String,
+    },
+    Archive {
+        target: String,
+        reason: String,
+    },
+    Unarchive {
+        id: String,
+    },
+    Move {
+        id: String,
+        folder: String,
+    },
+    Rename {
+        id: String,
+        slug: String,
+    },
+    /// Approve a lesson's script on this system; with `then_verify`, run the check right after.
+    Approve {
+        id: String,
+        script: crate::script::Kind,
+        sha256: String,
+        system: String,
+        then_verify: bool,
+    },
+    BreakLock {
+        path: String,
+        holder: String,
+    },
+    Install {
+        harnesses: Vec<crate::install::Harness>,
+        uninstall: bool,
+    },
+    Import {
+        items: Vec<ImportItem>,
+    },
 }
 
 /// One lesson of an import batch, with the decisions its report showed.
@@ -59,6 +100,7 @@ pub enum Decision {
     SkipDuplicates,
     Supersede,
     Archive,
+    Approve,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
