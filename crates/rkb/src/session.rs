@@ -11,14 +11,6 @@ fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
-fn home_path(root: &std::path::Path) -> String {
-    let root = root.display().to_string();
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && root.starts_with(&h) => format!("~{}", &root[h.len()..]),
-        _ => root,
-    }
-}
-
 fn matched(m: &Option<Matched>) -> Value {
     m.as_ref().map_or(Value::Null, |m| json!({ "name": m.name, "rule": m.rule.describe() }))
 }
@@ -33,7 +25,15 @@ fn next_list(place: &Place) -> String {
 /// The live state for `rkb` with no command.
 pub fn status(env: &Env, s: &State) -> Output {
     let c = env.colored;
-    let mut human = format!("{} {}\n\n", paint(c, "1", "rkb"), home_path(&env.root));
+    let bin = std::env::current_exe().map(|p| crate::output::tilde(&p)).unwrap_or_default();
+    let mut human = format!(
+        "{} {}\n{}\n{} {}\n\n",
+        paint(c, "1", "rkb"),
+        paint(c, "2", &format!("- {}", crate::ABOUT)),
+        paint(c, "2", &format!("bin {bin}")),
+        paint(c, "2", "kb "),
+        crate::output::tilde(&env.root)
+    );
     let row = |label: &str, m: &Option<Matched>, n: Option<usize>| match m {
         Some(m) => format!(
             "{label:<8} {:<14} {:>12}   {}\n",
@@ -67,7 +67,9 @@ pub fn status(env: &Env, s: &State) -> Output {
         help.push("Run `rkb doctor` to see the uncommitted changes".into());
     }
     let data = json!({
-        "kb": env.root.display().to_string(),
+        "bin": bin,
+        "description": crate::ABOUT,
+        "kb": crate::output::tilde(&env.root),
         "project": matched(&s.place.project),
         "system": matched(&s.place.system),
         "lessons": { "project": s.project_lessons, "system": s.system_lessons, "general": s.general_lessons },

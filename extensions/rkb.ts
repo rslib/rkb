@@ -5,6 +5,8 @@
 import { spawn } from "node:child_process";
 
 const HARNESS = "__HARNESS__";
+// The rkb binary that installed this file; rkb install fills it in.
+const RKB: string = "__RKB__";
 const TIMEOUT_MS = 5000;
 // Kept here as well so a command that runs `rkb confirm` is gated even when `rkb` cannot run.
 const CONFIRM = /(^|[\s;&|('"/])rkb\s+confirm\b/;
@@ -31,7 +33,7 @@ function hook(event: string, payload: Record<string, unknown>, timeoutMs = TIMEO
     };
     let child: any;
     try {
-      child = spawn("rkb", ["hook", event, "--harness", HARNESS], { stdio: ["pipe", "pipe", "ignore"] });
+      child = spawn(RKB, ["hook", event, "--harness", HARNESS], { stdio: ["pipe", "pipe", "ignore"] });
     } catch {
       return finish();
     }

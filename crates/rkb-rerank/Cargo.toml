@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1"
-tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 serde_json.workspace = true
 safetensors = "0.8"
 memmap2 = "0.9"

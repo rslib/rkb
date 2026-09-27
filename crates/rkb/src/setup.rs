@@ -6,20 +6,12 @@ use rkb_core::paths;
 use rkb_core::request::{self, Action, Choice, Decision, Request};
 use serde_json::json;
 
+use crate::output::tilde;
 use crate::output::{CliError, ErrorCode, Output, paint};
 use crate::writes::{Env, needs_user_output};
 
 fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
-}
-
-/// `path` with the home folder shown as `~`.
-fn tilde(path: &std::path::Path) -> String {
-    let h = home();
-    match path.strip_prefix(&h) {
-        Ok(rest) if !h.as_os_str().is_empty() => format!("~/{}", rest.display()),
-        _ => path.display().to_string(),
-    }
 }
 
 fn harnesses(names: &[String], home: &std::path::Path) -> Result<Vec<Harness>, CliError> {

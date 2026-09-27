@@ -158,7 +158,7 @@ fn init_creates_a_valid_knowledge_base() {
 fn init_refuses_a_non_empty_directory() {
     let env = Env::new();
     env.write("notes.txt", "x");
-    let o = env.rkb(&["init"]);
+    let o = env.rkb(&["init", "--toon"]);
     assert!(!o.status.success());
     assert!(stdout(&o).contains("code: exists"), "{}", stdout(&o));
     assert!(!env.kb().join(".git").exists());
@@ -168,7 +168,7 @@ fn init_refuses_a_non_empty_directory() {
 fn init_needs_a_git_identity() {
     let env = Env::new();
     std::fs::write(env.dir.path().join("gitconfig"), "").unwrap();
-    let o = env.rkb(&["init"]);
+    let o = env.rkb(&["init", "--toon"]);
     assert!(!o.status.success());
     let out = stdout(&o);
     assert!(out.contains("code: git_identity") && out.contains("git config --global user.name"), "{out}");
@@ -178,7 +178,7 @@ fn init_needs_a_git_identity() {
 #[test]
 fn missing_knowledge_base_points_to_init() {
     let env = Env::new();
-    let o = env.rkb(&["lint"]);
+    let o = env.rkb(&["lint", "--toon"]);
     assert!(!o.status.success());
     let out = stdout(&o);
     assert!(out.contains("code: not_a_kb") && out.contains("rkb init"), "{out}");
@@ -232,8 +232,12 @@ fn staged_lint_rejects_hand_written_checked() {
 fn output_formats() {
     let env = Env::new();
     env.init();
-    let toon = stdout(&env.rkb(&["lint"]));
+    let human = stdout(&env.rkb(&["lint"]));
+    assert!(human.contains("0 errors, 0 warnings") && !human.contains('\x1b'), "piped output is human text without color: {human}");
+    let toon = stdout(&env.rkb(&["lint", "--toon"]));
     assert!(toon.contains("errors: 0") && toon.contains("findings"), "{toon}");
+    let o = env.rkb(&["lint", "--toon", "--format", "json"]);
+    assert_eq!(o.status.code(), Some(2), "--toon and another --format conflict");
     let json: serde_json::Value = serde_json::from_slice(&env.rkb(&["lint", "--format", "json"]).stdout).unwrap();
     assert_eq!(json["findings"], serde_json::json!([]));
     let human = env.cmd(env!("CARGO_BIN_EXE_rkb")).env("RKB_FORMAT", "json").args(["lint", "--format", "human"]).output().unwrap();
@@ -246,7 +250,7 @@ fn output_formats() {
 fn error_records_in_each_format() {
     let env = Env::new();
     env.init();
-    let toon = env.rkb(&["show", "0000000000"]);
+    let toon = env.rkb(&["show", "0000000000", "--toon"]);
     assert!(!toon.status.success());
     assert!(String::from_utf8_lossy(&toon.stdout).contains("code: not_found"));
     let json: serde_json::Value = serde_json::from_slice(&env.rkb(&["show", "0000000000", "--format", "json"]).stdout).unwrap();
@@ -429,7 +433,7 @@ fn add_refuses_bad_input() {
 #[test]
 fn new_topic_needs_user_and_confirm_paths() {
     let env = kb_with_topics();
-    let o = env.rkb_in(&["add", "--topic", "cmak"], PITFALL);
+    let o = env.rkb_in(&["add", "--topic", "cmak", "--toon"], PITFALL);
     assert_eq!(o.status.code(), Some(3));
     let out = stdout(&o);
     assert!(out.contains("status: needs_user") && out.contains("create general/cmak") && out.contains("use general/cmake"), "{out}");
@@ -812,7 +816,7 @@ fn list_topic_markers_sections_and_widths() {
     assert!(ascii.contains("general/io - Input and output - 4 lessons") && ascii.contains("  - Stale one"), "{ascii}");
     assert!(!ascii.contains('·') && !ascii.contains('✓'));
 
-    let toon = list_cmd(&env, &["list", "general/io"], "80", "en_US.UTF-8");
+    let toon = list_cmd(&env, &["list", "general/io", "--toon"], "80", "en_US.UTF-8");
     assert!(toon.contains("lessons[4]{id,type,status,title,tags,when,verified}:"), "{toon}");
     assert!(toon.contains("Run `rkb show <id>`"));
     let rows: Vec<&str> = toon.lines().filter(|l| l.starts_with("  \"1000")).collect();
@@ -1017,7 +1021,7 @@ fn show_applies_with_reasons() {
 
     let human = stdout(&env.rkb(&["show", "7f3a9c2b41", "--with", "hdf5=1.14.3", "--system", "tuolumne", "--format", "human"]));
     assert!(human.contains("applies here: no (hdf5 wants 1.12:1.14.2, has 1.14.3)"), "{human}");
-    let toon = stdout(&env.rkb(&["show", "7f3a9c2b41", "--with", "hdf5=1.14.3", "--system", "tuolumne"]));
+    let toon = stdout(&env.rkb(&["show", "7f3a9c2b41", "--with", "hdf5=1.14.3", "--system", "tuolumne", "--toon"]));
     assert!(toon.contains("keys[2]{key,want,have,result,reason}:"), "{toon}");
 
     let (v, _) = env.json(&["show", "7f3a9c2b41", "--with", "hdf5=1.14.1", "--system", "tuolumne"], "");
@@ -1102,7 +1106,7 @@ fn search_outputs_and_hidden_results() {
 
     let (v, _) = env.json(&["find", "undefind vtable"], "");
     assert_eq!(v["results"][0]["id"], "1a00000012");
-    let toon = stdout(&env.rkb(&["search", "git rebase"]));
+    let toon = stdout(&env.rkb(&["search", "git rebase", "--toon"]));
     assert!(toon.contains("results[3]{id,type,title,path,status,applies,summary}:"), "{toon}");
     assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
 }
@@ -1372,6 +1376,47 @@ fn note_and_inbox() {
     let (v, _) = env.json(&["inbox"], "");
     assert_eq!((v["expired"].as_u64(), v["items"].as_array().unwrap().len()), (Some(1), 1), "{v}");
     assert!(!old.exists());
+}
+
+#[test]
+fn argument_errors_are_records_on_stdout() {
+    let env = search_kb();
+    let o = env.rkb(&["list", "--stat", "x", "--toon"]);
+    assert_eq!(o.status.code(), Some(2));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("code: usage") && out.contains("--stat") && out.contains("valid for `rkb list`"), "{out}");
+    let (v, code) = env.json(&["search", "x", "--limt", "3"], "");
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("usage"), Some(2)), "{v}");
+    assert!(v["error"]["fix"].as_str().unwrap().contains("--limit"), "{v}");
+    let (v, code) = env.json(&["lsit"], "");
+    assert_eq!(code, Some(2));
+    assert!(v["error"]["fix"].as_str().unwrap().contains("list"), "{v}");
+    let (v, _) = env.json(&["models"], "");
+    assert!(v["error"]["fix"].as_str().unwrap().contains("fetch"), "{v}");
+
+    let help = env.rkb(&["show", "--help"]);
+    assert_eq!(help.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("rkb show 7f3a9c2b41"));
+    for flag in ["-v", "-V", "--version"] {
+        let o = env.rkb(&[flag]);
+        assert_eq!((o.status.code(), String::from_utf8_lossy(&o.stdout).trim()), (Some(0), concat!("rkb ", env!("CARGO_PKG_VERSION"))));
+    }
+}
+
+#[test]
+fn home_view_identifies_the_binary() {
+    let env = search_kb();
+    let (v, _) = env.json(&[], "");
+    let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+    assert_eq!(keys[..3], ["bin", "description", "kb"], "{v}");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_rkb"));
+    assert_eq!(
+        v["bin"].as_str().unwrap(),
+        bin.canonicalize().unwrap().display().to_string().replace(&env.dir.path().display().to_string(), "~"),
+        "{v}"
+    );
+    assert_eq!(v["kb"], "~/kb", "the knowledge base under HOME is shown with ~: {v}");
+    assert!(v["description"].as_str().unwrap().contains("lessons learned"));
 }
 
 #[test]
@@ -1686,6 +1731,7 @@ fn extension_drives_rkb_hook() {
         let body = |t: &str| serde_json::to_string(t.split_once("\n---\n").unwrap().1.trim_start()).unwrap();
         let text = include_str!("../../../extensions/rkb.ts")
             .replace("__HARNESS__", harness)
+            .replace("\"__RKB__\"", "\"rkb\"")
             .replace("\"__RETRO__\"", &body(include_str!("../../../skills/rkb/commands/rkb-retro.md")))
             .replace("\"__DISTILL__\"", &body(include_str!("../../../skills/rkb/commands/rkb-distill.md")));
         std::fs::write(&file, text).unwrap();

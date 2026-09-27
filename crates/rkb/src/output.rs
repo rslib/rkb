@@ -11,7 +11,7 @@ pub enum Format {
     Human,
 }
 
-/// The format for this call: the flag, then `RKB_FORMAT`, then human on a terminal and TOON otherwise.
+/// The format for this call: the flag, then `RKB_FORMAT`, then human. Agents pass `--toon`.
 pub fn resolve(flag: Option<Format>) -> Result<Format, CliError> {
     if let Some(f) = flag {
         return Ok(f);
@@ -23,8 +23,16 @@ pub fn resolve(flag: Option<Format>) -> Result<Format, CliError> {
             fix: "set RKB_FORMAT to toon, json or human, or unset it".into(),
             extra: None,
         }),
-        Err(_) if std::io::stdout().is_terminal() => Ok(Format::Human),
-        Err(_) => Ok(Format::Toon),
+        Err(_) => Ok(Format::Human),
+    }
+}
+
+/// `path` with the home folder shown as `~`.
+pub fn tilde(path: &std::path::Path) -> String {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+    match path.strip_prefix(&home) {
+        Ok(rest) if !home.as_os_str().is_empty() => format!("~/{}", rest.display()),
+        _ => path.display().to_string(),
     }
 }
 

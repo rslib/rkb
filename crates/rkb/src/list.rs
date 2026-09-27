@@ -81,14 +81,6 @@ fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
-fn home_path(root: &Path) -> String {
-    let root = root.display().to_string();
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && root.starts_with(&h) => format!("~{}", &root[h.len()..]),
-        _ => root,
-    }
-}
-
 const MIN_TITLE: usize = 24;
 
 /// One lesson line: marker, title, then conditions and flags right-aligned at `end`.
@@ -244,7 +236,7 @@ fn overview_human(ov: &Overview, root: &Path, color: bool, m: &Marks, width: usi
         let pad = end.saturating_sub(indent + len(label) + len(&n)).max(2);
         format!("{}{}{}{n}\n", " ".repeat(indent), paint(color && bold, "1", label), " ".repeat(pad))
     };
-    let mut out = format!("{}\n", paint(color, "1", &format!("{} {} {}", home_path(root), m.sep, plural(ov.total, "lesson"))));
+    let mut out = format!("{}\n", paint(color, "1", &format!("{} {} {}", crate::output::tilde(root), m.sep, plural(ov.total, "lesson"))));
     if ov.scopes.is_empty() {
         out.push_str("\nNo lessons yet. Add one with `rkb add --topic <topic>`.\n");
     }

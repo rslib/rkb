@@ -11,7 +11,7 @@ mod writes;
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use output::{CliError, Format, Output, color, cut, paint};
 use rkb_core::conditions::Verdict;
 use rkb_core::lint::{LintEnv, Severity};
@@ -20,13 +20,18 @@ use serde_json::{Value, json};
 
 const MESSAGE_LIMIT: usize = 200;
 
-/// Read and grow a knowledge base of lessons learned.
+/// What rkb is, in one sentence: the top-level help and the no-command view share it.
+pub const ABOUT: &str = "Read and grow a knowledge base of lessons learned.";
+
 #[derive(Parser)]
-#[command(name = "rkb", version, after_help = "Example:\n  rkb lint")]
+#[command(name = "rkb", version, about = ABOUT, after_help = "Example:\n  rkb lint")]
 struct Cli {
-    /// Output format. Default: RKB_FORMAT, then human on a terminal and toon otherwise.
+    /// Output format. Default: RKB_FORMAT, then human.
     #[arg(long, global = true, value_enum)]
     format: Option<Format>,
+    /// TOON output for agents; the same as --format toon.
+    #[arg(long, global = true)]
+    toon: bool,
     /// Use this project instead of matching one (also RKB_PROJECT).
     #[arg(long, global = true)]
     project: Option<String>,
@@ -367,13 +372,85 @@ enum ModelsCmd {
     },
 }
 
+/// Turns a clap error into rkb's error record on stdout, so an agent can correct the call in one step.
+fn parse_error(args: &[String], e: clap::Error) -> ExitCode {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+        let _ = e.print();
+        return ExitCode::SUCCESS;
+    }
+    let flag = args
+        .windows(2)
+        .find(|w| w[0] == "--format")
+        .map(|w| w[1].clone())
+        .or_else(|| args.iter().find_map(|a| a.strip_prefix("--format=").map(str::to_string)));
+    let flag = flag.and_then(|f| <Format as clap::ValueEnum>::from_str(&f, true).ok());
+    let flag = if args.iter().any(|a| a == "--toon") { Some(Format::Toon) } else { flag };
+    let format = output::resolve(flag).unwrap_or(Format::Human);
+    let mut cmd = Cli::command();
+    cmd.build();
+    let mut path = vec!["rkb".to_string()];
+    for a in args.iter().skip(1).filter(|a| !a.starts_with('-')) {
+        let Some(sub) = cmd.find_subcommand(a).cloned() else { break };
+        cmd = sub;
+        path.push(a.clone());
+    }
+    let path = path.join(" ");
+    let rendered = e.render().to_string();
+    let message = rendered.lines().next().unwrap_or("").trim_start_matches("error: ").to_string();
+    let wants_command = matches!(
+        e.kind(),
+        ErrorKind::InvalidSubcommand | ErrorKind::MissingSubcommand | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    );
+    let fix = if wants_command {
+        let suggested = match e.get(ContextKind::SuggestedSubcommand) {
+            Some(ContextValue::String(s)) => format!("did you mean `{path} {s}`? "),
+            Some(ContextValue::Strings(v)) if !v.is_empty() => format!("did you mean `{path} {}`? ", v[0]),
+            _ => String::new(),
+        };
+        let names: Vec<&str> = cmd.get_subcommands().map(|c| c.get_name()).filter(|n| *n != "help").collect();
+        format!("{suggested}commands of `{path}`: {}", names.join(", "))
+    } else {
+        let (global, own): (Vec<_>, Vec<_>) = cmd.get_arguments().filter(|a| a.get_long() != Some("help")).partition(|a| a.is_global_set());
+        let names = |args: &[&clap::Arg]| -> Vec<String> {
+            args.iter()
+                .map(|a| match a.get_long() {
+                    Some(l) => format!("--{l}"),
+                    None => format!("<{}>", a.get_id().as_str().to_lowercase()),
+                })
+                .collect()
+        };
+        let own = names(&own);
+        let own = if own.is_empty() { "none".to_string() } else { own.join(", ") };
+        format!("valid for `{path}`: {own}; on every command: {}; `{path} --help` has examples", names(&global).join(", "))
+    };
+    let message = if wants_command && e.kind() != ErrorKind::InvalidSubcommand { format!("`{path}` needs a command") } else { message };
+    output::print_error(format, &CliError::new(output::ErrorCode::Usage, message, fix));
+    ExitCode::from(2)
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let args: Vec<String> = std::env::args().collect();
+    if let [_, v] = args.as_slice()
+        && matches!(v.as_str(), "-v" | "-V" | "--version")
+    {
+        println!("rkb {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(c) => c,
+        Err(e) => return parse_error(&args, e),
+    };
     if let Some(Cmd::Hook { event, harness }) = &cli.cmd {
         hook::run(event, harness);
         return ExitCode::SUCCESS;
     }
-    let format = match output::resolve(cli.format) {
+    if cli.toon && cli.format.is_some_and(|f| f != Format::Toon) {
+        let e = CliError::new(output::ErrorCode::Usage, "--toon and --format ask for different formats", "pass one of them");
+        output::print_error(Format::Toon, &e);
+        return ExitCode::from(2);
+    }
+    let format = match output::resolve(if cli.toon { Some(Format::Toon) } else { cli.format }) {
         Ok(f) => f,
         Err(e) => {
             output::print_error(Format::Human, &e);

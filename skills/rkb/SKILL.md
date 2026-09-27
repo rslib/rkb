@@ -1,11 +1,11 @@
 ---
 name: rkb
-description: Read and check a personal knowledge base of lessons learned (pitfalls, recipes, facts, decisions, preferences) with the rkb CLI. Use when you need to look at a lesson, check the knowledge base after a change, or write a lesson file in the right folder and format.
+description: A personal knowledge base of lessons learned (pitfalls, recipes, facts, decisions, preferences), used through the rkb CLI. Use it before fixing an error or problem that may have been seen before (search it first); after you learn something durable, or when the user says to remember something (record it with rkb add, never by writing files); and when the user asks to clean up the knowledge base, find duplicates, or distill the inbox.
 ---
 
 # rkb
 
-rkb manages a git repository of Markdown lessons at `$RKB_HOME` (default `~/Personal/kb`). Output is TOON when piped; read it as it is. Do not add `--format human` or `--format json` yourself: TOON is the format meant for you, and you tell the user the result in your own words. Only a script that parses the output uses `--format json`.
+rkb manages a git repository of Markdown lessons at `$RKB_HOME` (default `~/Personal/kb`). Pass `--toon` on every rkb command you run, such as `rkb search "cmake hdf5" --toon`: TOON is the compact, structured format meant for you. Without it rkb prints human text, which is for people at a terminal. Read the TOON as it is and tell the user the result in your own words. Only a script that parses the output uses `--format json`.
 
 - Run `rkb` (or `rkb context` for 3 short lines) at the start of a task. It shows the project and system rkb matched here, lesson counts, pending requests and uncommitted changes.
 - Run `rkb doctor` when something looks wrong. Each check that is not `ok` has a `fix` line; run it or show it to the user.
@@ -29,7 +29,7 @@ rkb manages a git repository of Markdown lessons at `$RKB_HOME` (default `~/Pers
 
 Never write or change a lesson file with your own tools. rkb checks it, places it and commits it.
 
-- Run `rkb add --type pitfall --template` to get a skeleton. Fill it and pipe it: `rkb add --topic <topic> < lesson.md`. Do not write `id`, `schema`, `status` or the file path; rkb sets them. rkb picks the scope folder from `when`.
+- rkb runs no model. You write the lesson text; rkb sets the id, the folder and the file name, checks the format, names similar lessons and commits. Run `rkb add --type pitfall --template` to see the skeleton, then pipe your filled text straight in with a heredoc, no temporary file: `rkb add --topic <topic> <<'EOF'` ... `EOF`. Do not write `id`, `schema`, `status` or the file path; rkb sets them. rkb picks the scope folder from `when`.
 - Run `rkb show <id>` before you change a lesson. Pipe the whole new file with the hash it printed: `rkb edit <id> --base <hash> < lesson.md`. A `conflict` error means the lesson changed; read it again and merge.
 - Run `rkb flag <id> --reason "<what failed>"` when a lesson looks wrong and you cannot fix it now. Fix it or flag it; never leave it silently wrong.
 - Run `rkb supersede <id> --by <new id> --reason "<why>"` when a lesson is wrong and another lesson now says the right thing. Run `rkb archive <id or folder> --reason "<why>"` when a lesson is still true but no longer matters, such as for a retired system. Both hide lessons from search, so they return `needs_user`; show the question to the user. `rkb unarchive <id>` brings a lesson back without a question.
