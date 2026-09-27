@@ -24,6 +24,8 @@ impl Env {
         let bin = PathBuf::from(env!("CARGO_BIN_EXE_rkb"));
         let path = format!("{}:{}", bin.parent().unwrap().display(), std::env::var("PATH").unwrap());
         let mut c = Command::new(program);
+        // Never the developer's checkout: project detection would run git there.
+        c.current_dir(self.dir.path());
         c.env("RKB_HOME", self.kb())
             .env("HOME", self.dir.path())
             .env("USER", "testuser")
@@ -1517,7 +1519,7 @@ fn rkb_add_builds_the_lesson() {
     assert!(out.contains("status: written") && out.contains("general/cmake/"), "{out}");
     let id = out.lines().find_map(|l| l.strip_prefix("id: ")).unwrap().to_string();
     let (v, _) = env.json(&["show", &id], "");
-    let body = v["body"].as_str().unwrap();
+    let body = v["body"].as_str().unwrap_or_else(|| panic!("show {id}: {v}\nadd said: {out}"));
     let heads: Vec<&str> = body.lines().filter_map(|l| l.strip_prefix("## ")).collect();
     assert_eq!(heads, ["Symptom", "Cause", "Fix", "Evidence"]);
     assert_eq!(v["frontmatter"]["tags"][0], "ninja");
