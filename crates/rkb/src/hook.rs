@@ -2,7 +2,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rkb_core::conditions::{Facts, Verdict};
-use rkb_core::hooks::{self, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_MIN_COVERAGE, DEFAULT_MIN_RELEVANCE, MAX_NUDGES};
+use rkb_core::hooks::{
+    self, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_MIN_COVERAGE, DEFAULT_MIN_RELEVANCE, MAX_NUDGES, RECALL_MIN_MARGIN, RECALL_MIN_RELEVANCE,
+};
 use rkb_core::matching::Hints;
 use rkb_core::search::{Mode, Options};
 use rkb_core::{config, kb, lock, paths, request, rerank, search, state};
@@ -129,12 +131,6 @@ fn tool_ok(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {
     }
     Ok(None)
 }
-
-/// Recall adds a lesson only when a model rates it at least this high...
-const RECALL_MIN_RELEVANCE: f64 = 0.85;
-/// ...and at least this much above the next lesson: Laya rates general lessons high for many questions,
-/// so a lone clear winner is the signal, not a high score alone.
-const RECALL_MIN_MARGIN: f64 = 0.05;
 
 fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {
     if p["is_interrupt"] == true {

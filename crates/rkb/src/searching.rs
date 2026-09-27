@@ -205,7 +205,18 @@ pub fn find(env: &Env, query: &str, limit: usize) -> Result<Output, CliError> {
     Ok(Output { data: json!({ "query": query, "results": rows, "help": [help] }), human, exit: 0, raw: false })
 }
 
-pub fn eval(env: &Env, file: Option<String>, min_recall: Option<f64>, backend: &str) -> Result<Output, CliError> {
+/// `hooks.recall_min_relevance` and `hooks.recall_min_margin` from kb.toml, else the defaults.
+fn recall_thresholds(root: &std::path::Path) -> (f64, f64) {
+    let hooks = std::fs::read_to_string(root.join("kb.toml"))
+        .ok()
+        .and_then(|t| rkb_core::config::parse::<rkb_core::config::KbConfig>(&t).ok())
+        .and_then(|c| c.hooks)
+        .unwrap_or_default();
+    let get = |k: &str, d: f64| hooks.get(k).and_then(|v| v.as_float()).unwrap_or(d);
+    (get("recall_min_relevance", rkb_core::hooks::RECALL_MIN_RELEVANCE), get("recall_min_margin", rkb_core::hooks::RECALL_MIN_MARGIN))
+}
+
+pub fn eval(env: &Env, file: Option<String>, min_recall: Option<f64>, backend: &str, sweep: bool) -> Result<Output, CliError> {
     let path = file.map(std::path::PathBuf::from).unwrap_or_else(|| env.root.join("eval/queries.toml"));
     let text = std::fs::read_to_string(&path).map_err(|e| {
         CliError::new(
@@ -246,31 +257,85 @@ pub fn eval(env: &Env, file: Option<String>, min_recall: Option<f64>, backend: &
         Ok(())
     })?;
     let pass = min_recall.is_none_or(|m| report.recall_at_5 + 1e-9 >= m);
+    let (min, margin) = recall_thresholds(&env.root);
     let c = env.colored;
     let mut human = String::new();
+    let scores = |r: &eval::Row| -> String {
+        r.top.iter().filter_map(|t| t.1).map(|s| format!("{:.2}", crate::output::score2(s))).collect::<Vec<_>>().join(" ")
+    };
     for r in &report.rows {
-        let rank = r.rank.map_or_else(|| "-".to_string(), |k| k.to_string());
-        let rank =
-            if r.rank.is_some_and(|k| k <= 5) { paint(c, "32", &format!("{rank:>2}")) } else { paint(c, "31", &format!("{rank:>2}")) };
-        human.push_str(&format!("{rank}  {}\n", r.text));
+        let rank = if !r.answerable() {
+            paint(c, "2", " n")
+        } else {
+            let rank = r.rank.map_or_else(|| "-".to_string(), |k| k.to_string());
+            if r.rank.is_some_and(|k| k <= 5) { paint(c, "32", &format!("{rank:>2}")) } else { paint(c, "31", &format!("{rank:>2}")) }
+        };
+        let verdict = eval::recall(r, min, margin).map(|v| {
+            let color = match v {
+                eval::Recall::Right => "32",
+                eval::Recall::Wrong => "31",
+                eval::Recall::Silent => "2",
+            };
+            format!("  {} {}", paint(c, color, &format!("{:<6}", v.as_str())), paint(c, "2", &scores(r)))
+        });
+        human.push_str(&format!("{rank}  {}{}\n", r.text, verdict.unwrap_or_default()));
     }
+    let answerable = report.rows.iter().filter(|r| r.answerable()).count();
     human.push_str(&format!(
-        "\n{} queries  recall@5 {:.2}  mrr {:.2}  ranked by: {ranked_by}",
+        "\n{} queries ({} with no answer)  recall@5 {:.2}  mrr {:.2}  ranked by: {ranked_by}",
         report.rows.len(),
+        report.rows.len() - answerable,
         report.recall_at_5,
         report.mrr
     ));
     if let Some(m) = min_recall {
         human.push_str(&format!("  ({} the minimum {m:.2})", if pass { "meets" } else { "BELOW" }));
     }
-    let rows: Vec<Value> = report.rows.iter().map(|r| json!({ "query": r.text, "rank": r.rank.unwrap_or(0) })).collect();
-    let data = json!({
+    let totals = eval::tally(&report.rows, min, margin);
+    match totals {
+        Some([right, wrong, silent]) => {
+            human.push_str(&format!("\nrecall at {min:.2}, margin {margin:.2}: {right} right, {wrong} wrong, {silent} silent"))
+        }
+        None => human.push_str("\nrecall does not apply: no model ranked the results"),
+    }
+    let mut grid = vec![];
+    if sweep && totals.is_some() {
+        human.push_str("\n\n min  margin  right  wrong  silent");
+        for m in eval::SWEEP_MIN {
+            for g in eval::SWEEP_MARGIN {
+                let [right, wrong, silent] = eval::tally(&report.rows, m, g).expect("a model ranked the results");
+                human.push_str(&format!("\n{m:.2}   {g:.2}   {right:>5}  {wrong:>5}  {silent:>6}"));
+                grid.push(json!({ "min": m, "margin": g, "right": right, "wrong": wrong, "silent": silent }));
+            }
+        }
+    }
+    let rows: Vec<Value> = report
+        .rows
+        .iter()
+        .map(|r| {
+            let mut row = json!({ "query": r.text, "answerable": r.answerable(), "rank": r.rank.unwrap_or(0) });
+            if let Some(v) = eval::recall(r, min, margin) {
+                row["recall"] = json!(v.as_str());
+                row["top"] =
+                    json!(r.top.iter().map(|(id, s)| json!({ "id": id, "relevance": s.map(crate::output::score2) })).collect::<Vec<_>>());
+            }
+            row
+        })
+        .collect();
+    let mut data = json!({
         "queries": report.rows.len(),
+        "answerable": answerable,
         "recall_at_5": (report.recall_at_5 * 1000.0).round() / 1000.0,
         "mrr": (report.mrr * 1000.0).round() / 1000.0,
         "ranked_by": ranked_by,
         "rows": rows,
         "help": ["rank 0 means not in the first 10; add a missed search to the query file to keep it tested"],
     });
+    if let Some([right, wrong, silent]) = totals {
+        data["recall"] = json!({ "min_relevance": min, "margin": margin, "right": right, "wrong": wrong, "silent": silent });
+    }
+    if sweep && !grid.is_empty() {
+        data["recall_sweep"] = json!(grid);
+    }
     Ok(Output { data, human, exit: u8::from(!pass), raw: false })
 }

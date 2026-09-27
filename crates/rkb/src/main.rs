@@ -144,7 +144,7 @@ enum Cmd {
     },
     /// Measure search on a query file: recall at 5 and mean reciprocal rank.
     #[command(
-        after_help = "Example:\n  rkb eval\n  rkb eval --queries tests/fixtures/search/queries.toml --min-recall 0.9\n  rkb eval --rerank laya"
+        after_help = "Example:\n  rkb eval\n  rkb eval --queries tests/fixtures/search/queries.toml --min-recall 0.9\n  rkb eval --rerank laya --recall-sweep"
     )]
     Eval {
         /// Default: $RKB_HOME/eval/queries.toml.
@@ -156,6 +156,9 @@ enum Cmd {
         /// Rerank with this backend; the eval fails if it cannot run, so a report never mixes backends.
         #[arg(long, default_value = "bm25")]
         rerank: String,
+        /// With a model, also count what recall would add over a grid of thresholds and margins.
+        #[arg(long)]
+        recall_sweep: bool,
     },
     /// Put the rkb skill, hooks and confirm gate into Claude Code, pi and omp.
     #[command(after_help = "Example:\n  rkb install\n  rkb install --list\n  rkb install claude --uninstall")]
@@ -559,9 +562,9 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             kb::open(&root)?;
             searching::find(&env, &words.join(" "), limit)
         }
-        Cmd::Eval { queries, min_recall, rerank } => {
+        Cmd::Eval { queries, min_recall, rerank, recall_sweep } => {
             kb::open(&root)?;
-            searching::eval(&env, queries, min_recall, &rerank)
+            searching::eval(&env, queries, min_recall, &rerank, recall_sweep)
         }
         Cmd::Dupes { min } => {
             kb::open(&root)?;

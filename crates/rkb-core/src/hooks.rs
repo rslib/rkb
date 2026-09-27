@@ -179,6 +179,12 @@ pub fn strong_enough(relevance: Option<f32>, coverage: impl FnOnce() -> f64, min
     }
 }
 
+/// Recall adds a lesson only when a model rates it at least this high...
+pub const RECALL_MIN_RELEVANCE: f64 = 0.85;
+/// ...and at least this much above the next lesson: Laya rates general lessons high for many questions,
+/// so a lone clear winner is the signal, not a high score alone.
+pub const RECALL_MIN_MARGIN: f64 = 0.05;
+
 /// Whether recall adds the top lesson: rated at least `min`, and at least `margin` above the next one.
 pub fn clear_winner(top: f64, next: f64, min: f64, margin: f64) -> bool {
     top >= min && top - next >= margin
