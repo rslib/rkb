@@ -13,12 +13,23 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// Runs one Claude Code hook event. Never fails: errors go to `hook-errors.log` and nothing is printed.
 pub fn run(event: &str, harness: &str) {
     let state = paths::state_dir();
-    let reply = if hooks::HARNESSES.contains(&harness) {
-        let _ = hooks::beat(&state, harness);
-        read_payload().and_then(|p| handle(event, &p, &state, harness))
-    } else {
-        Err(format!("unknown harness `{harness}`; use one of {}", hooks::HARNESSES.join(", ")).into())
-    };
+    // A panic, also in a search thread, is logged like any hook error instead of printed, so it never
+    // reaches the harness as a failed hook.
+    let log = state.join("hook-errors.log");
+    let event_name = event.to_string();
+    std::panic::set_hook(Box::new(move |info| {
+        let line = json!({ "time": request::now(), "event": event_name, "error": format!("panic: {info}") });
+        let _ = lock::append_line(&log, &line.to_string());
+    }));
+    let reply = std::panic::catch_unwind(|| {
+        if hooks::HARNESSES.contains(&harness) {
+            let _ = hooks::beat(&state, harness);
+            read_payload().and_then(|p| handle(event, &p, &state, harness))
+        } else {
+            Err(format!("unknown harness `{harness}`; use one of {}", hooks::HARNESSES.join(", ")).into())
+        }
+    })
+    .unwrap_or_else(|_| Ok(None));
     match reply {
         Ok(Some(text)) => println!("{text}"),
         Ok(None) => {}
