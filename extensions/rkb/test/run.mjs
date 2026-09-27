@@ -3,16 +3,19 @@
 // Env: XDG_STATE_HOME and RKB_HOME set up by the Rust test; RKB_KB is the knowledge base folder;
 // RKB_REQUEST and RKB_QUESTION name a stored request.
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 const [file, harness] = process.argv.slice(2);
 const handlers = {};
 const commands = {};
+const tools = {};
 const sent = [];
 const mod = await import(file);
 mod.default({
   on: (name, fn) => (handlers[name] = fn),
   registerCommand: (name, options) => (commands[name] = options),
+  registerTool: (def) => (tools[def.name] = def),
   sendUserMessage: (content) => sent.push(content),
 });
 
@@ -98,6 +101,31 @@ assert.match(sent.at(-1), /Focus from the user, if any: the cmake part/);
 await commands["rkb-distill"].handler("", ctx());
 assert.match(sent.at(-1), /^Turn rkb inbox items into lessons/);
 assert.match(sent.at(-1), /the ids the user gave: none/);
+
+// The four agent tools run `rkb tool` and return its TOON text; failures throw, as pi expects.
+assert.deepEqual(Object.keys(tools).sort(), ["rkb_add", "rkb_note", "rkb_search", "rkb_show"]);
+assert.match(tools.rkb_search.description, /before a web search/i);
+assert.equal(tools.rkb_search.parameters.properties.query.type, "string");
+const found = await tools.rkb_search.execute("t1", { query: "undefined reference to vtable" });
+assert.match(found.content[0].text, /1a00000012/);
+await assert.rejects(tools.rkb_show.execute("t2", {}), /`id` is required/);
+
+// A recall reply goes into the next turn's context, hidden, with the session-start lines.
+const stubDir = mkdtempSync(`${tmpdir()}/rkb-stub-`);
+const recallNote = "rkb: lessons that may help with this message";
+writeFileSync(
+  `${stubDir}/rkb`,
+  `#!/bin/sh\ncat >/dev/null\n[ "$2" = prompt ] && echo '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"${recallNote}"}}'\nexit 0\n`,
+);
+chmodSync(`${stubDir}/rkb`, 0o755);
+const realPath = process.env.PATH;
+process.env.PATH = `${stubDir}:${realPath}`;
+await on("input", { text: "why does the linker fail on vtable", source: "interactive" });
+const recalled = await on("before_agent_start", { prompt: "why does the linker fail on vtable" });
+assert.equal(recalled.message.display, false);
+assert.ok(recalled.message.content.includes(recallNote), recalled.message.content);
+assert.equal(await on("before_agent_start", { prompt: "next" }), undefined, "once");
+process.env.PATH = realPath;
 
 // Stop nudge: once, then quiet while the continuation settles.
 const stop = (active) =>

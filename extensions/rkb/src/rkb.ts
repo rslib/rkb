@@ -3,8 +3,11 @@
 // Forwards __HARNESS__ events to `rkb hook <event>` as Claude Code shaped payloads and turns the
 // replies back into results. All rkb logic lives in the rkb binary; this file only maps.
 import { spawn } from "node:child_process";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
-const HARNESS = "__HARNESS__";
+// rkb install fills in the harness, the binary, the prompts and the tool definitions.
+const HARNESS: string = "__HARNESS__";
 // The rkb binary that installed this file; rkb install fills it in.
 const RKB: string = "__RKB__";
 const TIMEOUT_MS = 5000;
@@ -14,26 +17,41 @@ const NO_UI = "rkb confirm needs the user: ask them to run this command in their
 const DECLINED = "The user declined this rkb confirm.";
 // omp stops a session_shutdown handler after 2 s.
 const SHUTDOWN_TIMEOUT_MS = 1800;
-// The /rkb-retro and /rkb-distill prompts; rkb install fills them in.
 const RETRO: string = "__RETRO__";
 const DISTILL: string = "__DISTILL__";
+const TOOLS_JSON: string = "__TOOLS__";
+// A tool runs a search or a write, which may load a model, so it gets longer than a hook.
+const TOOL_TIMEOUT_MS = 60000;
+
+interface ToolDef {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+const TOOLS: ToolDef[] = TOOLS_JSON.startsWith("[") ? JSON.parse(TOOLS_JSON) : [];
 
 process.env.RKB_HARNESS = HARNESS;
 
-function hook(event: string, payload: Record<string, unknown>, timeoutMs = TIMEOUT_MS): Promise<string | undefined> {
+interface Ran {
+  code: number | null;
+  out: string;
+}
+
+/** Runs rkb with `input` on stdin; undefined when it cannot start or takes longer than `timeoutMs`. */
+function runRkb(args: string[], input: string, timeoutMs: number): Promise<Ran | undefined> {
   return new Promise((resolve) => {
     let out = "";
     let done = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const finish = (value?: string) => {
+    const finish = (value?: Ran) => {
       if (done) return;
       done = true;
       if (timer) clearTimeout(timer);
       resolve(value);
     };
-    let child: any;
+    let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(RKB, ["hook", event, "--harness", HARNESS], { stdio: ["pipe", "pipe", "ignore"] });
+      child = spawn(RKB, args, { stdio: ["pipe", "pipe", "ignore"] });
     } catch {
       return finish();
     }
@@ -42,13 +60,18 @@ function hook(event: string, payload: Record<string, unknown>, timeoutMs = TIMEO
       finish();
     }, timeoutMs);
     child.on("error", () => finish());
-    child.stdout.on("data", (d: Buffer) => {
+    child.stdout?.on("data", (d: Buffer) => {
       out += d.toString();
     });
-    child.on("close", (code: number | null) => finish(code === 0 && out.trim() ? out.trim() : undefined));
-    child.stdin.on("error", () => {});
-    child.stdin.end(JSON.stringify(payload));
+    child.on("close", (code: number | null) => finish({ code, out }));
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(input);
   });
+}
+
+async function hook(event: string, payload: Record<string, unknown>, timeoutMs = TIMEOUT_MS): Promise<string | undefined> {
+  const r = await runRkb(["hook", event, "--harness", HARNESS], JSON.stringify(payload), timeoutMs);
+  return r && r.code === 0 && r.out.trim() ? r.out.trim() : undefined;
 }
 
 function parse(reply: string | undefined): any {
@@ -114,8 +137,28 @@ function safe(fn: (event: any, ctx: any) => Promise<any>) {
   };
 }
 
-export default function rkb(pi: any) {
+export default function rkb(pi: ExtensionAPI) {
   let startContext: string | undefined;
+  // Lessons recalled for the user's message, added to the context of that turn.
+  let recallContext: string | undefined;
+
+  for (const tool of TOOLS) {
+    pi.registerTool({
+      name: tool.name,
+      label: tool.name,
+      description: tool.description,
+      promptSnippet: tool.description.split(". ")[0],
+      parameters: Type.Unsafe(tool.inputSchema),
+      async execute(_id: string, params: unknown) {
+        const r = await runRkb(["tool", tool.name], JSON.stringify(params ?? {}), TOOL_TIMEOUT_MS);
+        if (!r) throw new Error("rkb did not run: check that the rkb command is installed (`rkb doctor` in a terminal).");
+        const text = r.out.trim();
+        // Exit 3 is a question for the user, which the agent passes on; 1 and 2 are failures.
+        if (r.code === 1 || r.code === 2) throw new Error(text || `rkb exited with ${r.code}`);
+        return { content: [{ type: "text", text }], details: {} };
+      },
+    });
+  }
   // pi has no stop_hook_active flag, so the extension tracks its own continuation.
   let continuedByRkb = false;
 
@@ -129,10 +172,11 @@ export default function rkb(pi: any) {
   pi.on(
     "before_agent_start",
     safe(async () => {
-      if (!startContext) return undefined;
-      const content = startContext;
+      const parts = [startContext, recallContext].filter((p): p is string => Boolean(p));
       startContext = undefined;
-      return { message: { customType: "rkb", content, display: false } };
+      recallContext = undefined;
+      if (parts.length === 0) return undefined;
+      return { message: { customType: "rkb", content: parts.join("\n\n"), display: false } };
     }),
   );
 
@@ -204,7 +248,7 @@ export default function rkb(pi: any) {
     "input",
     safe(async (event, ctx) => {
       continuedByRkb = false;
-      await hook("prompt", { ...base(ctx), prompt: String(event?.text ?? "") });
+      recallContext = additional(await hook("prompt", { ...base(ctx), prompt: String(event?.text ?? "") }));
       return HARNESS === "pi" ? { action: "continue" } : undefined;
     }),
   );
@@ -227,11 +271,13 @@ export default function rkb(pi: any) {
   }
 
   if (HARNESS === "omp") {
-    pi.on(
+    // omp's own event, which pi's types do not declare.
+    const omp = pi as unknown as { on(event: "session_stop", handler: (event: any, ctx: any) => Promise<unknown>): void };
+    omp.on(
       "session_stop",
       safe(async (event, ctx) => {
         if (event?.signal?.aborted) return undefined;
-        const payload = { ...base(ctx), stop_hook_active: Boolean(event?.stop_hook_active) };
+        const payload: Record<string, unknown> = { ...base(ctx), stop_hook_active: Boolean(event?.stop_hook_active) };
         if (event?.session_id) payload.session_id = String(event.session_id);
         const note = additional(await hook("stop", payload));
         return note ? { continue: true, additionalContext: note } : undefined;

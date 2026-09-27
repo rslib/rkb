@@ -1889,16 +1889,20 @@ fn extension_drives_rkb_hook() {
     std::fs::write(env.kb().join("kb.toml"), format!("{toml}\n[hooks]\nstop_nudge = true\n")).unwrap();
     std::fs::create_dir_all(env.dir.path().join(".claude")).unwrap();
     let (req, _) = env.json(&["install", "claude"], "");
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/extension/run.mjs");
-    for harness in ["pi", "omp"] {
-        let file = env.dir.path().join(format!("rkb-{harness}.ts"));
-        let body = |t: &str| serde_json::to_string(t.split_once("\n---\n").unwrap().1.trim_start()).unwrap();
-        let text = include_str!("../../../extensions/rkb.ts")
-            .replace("__HARNESS__", harness)
-            .replace("\"__RKB__\"", "\"rkb\"")
-            .replace("\"__RETRO__\"", &body(include_str!("../../../skills/rkb/commands/rkb-retro.md")))
-            .replace("\"__DISTILL__\"", &body(include_str!("../../../skills/rkb/commands/rkb-distill.md")));
-        std::fs::write(&file, text).unwrap();
+    let package = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../extensions/rkb");
+    if !package.join("node_modules/typebox").exists() {
+        eprintln!("skipped: run `npm install` in extensions/rkb to test the extension");
+        return;
+    }
+    let script = package.join("test/run.mjs");
+    // Inside the package, so `import "typebox"` resolves as pi and omp resolve it.
+    let generated = package.join(".test");
+    std::fs::create_dir_all(&generated).unwrap();
+    for (harness, h) in [("pi", rkb_core::install::Harness::Pi), ("omp", rkb_core::install::Harness::Omp)] {
+        let file = generated.join(format!("rkb-{harness}-{}.ts", std::process::id()));
+        // This test process is not the rkb binary, so point the extension at the `rkb` on PATH.
+        let here = serde_json::to_string(&rkb_core::install::hook_binary()).unwrap();
+        std::fs::write(&file, h.extension().replace(&format!("const RKB: string = {here};"), "const RKB: string = \"rkb\";")).unwrap();
         let o = env
             .cmd("node")
             .arg(&script)
@@ -1910,6 +1914,7 @@ fn extension_drives_rkb_hook() {
             .env("RKB_TRANSCRIPT", PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/pi.jsonl"))
             .output()
             .unwrap();
+        let _ = std::fs::remove_file(&file);
         assert!(o.status.success(), "{harness}: {}", stdout(&o));
         assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), format!("ok {harness}"));
     }

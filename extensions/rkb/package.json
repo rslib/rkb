@@ -1,0 +1,15 @@
+{
+  "name": "rkb-extension",
+  "private": true,
+  "description": "The rkb extension for pi and omp. rkb embeds src/rkb.ts and writes it with `rkb install pi` or `rkb install omp`; it is not published.",
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@types/node": "^24.0.0",
+    "typebox": "1.3.27",
+    "typescript": "^5.9.0"
+  }
+}
