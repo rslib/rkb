@@ -179,6 +179,11 @@ pub fn strong_enough(relevance: Option<f32>, coverage: impl FnOnce() -> f64, min
     }
 }
 
+/// Whether recall adds the top lesson: rated at least `min`, and at least `margin` above the next one.
+pub fn clear_winner(top: f64, next: f64, min: f64, margin: f64) -> bool {
+    top >= min && top - next >= margin
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +277,15 @@ mod tests {
         assert!(strong_enough(Some(0.91), || 0.0, 0.8, 0.6));
         assert!(strong_enough(None, || 0.7, 0.8, 0.6));
         assert!(!strong_enough(None, || 0.5, 0.8, 0.6));
+    }
+
+    #[test]
+    fn recall_needs_a_clear_winner() {
+        // Top and second scores seen on real lessons with Laya (2026-09-27).
+        assert!(clear_winner(0.93, 0.86, 0.85, 0.05), "right lesson, clear lead");
+        assert!(clear_winner(0.89, 0.0, 0.85, 0.05), "right lesson, alone");
+        assert!(!clear_winner(0.86, 0.83, 0.85, 0.05), "wrong lesson on top, no clear lead");
+        assert!(!clear_winner(0.88, 0.86, 0.85, 0.05), "two close lessons");
+        assert!(!clear_winner(0.77, 0.66, 0.85, 0.05), "a question no lesson answers");
     }
 }

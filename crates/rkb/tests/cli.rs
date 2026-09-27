@@ -1681,6 +1681,44 @@ fn session_start_names_a_full_inbox() {
 }
 
 #[test]
+fn recall_needs_a_model() {
+    let env = search_kb();
+    let payload = serde_json::json!({ "session_id": "r", "cwd": env.dir.path(), "prompt": "the linker says undefined reference to vtable for Widget" });
+    assert_eq!(hook(&env, "prompt", &payload), "", "BM25 alone never recalls");
+}
+
+/// Runs only with `RKB_TEST_LAYA_DIR` set to fetched model files.
+#[test]
+fn recall_adds_a_strong_lesson_once() {
+    let Ok(model) = std::env::var("RKB_TEST_LAYA_DIR") else { return };
+    let env = search_kb();
+    set_chain(&env, "chain = [\"laya\", \"bm25\"]\n\n[hooks]\nhook_timeout_ms = 60000");
+    let data = env.dir.path().join("data/rkb/models");
+    std::fs::create_dir_all(&data).unwrap();
+    std::os::unix::fs::symlink(&model, data.join("laya")).unwrap();
+    let run = |prompt: &str| {
+        let payload = serde_json::json!({ "session_id": "r", "cwd": env.dir.path(), "prompt": prompt });
+        let o = env
+            .cmd(env!("CARGO_BIN_EXE_rkb"))
+            .args(["hook", "prompt"])
+            .env("XDG_DATA_HOME", env.dir.path().join("data"))
+            .env("RKB_LAYA_DEVICE", "cpu")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        let mut o = o;
+        o.stdin.take().unwrap().write_all(payload.to_string().as_bytes()).unwrap();
+        String::from_utf8_lossy(&o.wait_with_output().unwrap().stdout).into_owned()
+    };
+    let first = run("the linker says undefined reference to vtable for Widget");
+    assert!(first.contains("1a00000012") && first.contains("additionalContext"), "{first}");
+    assert_eq!(run("the linker says undefined reference to vtable for Widget again"), "", "once per session");
+    assert_eq!(run("/rkb:retro"), "");
+}
+
+#[test]
 fn capture_of_a_large_transcript_is_fast() {
     let env = search_kb();
     let path = env.dir.path().join("big.jsonl");

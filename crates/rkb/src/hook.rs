@@ -130,6 +130,12 @@ fn tool_ok(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// Recall adds a lesson only when a model rates it at least this high...
+const RECALL_MIN_RELEVANCE: f64 = 0.85;
+/// ...and at least this much above the next lesson: Laya rates general lessons high for many questions,
+/// so a lone clear winner is the signal, not a high score alone.
+const RECALL_MIN_MARGIN: f64 = 0.05;
+
 fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {
     if p["is_interrupt"] == true {
         return Ok(None);
@@ -142,20 +148,9 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
     kb::open(&root)?;
     let error = p["error"].as_str().unwrap_or("");
     let query = hooks::error_query(command, error);
-    let place = state::locate(&root, &cwd(p), &Hints::default(), state)?;
-    let facts = Facts::gather(&root, &place, &[]);
-    let settings = rerank::Settings::load(&root);
     let cfg = hooks_config(&root);
-    let opts = Options { all: false, every_status: false, limit: settings.top.max(1), probes: rkb_core::search::ProbeMode::Cached };
-    let mut found = search::search(&root, &place, &facts, &Mode::Ranked(query.clone()), &opts)?;
-    let items = search::rerank_items(&root, &found.hits);
-    let timeout = cfg.get("hook_timeout_ms").and_then(toml::Value::as_integer).map_or(DEFAULT_HOOK_TIMEOUT_MS, |v| v.max(0) as u64);
-    let ranked =
-        rerank::run(&settings, None, &crate::rerankers::opener(&settings), &query, &items, std::time::Duration::from_millis(timeout))?;
-    if let Some(scores) = &ranked.scores {
-        search::apply_relevance(&mut found.hits, scores);
-    }
-    let Some(hit) = found.hits.into_iter().next() else {
+    let (hits, ranked) = ranked_search(&root, p, state, &cfg, &query)?;
+    let Some(hit) = hits.into_iter().next() else {
         return Ok(None);
     };
     if hit.applies == Verdict::No {
@@ -187,15 +182,74 @@ fn capture(p: &Value, state: &Path, session: &str, harness: &str) -> Result<Opti
     Ok(None)
 }
 
+/// The hits for `query` from the current place, reranked by the chain within the hook time limit.
+fn ranked_search(root: &Path, p: &Value, state: &Path, cfg: &toml::Table, query: &str) -> Result<(Vec<search::Hit>, rerank::Ranked)> {
+    let place = state::locate(root, &cwd(p), &Hints::default(), state)?;
+    let facts = Facts::gather(root, &place, &[]);
+    let settings = rerank::Settings::load(root);
+    let opts = Options { all: false, every_status: false, limit: settings.top.max(1), probes: rkb_core::search::ProbeMode::Cached };
+    let mut found = search::search(root, &place, &facts, &Mode::Ranked(query.to_string()), &opts)?;
+    let items = search::rerank_items(root, &found.hits);
+    let timeout = cfg.get("hook_timeout_ms").and_then(toml::Value::as_integer).map_or(DEFAULT_HOOK_TIMEOUT_MS, |v| v.max(0) as u64);
+    let ranked =
+        rerank::run(&settings, None, &crate::rerankers::opener(&settings), query, &items, std::time::Duration::from_millis(timeout))?;
+    if let Some(scores) = &ranked.scores {
+        search::apply_relevance(&mut found.hits, scores);
+    }
+    Ok((found.hits, ranked))
+}
+
 fn prompt(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {
-    let (correction, remember) = hooks::prompt_signals(p["prompt"].as_str().unwrap_or(""));
+    let text = p["prompt"].as_str().unwrap_or("");
+    let (correction, remember) = hooks::prompt_signals(text);
     if correction {
         hooks::append(state, session, &json!({ "kind": "correction" }))?;
     }
     if remember {
         hooks::append(state, session, &json!({ "kind": "remember" }))?;
     }
-    Ok(None)
+    recall(p, state, session, text)
+}
+
+/// Adds the top lesson when a model rated it high and clearly above the next one.
+fn recall(p: &Value, state: &Path, session: &str, text: &str) -> Result<Option<String>> {
+    if text.trim_start().starts_with('/') || text.split_whitespace().count() < 3 {
+        return Ok(None);
+    }
+    let root = kb::home();
+    kb::open(&root)?;
+    let cfg = hooks_config(&root);
+    if cfg.get("recall").and_then(toml::Value::as_bool) == Some(false) {
+        return Ok(None);
+    }
+    let min = cfg.get("recall_min_relevance").and_then(toml::Value::as_float).unwrap_or(RECALL_MIN_RELEVANCE);
+    let margin = cfg.get("recall_min_margin").and_then(toml::Value::as_float).unwrap_or(RECALL_MIN_MARGIN);
+    let (hits, ranked) = ranked_search(&root, p, state, &cfg, text)?;
+    // A BM25 score means different things for different queries, so without a model there is no threshold.
+    if ranked.scores.is_none() {
+        return Ok(None);
+    }
+    let score = |h: Option<&search::Hit>| h.and_then(|h| h.relevance).map_or(0.0, f64::from);
+    let (top, next) = (score(hits.first()), score(hits.get(1)));
+    let seen = hooks::read(state, session);
+    let strong: Vec<search::Hit> = hits
+        .into_iter()
+        .take(1)
+        .filter(|h| hooks::clear_winner(top, next, min, margin) && h.applies != Verdict::No)
+        .filter(|h| !seen.iter().any(|r| r["kind"] == "injected" && r["id"] == h.id.as_str()))
+        .collect();
+    if strong.is_empty() {
+        return Ok(None);
+    }
+    let mut lines = vec!["rkb: a lesson that may help with this message; check that it applies before acting on it:".to_string()];
+    for h in &strong {
+        hooks::append(state, session, &json!({ "kind": "injected", "id": h.id }))?;
+        let log = json!({ "time": request::now(), "session": session, "id": h.id, "ranked_by": ranked.describe(), "relevance": h.relevance.map(crate::output::score2), "from": "recall" });
+        lock::append_line(&state.join("injections.jsonl"), &log.to_string())?;
+        let summary = if h.summary.is_empty() { String::new() } else { format!(" - {}", h.summary) };
+        lines.push(format!("- {} {}{summary} (`rkb show {}`)", h.id, h.title, h.id));
+    }
+    Ok(Some(reply("UserPromptSubmit", "additionalContext", json!(lines.join("\n")))))
 }
 
 fn stop(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {
