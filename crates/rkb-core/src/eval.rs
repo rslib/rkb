@@ -78,7 +78,7 @@ pub fn run(root: &Path, queries: &[Query], depth: usize, rerank: &mut dyn FnMut(
     let mut rows = vec![];
     for q in queries {
         let matched = |name: &Option<String>| name.as_ref().map(|n| Matched { name: n.clone(), rule: Rule::Flag });
-        let place = Place { project: matched(&q.project), system: matched(&q.system), repo: None };
+        let place = Place { project: matched(&q.project), system: matched(&q.system), repo: None, dir: None };
         let with: Vec<(String, String)> = q.with.clone().into_iter().collect();
         let facts = Facts::gather(root, &place, &with);
         let mode = match q.mode {

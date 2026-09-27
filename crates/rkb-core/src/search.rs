@@ -564,7 +564,7 @@ mod tests {
     }
 
     fn place(project: Option<&str>) -> Place {
-        Place { project: project.map(|p| Matched { name: p.into(), rule: Rule::Flag }), system: None, repo: None }
+        Place { project: project.map(|p| Matched { name: p.into(), rule: Rule::Flag }), system: None, repo: None, dir: None }
     }
 
     #[test]

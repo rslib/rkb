@@ -1020,6 +1020,54 @@ fn add_creates_a_project_with_its_remote() {
 }
 
 #[test]
+fn projects_without_a_remote_are_recognized() {
+    let env = Env::new();
+    env.init();
+    env.trust_claude();
+    let add_from = |dir: &Path, project: &str| -> serde_json::Value {
+        let lesson = PITFALL.replace("verified_how: ran", &format!("verified_how: ran\nwhen:\n  project: {project}"));
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.current_dir(dir);
+        serde_json::from_slice(&rkb_with(c, &["add", "--topic", "cmake", "--format", "json"], &lesson).stdout).unwrap()
+    };
+
+    // A git repository with no remote: its root commit goes into the project note.
+    let tool = env.dir.path().join("tool");
+    std::fs::create_dir_all(tool.join("src")).unwrap();
+    for args in [vec!["init", "-q"], vec!["commit", "-q", "--allow-empty", "-m", "root"]] {
+        assert!(env.cmd("git").arg("-C").arg(&tool).args(&args).status().unwrap().success());
+    }
+    let v = add_from(&tool, "tool");
+    assert_eq!(v["status"], "written", "{v}");
+    let note = std::fs::read_to_string(env.kb().join("projects/tool/README.md")).unwrap();
+    assert!(note.starts_with("---\nroot_commit: ") && !note.contains("remotes"), "{note}");
+    assert!(env.rkb(&["lint"]).status.success(), "the note is valid");
+    let (v, _) = in_dir(&env, &tool.join("src"), &[], &[]);
+    assert_eq!(
+        (v["project"]["name"].as_str(), v["project"]["rule"].as_str().map(|r| r.starts_with("root commit"))),
+        (Some("tool"), Some(true)),
+        "{v}"
+    );
+
+    // No git at all (here an hg checkout): the path is remembered on this machine.
+    let notes = env.dir.path().join("notes-proj");
+    std::fs::create_dir_all(notes.join(".hg")).unwrap();
+    std::fs::create_dir_all(notes.join("docs")).unwrap();
+    let v = add_from(&notes.join("docs"), "notes-proj");
+    assert_eq!(v["status"], "written", "{v}");
+    assert!(v["notes"].to_string().contains("now matches project notes-proj on this machine"), "{v}");
+    let (v, _) = in_dir(&env, &notes.join("docs"), &[], &[]);
+    assert_eq!(v["project"]["name"], "notes-proj", "{v}");
+    assert!(v["project"]["rule"].as_str().unwrap().contains("checkout"), "{v}");
+
+    // A folder with another name is not taken for the project.
+    let other = env.dir.path().join("elsewhere");
+    std::fs::create_dir_all(&other).unwrap();
+    let v = add_from(&other, "tool");
+    assert!(!v["notes"].to_string().contains("now matches"), "{v}");
+}
+
+#[test]
 fn show_applies_with_reasons() {
     let env = fixture_kb();
     let (v, _) = env.json(&["show", "7f3a9c2b41", "--with", "hdf5=1.14.3", "--system", "tuolumne"], "");

@@ -585,6 +585,7 @@ mod tests {
             project: Some(Matched { name: "dftracer".into(), rule: Rule::Flag }),
             system: Some(Matched { name: "tuolumne".into(), rule: Rule::Flag }),
             repo: Some(Repo { top: repo.path().to_path_buf(), remotes: vec![], root_commits: vec![] }),
+            dir: None,
         };
         let f = Facts::gather(kb.path(), &place, &[]);
         assert_eq!(f.values["gpu"], "mi300a");

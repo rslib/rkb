@@ -21,7 +21,10 @@ pub struct State {
 pub fn locate(root: &Path, cwd: &Path, hints: &Hints, state_dir: &Path) -> Result<Place> {
     let notes = Snapshot::from_dir_where(root, |p| classify(p) == FileKind::FolderNote)?;
     let env = |k: &str| std::env::var(k).ok();
-    let place = matching::current(root, &notes, matching::repo(cwd), hints, &env, crate::lock::hostname());
+    let dir = matching::project_root(cwd);
+    let checkouts = matching::all_checkouts(state_dir);
+    let here = matching::Here { repo: matching::repo(cwd), dir: Some(&dir), checkouts: &checkouts };
+    let place = matching::current(root, &notes, here, hints, &env, crate::lock::hostname());
     if let (Some(p), Some(r)) = (&place.project, &place.repo) {
         matching::record_checkout(state_dir, &p.name, &r.top)?;
     }
@@ -78,6 +81,7 @@ mod tests {
             project: Some(Matched { name: "d".into(), rule: Rule::Flag }),
             system: Some(Matched { name: "t".into(), rule: Rule::Flag }),
             repo: None,
+            dir: None,
         };
         let s = build(root, place, state.path()).unwrap();
         assert_eq!((s.project_lessons, s.system_lessons, s.general_lessons), (Some(2), Some(1), 2));

@@ -47,6 +47,8 @@ pub struct Written {
 pub enum Note {
     /// A scope or topic folder the write created.
     NewFolder(String),
+    /// A checkout path that now matches a project on this machine: `(project, path)`.
+    Checkout(String, String),
     /// A lesson this write archived.
     Archived(String),
     /// Another file whose links a move or rename rewrote.
@@ -65,6 +67,7 @@ impl Note {
     pub fn message(&self) -> String {
         match self {
             Note::NewFolder(f) => format!("created the folder {f}"),
+            Note::Checkout(p, d) => format!("{d} now matches project {p} on this machine"),
             Note::Archived(p) => format!("archived {p}; search hides it now"),
             Note::LinksUpdated(p) => format!("updated links in {p}"),
             Note::Checked(m) => m.clone(),
@@ -396,7 +399,25 @@ pub(crate) fn add(
                 _ => None,
             };
             project_note = Some((repo.remotes.clone(), root_commit));
+        } else if let Some(repo) = new_project_repo(ctx, &scope)
+            && repo.remotes.is_empty()
+            && repo.top.file_name().and_then(|n| n.to_str()) == scope.strip_prefix("projects/")
+            && let [root_commit] = repo.root_commits.as_slice()
+        {
+            // A repository with no remote is still recognized, by its root commit, on every machine.
+            project_note = Some((vec![], Some(root_commit.clone())));
         }
+    }
+    // A project root with the project's name that matches no project: remember it on this machine, so
+    // projects without a git remote, or without git, are recognized here from now on.
+    if let Some(name) = scope.strip_prefix("projects/")
+        && let Some(place) = ctx.place
+        && place.project.is_none()
+        && let Some(dir) = &place.dir
+        && dir.file_name().and_then(|n| n.to_str()) == Some(name)
+        && crate::matching::record_checkout(ctx.state, name, dir)?
+    {
+        notes.push(Note::Checkout(name.to_string(), dir.display().to_string()));
     }
     if !exists {
         notes.push(Note::NewFolder(folder.clone()));
@@ -450,7 +471,9 @@ fn new_project_repo<'a>(ctx: &Ctx<'a>, scope: &str) -> Option<&'a crate::matchin
 
 fn project_note_text(scope: &str, remotes: &[String], root_commit: Option<&str>) -> String {
     let mut m = Mapping::new();
-    m.insert("remotes".into(), Value::Sequence(remotes.iter().map(|r| r.clone().into()).collect()));
+    if !remotes.is_empty() {
+        m.insert("remotes".into(), Value::Sequence(remotes.iter().map(|r| r.clone().into()).collect()));
+    }
     if let Some(c) = root_commit {
         m.insert("root_commit".into(), c.into());
     }
