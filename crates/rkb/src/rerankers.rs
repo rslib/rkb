@@ -79,3 +79,23 @@ pub fn model_check(settings: &Settings) -> Option<Check> {
         check(Level::Ok, format!("laya files ok in {}; device {device}", dir.display()), None)
     }
 }
+
+/// Compiles the GPU kernels for this binary when Laya's files are there and it has not done so yet,
+/// because a new binary (after `cargo install`) starts cold. Returns a line for the install report.
+#[cfg(feature = "laya")]
+pub fn warm_after_install() -> Option<String> {
+    let dir = rkb_rerank::files::default_dir();
+    if rkb_rerank::files::check(&dir).is_err() || rkb_rerank::warmed(&dir) {
+        return None;
+    }
+    match rkb_rerank::warm(&dir) {
+        Ok(Some(t)) => Some(format!("GPU kernels compiled for this rkb in {:.1} s", t.as_secs_f64())),
+        Ok(None) => None,
+        Err(e) => Some(format!("GPU kernels not compiled ({e:#}); `rkb models warm` tries again")),
+    }
+}
+
+#[cfg(not(feature = "laya"))]
+pub fn warm_after_install() -> Option<String> {
+    None
+}
