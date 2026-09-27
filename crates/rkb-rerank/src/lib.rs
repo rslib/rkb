@@ -12,7 +12,7 @@ use std::path::Path;
 use anyhow::Result;
 
 /// The question Laya answers for each lesson.
-pub const QUESTION: &str = "Does this lesson help with this problem?";
+pub const QUESTION: &str = "Is this lesson about the same problem as the user describes?";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pref {
