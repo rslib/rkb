@@ -350,7 +350,12 @@ fn rank(lessons: &[&Lesson], place: &Place, query: &str) -> Vec<(usize, f64)> {
             };
             let mut close: Vec<(usize, &String)> = vocab.iter().map(|v| (edit_distance(&t, v), v)).filter(|(d, _)| *d <= max).collect();
             close.sort();
-            added.extend(close.into_iter().take(3).map(|(_, v)| v.clone()));
+            // Two typos can expand to the same word; each counted term must appear once.
+            for (_, v) in close.into_iter().take(3) {
+                if !index.contains_key(v) && !added.contains(v) {
+                    added.push(v.clone());
+                }
+            }
         }
         if !added.is_empty() {
             let extra: HashMap<String, usize> = added.iter().enumerate().map(|(i, t)| (t.clone(), i)).collect();
@@ -590,6 +595,9 @@ mod tests {
 
         let typo = search(r, &place(None), &facts, &Mode::Ranked("stripng".into()), &opts()).unwrap();
         assert!(ids(&typo).contains(&"0000000001"));
+        // Two typos of one word, and a typo of a word the query already has, used to count a term twice.
+        let twice = search(r, &place(None), &facts, &Mode::Ranked("stripng strping striping".into()), &opts()).unwrap();
+        assert!(ids(&twice).contains(&"0000000001"));
         assert!(search(r, &place(None), &facts, &Mode::Ranked("1.13".into()), &opts()).unwrap().hits.is_empty());
     }
 
