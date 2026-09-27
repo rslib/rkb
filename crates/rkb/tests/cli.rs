@@ -1096,8 +1096,12 @@ fn show_applies_with_reasons() {
 }
 
 fn search_kb() -> Env {
+    named_kb("search")
+}
+
+fn named_kb(name: &str) -> Env {
     let env = Env::new();
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/search/kb");
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures").join(name).join("kb");
     copy_dir(&src, &env.kb());
     for args in [
         vec!["init", "-q"],
@@ -1127,6 +1131,47 @@ fn search_fixture_meets_recall() {
     let low = env.dir.path().join("low.toml");
     std::fs::write(&low, "[[query]]\ntext = \"nothing matches this\"\nexpect = [\"1a00000001\"]\n").unwrap();
     assert_eq!(env.rkb(&["eval", "--queries", low.to_str().unwrap(), "--min-recall", "0.5"]).status.code(), Some(1));
+}
+
+#[test]
+fn eval_fixture_meets_recall() {
+    let env = named_kb("eval");
+    let q = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/eval/queries.toml");
+    let q = q.to_str().unwrap();
+    let o = env.rkb(&["eval", "--queries", q, "--min-recall", "0.85", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(o.status.success(), "{v}");
+    assert_eq!((v["queries"].as_u64(), v["answerable"].as_u64()), (Some(124), Some(102)), "{v}");
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(rows.iter().filter(|r| r["answerable"] == false).count(), 22, "{v}");
+    assert!(v["recall"].is_null(), "recall does not apply with BM25: {v}");
+    let o = env.rkb(&["eval", "--queries", q]);
+    assert!(stdout(&o).contains("recall does not apply"), "{}", stdout(&o));
+}
+
+/// Runs only with `RKB_TEST_LAYA_DIR` set to fetched model files.
+#[test]
+fn eval_sweeps_recall_with_laya() {
+    let Ok(model) = std::env::var("RKB_TEST_LAYA_DIR") else { return };
+    let env = named_kb("eval");
+    let data = env.dir.path().join("data/rkb/models");
+    std::fs::create_dir_all(&data).unwrap();
+    std::os::unix::fs::symlink(&model, data.join("laya")).unwrap();
+    let q = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/eval/queries.toml");
+    let o = env
+        .cmd(env!("CARGO_BIN_EXE_rkb"))
+        .args(["eval", "--queries", q.to_str().unwrap(), "--rerank", "laya", "--recall-sweep", "--format", "json"])
+        .env("XDG_DATA_HOME", env.dir.path().join("data"))
+        .env("RKB_LAYA_DEVICE", "cpu")
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(v["ranked_by"], "laya (cpu)", "{v}");
+    let sweep = v["recall_sweep"].as_array().unwrap();
+    assert_eq!(sweep.len(), 24, "{v}");
+    let total = |c: &serde_json::Value| ["right", "wrong", "silent"].iter().map(|k| c[k].as_u64().unwrap()).sum::<u64>();
+    assert_eq!(total(&v["recall"]), 124, "{v}");
+    assert!(sweep.iter().all(|c| total(c) == 124), "{v}");
 }
 
 #[test]

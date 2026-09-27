@@ -1,0 +1,499 @@
+# Queries for `rkb eval` on tests/fixtures/eval/kb. Written from scratch from problem summaries, not from the lessons.
+
+[[query]]
+text = "cmake still says libfoo not found after brew install"
+expect = ["2b00000001"]
+
+[[query]]
+text = "cmake keeps using gcc after I set clang as the compiler"
+expect = ["2b00000002"]
+
+[[query]]
+text = "clangd underlines every #include as an error"
+expect = ["2b00000003"]
+
+[[query]]
+text = "touching one .cpp file triggers a huge rebuild on a mid-size project"
+expect = ["2b00000004"]
+
+[[query]]
+text = "undefined reference even though nm shows the symbol in the .a file"
+expect = ["2b00000006"]
+
+[[query]]
+text = "plain C program can't link to my cpp functions, the names look mangled"
+expect = ["2b00000007"]
+
+[[query]]
+text = "which .so provides this undefined name, before I edit LDFLAGS"
+expect = ["2b00000009"]
+
+[[query]]
+text = "two .a archives depend on each other and no ordering on the gcc line works"
+expect = ["2b00000010"]
+
+[[query]]
+text = "my commits disappeared after checking out a different branch"
+expect = ["2b00000011"]
+
+[[query]]
+text = "rewrote history with git's -i mode and now my work vanished"
+expect = ["2b00000012"]
+
+[[query]]
+text = "removed the wrong git ref by accident, need that work back"
+expect = ["2b00000013"]
+
+[[query]]
+text = "people keep pushing straight onto the default trunk, how to block it"
+expect = ["2b00000014"]
+
+[[query]]
+text = "pip show lists it yet python says ModuleNotFoundError"
+expect = ["2b00000016"]
+
+[[query]]
+text = "editable pip install ignores new modules I add"
+expect = ["2b00000017"]
+
+[[query]]
+text = "clone on a new machine resolves newer libs than we tested with"
+expect = ["2b00000018"]
+
+[[query]]
+text = "where should the virtualenv for a repo live"
+expect = ["2b00000019"]
+
+[[query]]
+text = "cron job works when I launch it myself but breaks when scheduled"
+expect = ["2b00000021"]
+
+[[query]]
+text = "ssh one-liner can't locate a program I can use after logging in normally"
+expect = ["2b00000022"]
+
+[[query]]
+text = "bash script keeps going after a command inside it fails"
+expect = ["2b00000023"]
+
+[[query]]
+text = "filename with spaces gets split apart when passed to a program"
+expect = ["2b00000024"]
+
+[[query]]
+text = "docker bind mount denied writes on an SELinux enforcing machine"
+expect = ["2b00000026"]
+
+[[query]]
+text = "podman without root can't save into a folder that I own"
+expect = ["2b00000027"]
+
+[[query]]
+text = "docker output is bloated by compilers left in the final layer"
+expect = ["2b00000028"]
+
+[[query]]
+text = "writes to files inside my apptainer .sif never stick"
+expect = ["2b00000029"]
+
+[[query]]
+text = "sbatch run stuck at MPI_Init on several machines"
+expect = ["2b00000031"]
+
+[[query]]
+text = "MPI run only dies when compute hosts have mismatched library builds"
+expect = ["2b00000032"]
+
+[[query]]
+text = "srun vs mpirun inside an existing slurm allocation"
+expect = ["2b00000033"]
+
+[[query]]
+text = "MPI_Barrier doesn't mean all ranks finish at the same time"
+expect = ["2b00000034"]
+
+[[query]]
+text = "no space left on device but df shows plenty free"
+expect = ["2b00000036"]
+
+[[query]]
+text = "lustre quota exceeded though my folder holds almost nothing"
+expect = ["2b00000037"]
+
+[[query]]
+text = "open file on an NFS mount errors with ESTALE after the server was changed"
+expect = ["2b00000038"]
+
+[[query]]
+text = "when does raising the lustre stripe count hurt performance"
+expect = ["2b00000039"]
+
+[[query]]
+text = "each ssh connect hangs a long time before I can type"
+expect = ["2b00000041"]
+
+[[query]]
+text = "scp of a big archive hangs the whole ssh terminal"
+expect = ["2b00000042"]
+
+[[query]]
+text = "get to a machine behind a bastion in one step instead of hopping twice"
+expect = ["2b00000043"]
+
+[[query]]
+text = "is ssh -A safe to turn on"
+expect = ["2b00000044"]
+
+[[query]]
+text = "latex undefined control sequence right after I load one more usepackage"
+expect = ["2b00000046"]
+
+[[query]]
+text = "latex figures keep floating far from where they're placed in the text"
+expect = ["2b00000047"]
+
+[[query]]
+text = "rust refuses two mutable borrows in code that seems correct"
+expect = ["2b00000051"]
+
+[[query]]
+text = "rust variable moved into a call and now I can't use it again"
+expect = ["2b00000052"]
+
+[[query]]
+text = "vim E325 ATTENTION message when reopening after my laptop died"
+expect = ["2b00000056"]
+
+[[query]]
+text = "work on code on an HPC machine without copying it back and forth"
+expect = ["2b00000057"]
+
+[[query]]
+text = "how to cross-compile a cmake project for arm64"
+expect = []
+
+[[query]]
+text = "how to squash all commits before cutting a release"
+expect = []
+
+[[query]]
+text = "setting up ssh port forwarding for a remote database"
+expect = []
+
+[[query]]
+text = "how to limit cpu and memory for a docker container"
+expect = []
+
+[[query]]
+text = "how to add a table of contents in latex"
+expect = []
+
+[[query]]
+text = "how to implement a custom trait for a generic struct in rust"
+expect = []
+
+[[query]]
+text = "how to request GPUs in a slurm job script"
+expect = []
+
+[[query]]
+text = "how to profile memory usage of a python script"
+expect = []
+
+[[query]]
+text = "how to mount an s3 bucket as a local filesystem"
+expect = []
+
+[[query]]
+text = "how to enable vim keybindings inside vscode"
+expect = []
+
+# Second batch, written after the first measurements, to check a change on questions it was not tuned on.
+
+[[query]]
+text = "find_package can't see zlib even though I just put it in with apt, reran configure twice"
+expect = ["2b00000001"]
+
+[[query]]
+text = "set CC=clang and reran, but the cache still shows /usr/bin/cc"
+expect = ["2b00000002"]
+
+[[query]]
+text = "neovim lsp says file not found for every header in my C++ repo"
+expect = ["2b00000003"]
+
+[[query]]
+text = "incremental builds feel sluggish, anything faster than the Unix Makefiles backend?"
+expect = ["2b00000004"]
+
+[[query]]
+text = "what -O level does cmake pass if I never choose a configuration like Release"
+expect = ["2b00000005"]
+
+[[query]]
+text = "linking fails with unresolved symbols, but swapping -lfoo and -lbar around makes it work"
+expect = ["2b00000006"]
+
+[[query]]
+text = "gcc can't resolve a routine I wrote in a .cpp file when main.c tries to call it"
+expect = ["2b00000007"]
+
+[[query]]
+text = "executable compiled cleanly yet aborts on launch complaining about a missing name in a .so"
+expect = ["2b00000008"]
+
+[[query]]
+text = "how do I tell which of these .a files defines foo_init"
+expect = ["2b00000009"]
+
+[[query]]
+text = "even with libA libB libA on the command line the linker still can't resolve everything"
+expect = ["2b00000010"]
+
+[[query]]
+text = "did git checkout throw away what I just did? log doesn't show it"
+expect = ["2b00000011"]
+
+[[query]]
+text = "picked drop by accident while reordering history, how do I get those changes back"
+expect = ["2b00000012"]
+
+[[query]]
+text = "ran git's capital -D on the wrong ref, is it recoverable"
+expect = ["2b00000013"]
+
+[[query]]
+text = "should small fixes go straight to trunk or through a PR?"
+expect = ["2b00000014"]
+
+[[query]]
+text = "how long does git keep the history of where HEAD pointed"
+expect = ["2b00000015"]
+
+[[query]]
+text = "import numpy fails but pip list has it"
+expect = ["2b00000016"]
+
+[[query]]
+text = "changes I make to my library aren't used when I run tests, it's in develop mode"
+expect = ["2b00000017"]
+
+[[query]]
+text = "CI started failing because a transitive package released a new major"
+expect = ["2b00000018"]
+
+[[query]]
+text = "should .venv sit next to the code or in a central folder"
+expect = ["2b00000019"]
+
+[[query]]
+text = "pip install worked but python3 script.py still can't import it, I have two pythons"
+expect = ["2b00000020"]
+
+[[query]]
+text = "my crontab entry does nothing, but the same command works in my terminal"
+expect = ["2b00000021"]
+
+[[query]]
+text = "ssh host make says make: not found, but it's there once logged in"
+expect = ["2b00000022"]
+
+[[query]]
+text = "what should I put at the top of every bash file so failures stop it"
+expect = ["2b00000023"]
+
+[[query]]
+text = "rm $file deleted the wrong things when the name had a blank in it"
+expect = ["2b00000024"]
+
+[[query]]
+text = "count stays 0 after my while read loop fed by a pipe"
+expect = ["2b00000025"]
+
+[[query]]
+text = "permission denied inside docker on fedora for a -v volume, chmod 777 didn't help"
+expect = ["2b00000026"]
+
+[[query]]
+text = "podman run as non-admin gets EACCES on a volume from my home folder"
+expect = ["2b00000027"]
+
+[[query]]
+text = "my Dockerfile makes a 2GB result for a tiny go service"
+expect = ["2b00000028"]
+
+[[query]]
+text = "apptainer exec: touch says the filesystem can't be modified"
+expect = ["2b00000029"]
+
+[[query]]
+text = "admins won't give us the docker group on the cluster, what can users run containers with"
+expect = ["2b00000030"]
+
+[[query]]
+text = "mpirun works on one host, with two hosts nothing prints and it sits forever"
+expect = ["2b00000031"]
+
+[[query]]
+text = "segfault only when the allocation includes both node types, fine on one"
+expect = ["2b00000032"]
+
+[[query]]
+text = "inside salloc should I use mpiexec or the scheduler's launcher"
+expect = ["2b00000033"]
+
+[[query]]
+text = "measured times after a barrier differ per rank, why"
+expect = ["2b00000034"]
+
+[[query]]
+text = "4096-process run froze, how do I find the culprit process"
+expect = ["2b00000035"]
+
+[[query]]
+text = "touch: cannot create, disk full, yet 40% used"
+expect = ["2b00000036"]
+
+[[query]]
+text = "Disk quota exceeded writing to /scratch even though I have almost no data there"
+expect = ["2b00000037"]
+
+[[query]]
+text = "cat on a mounted share fails to read after the fileserver rebooted"
+expect = ["2b00000038"]
+
+[[query]]
+text = "lfs setstripe -c -1 on my directory of tiny files made ls crawl"
+expect = ["2b00000039"]
+
+[[query]]
+text = "coworkers can't edit files I create in our team folder"
+expect = ["2b00000040"]
+
+[[query]]
+text = "ssh takes ages to connect, maybe dns or gssapi"
+expect = ["2b00000041"]
+
+[[query]]
+text = "terminal locks up when I cat a long log over ssh"
+expect = ["2b00000042"]
+
+[[query]]
+text = "ProxyJump config example for a gateway machine"
+expect = ["2b00000043"]
+
+[[query]]
+text = "risk of ForwardAgent yes on a shared server"
+expect = ["2b00000044"]
+
+[[query]]
+text = "ansible over ssh is slow because each task reconnects"
+expect = ["2b00000045"]
+
+[[query]]
+text = "Undefined control sequence after loading another .sty"
+expect = ["2b00000046"]
+
+[[query]]
+text = "all my images pile up on the final pages of the pdf"
+expect = ["2b00000047"]
+
+[[query]]
+text = "how often must pdflatex run for cross refs"
+expect = ["2b00000048"]
+
+[[query]]
+text = "\\cite shows [?] in the output"
+expect = ["2b00000049"]
+
+[[query]]
+text = "which bibliography backend should a fresh thesis use"
+expect = ["2b00000050"]
+
+[[query]]
+text = "error E0502 on a vec I push to while holding a reference to an element"
+expect = ["2b00000051"]
+
+[[query]]
+text = "E0382 after I hand my String to another fn"
+expect = ["2b00000052"]
+
+[[query]]
+text = "cargo compile takes minutes, I only want to know if types line up"
+expect = ["2b00000053"]
+
+[[query]]
+text = "my rust program is 30x slower than expected, benchmark from cargo run"
+expect = ["2b00000054"]
+
+[[query]]
+text = "several structs need to mutate the same memo table, lifetimes are a mess"
+expect = ["2b00000055"]
+
+[[query]]
+text = "vim shows Found a .swp when I edit my notes"
+expect = ["2b00000056"]
+
+[[query]]
+text = "vscode remote-ssh setup to hack on server code"
+expect = ["2b00000057"]
+
+[[query]]
+text = "emacs: set indent-tabs-mode only for one repo"
+expect = ["2b00000058"]
+
+[[query]]
+text = "tabs vs spaces flip back and forth in PR diffs, add an .editorconfig?"
+expect = ["2b00000059"]
+
+[[query]]
+text = "Pylance says import could not be resolved but it runs in terminal"
+expect = ["2b00000060"]
+
+[[query]]
+text = "cmake: how to install headers alongside the library with install(TARGETS)"
+expect = []
+
+[[query]]
+text = "git: how do I sign commits with an ssh key"
+expect = []
+
+[[query]]
+text = "python: how to type-hint a function that returns a generator"
+expect = []
+
+[[query]]
+text = "bash: how to parse command line flags with getopts"
+expect = []
+
+[[query]]
+text = "docker compose: containers can't reach each other by service name"
+expect = []
+
+[[query]]
+text = "mpi: how to pick between MPI_Send and MPI_Isend"
+expect = []
+
+[[query]]
+text = "ssh: how to generate an ed25519 key"
+expect = []
+
+[[query]]
+text = "latex: how to make a table span both columns in a two-column paper"
+expect = []
+
+[[query]]
+text = "rust: how to write an async function that returns a stream"
+expect = []
+
+[[query]]
+text = "vim: how to record and replay a macro"
+expect = []
+
+[[query]]
+text = "nfs: how to export a directory read-only to one subnet"
+expect = []
+
+[[query]]
+text = "how to make a fully static binary with no glibc dependency"
+expect = []
