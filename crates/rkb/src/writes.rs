@@ -185,7 +185,7 @@ fn needs_user(env: &Env, req: &Request) -> Output {
     Output { data, human, exit: 3, raw: false }
 }
 
-pub fn add(env: &Env, topic: Option<String>, kind: Option<String>, template: bool) -> Result<Output, CliError> {
+pub fn add(env: &Env, topic: Option<String>, kind: Option<String>, template: bool, given: Option<String>) -> Result<Output, CliError> {
     let kind: Option<LessonType> = kind.map(|k| LessonType::from_name(&k).expect("clap checks the type"));
     if template {
         let kind =
@@ -195,7 +195,9 @@ pub fn add(env: &Env, topic: Option<String>, kind: Option<String>, template: boo
     }
     kb::open(&env.root)?;
     let topic = topic.ok_or_else(|| usage_error("rkb add needs --topic", "add --topic <topic>, such as --topic cmake"))?;
-    let text = if stdin_is_terminal() {
+    let text = if let Some(text) = given {
+        text
+    } else if stdin_is_terminal() {
         let kind =
             kind.ok_or_else(|| usage_error("no lesson on stdin", "pipe a lesson file on stdin, or pass --type to write one in $EDITOR"))?;
         let skeleton = write::template(kind);

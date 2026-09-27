@@ -32,6 +32,7 @@ pub mod search;
 pub mod state;
 pub mod sync;
 pub mod text;
+pub mod tools;
 pub mod usage;
 pub mod verify;
 pub mod write;

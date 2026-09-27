@@ -1,7 +1,9 @@
+mod agent;
 mod graphing;
 mod hook;
 mod inbox;
 mod list;
+mod mcp;
 mod output;
 mod rerankers;
 mod searching;
@@ -195,6 +197,9 @@ enum Cmd {
         /// Print a skeleton for --type and write nothing.
         #[arg(long)]
         template: bool,
+        /// Lesson text from the rkb_add tool instead of stdin.
+        #[arg(skip)]
+        text: Option<String>,
     },
     /// Replace a lesson with the file read from stdin, or edit it in $EDITOR.
     #[command(after_help = "Example:\n  rkb edit 7f3a9c2b41 --base 3f9a1c0d2e4b < lesson.md")]
@@ -302,6 +307,18 @@ enum Cmd {
     Import {
         /// The folder with the lesson files.
         dir: std::path::PathBuf,
+    },
+    /// Serve the agent tools over MCP on stdin and stdout; Claude Code starts this through the rkb plugin.
+    #[command(after_help = "Example:\n  rkb mcp")]
+    Mcp,
+    /// Print the agent tools every harness offers: names, descriptions and argument schemas.
+    #[command(after_help = "Example:\n  rkb tools --toon")]
+    Tools,
+    /// Run one agent tool with its arguments as JSON on stdin, as the harness integrations do.
+    #[command(after_help = "Example:\n  echo '{\"query\": \"cmake cannot find hdf5\"}' | rkb tool rkb_search")]
+    Tool {
+        /// rkb_search, rkb_show, rkb_add or rkb_note.
+        name: String,
     },
     /// Save a short finding to the inbox, to turn into a lesson later with /rkb-distill. Changes no lesson.
     #[command(after_help = "Example:\n  rkb note \"the linker wants -lz after -lhdf5 on tuolumne\"\n  echo \"...\" | rkb note")]
@@ -441,6 +458,15 @@ fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => return parse_error(&args, e),
     };
+    if let Some(Cmd::Mcp) = &cli.cmd {
+        mcp::serve();
+        return ExitCode::SUCCESS;
+    }
+    if let Some(Cmd::Tool { name }) = &cli.cmd {
+        let (text, exit) = agent::from_stdin(name);
+        println!("{text}");
+        return ExitCode::from(exit);
+    }
     if let Some(Cmd::Hook { event, harness }) = &cli.cmd {
         hook::run(event, harness);
         return ExitCode::SUCCESS;
@@ -568,7 +594,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             let listing = rkb_core::list::list(&root, folder.as_deref())?;
             Ok(list::render(&listing, &root, colored))
         }
-        Cmd::Add { topic, kind, template } => writes::add(&env, topic, kind, template),
+        Cmd::Add { topic, kind, template, text } => writes::add(&env, topic, kind, template, text),
         Cmd::Edit { id, base } => writes::edit(&env, id, base),
         Cmd::Flag { id, reason } => writes::flag(&env, id, reason),
         Cmd::Review { folder } => {
@@ -619,6 +645,8 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Hook { .. } => unreachable!("main runs hooks first"),
         Cmd::Import { dir } => writes::import(&env, &dir),
         Cmd::Note { words } => inbox::note(&env, words),
+        Cmd::Tools => Ok(agent::list()),
+        Cmd::Tool { .. } | Cmd::Mcp => unreachable!("main runs tools and the MCP server first"),
         Cmd::Inbox { action: None } => inbox::list(&env),
         Cmd::Inbox { action: Some(InboxCmd::Show { id }) } => inbox::show(&env, &id),
         Cmd::Inbox { action: Some(InboxCmd::Done { ids }) } => inbox::done(&env, &ids),

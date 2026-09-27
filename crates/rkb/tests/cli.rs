@@ -1420,6 +1420,94 @@ fn home_view_identifies_the_binary() {
     assert!(v["description"].as_str().unwrap().contains("lessons learned"));
 }
 
+fn tool(env: &Env, name: &str, args: &serde_json::Value) -> (String, Option<i32>) {
+    let o = env.rkb_in(&["tool", name], &args.to_string());
+    (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code())
+}
+
+#[test]
+fn agent_tools_match_the_commands() {
+    let env = search_kb();
+    let (v, _) = env.json(&["tools"], "");
+    let names: Vec<&str> = v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["rkb_search", "rkb_show", "rkb_add", "rkb_note"]);
+    assert!(
+        v["tools"][0]["description"].as_str().unwrap().contains("before a web search")
+            || v["tools"][0]["description"].as_str().unwrap().contains("BEFORE a web search")
+    );
+
+    let (out, code) = tool(&env, "rkb_search", &serde_json::json!({ "query": "undefined reference to vtable" }));
+    assert_eq!(code, Some(0));
+    assert_eq!(out, stdout(&env.rkb(&["search", "undefined reference to vtable", "--toon"])));
+    let (out, code) = tool(&env, "rkb_show", &serde_json::json!({}));
+    assert_eq!(code, Some(2));
+    assert!(out.contains("code: usage") && out.contains("`id` is required"), "{out}");
+    let (out, code) = tool(&env, "rkb_show", &serde_json::json!({ "id": "1a00000012" }));
+    assert_eq!((code, out), (Some(0), stdout(&env.rkb(&["show", "1a00000012", "--toon"]))));
+    let (out, _) = tool(&env, "rkb_note", &serde_json::json!({ "text": "tuolumne wants module load cmake" }));
+    assert!(out.starts_with("id: "), "{out}");
+}
+
+#[test]
+fn rkb_add_builds_the_lesson() {
+    let env = search_kb();
+    let pitfall = serde_json::json!({
+        "type": "pitfall", "title": "Ninja ignores CFLAGS changes until a reconfigure", "topic": "cmake",
+        "symptom": "A changed CFLAGS has no effect.", "cause": "CMake caches the flags at configure time.",
+        "fix": "Run `cmake --fresh -B build`.", "evidence": "The next build used the new flags.", "tags": ["ninja"],
+    });
+    let (out, code) = tool(&env, "rkb_add", &pitfall);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("status: written") && out.contains("general/cmake/"), "{out}");
+    let id = out.lines().find_map(|l| l.strip_prefix("id: ")).unwrap().to_string();
+    let (v, _) = env.json(&["show", &id], "");
+    let body = v["body"].as_str().unwrap();
+    let heads: Vec<&str> = body.lines().filter_map(|l| l.strip_prefix("## ")).collect();
+    assert_eq!(heads, ["Symptom", "Cause", "Fix", "Evidence"]);
+    assert_eq!(v["frontmatter"]["tags"][0], "ninja");
+
+    let recipe = serde_json::json!({ "type": "recipe", "title": "t", "topic": "git", "when_to_use": "w", "evidence": "e" });
+    let before = stdout(&env.git(&["log", "--oneline"]));
+    let (out, code) = tool(&env, "rkb_add", &recipe);
+    assert_eq!(code, Some(2));
+    assert!(out.contains("`steps`"), "{out}");
+    assert_eq!(stdout(&env.git(&["log", "--oneline"])), before, "nothing was written");
+
+    let mut near = pitfall.clone();
+    near["topic"] = "cmak".into();
+    near["title"] = "Another lesson for a close topic".into();
+    let (out, code) = tool(&env, "rkb_add", &near);
+    assert_eq!(code, Some(3), "{out}");
+    assert!(out.contains("status: needs_user") && out.contains("use general/cmake"), "{out}");
+}
+
+#[test]
+fn mcp_server_offers_the_tools() {
+    let env = search_kb();
+    let msgs = [
+        serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "t", "version": "1" } } }),
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+        serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "rkb_search", "arguments": { "query": "undefined reference to vtable" } } }),
+        serde_json::json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": { "name": "rkb_show", "arguments": {} } }),
+        serde_json::json!({ "jsonrpc": "2.0", "id": 5, "method": "resources/list" }),
+        serde_json::json!({ "jsonrpc": "2.0", "id": 6, "method": "ping" }),
+    ];
+    let input: String = msgs.iter().map(|m| format!("{m}\n")).collect();
+    let o = env.rkb_in(&["mcp"], &input);
+    let replies: Vec<serde_json::Value> = String::from_utf8_lossy(&o.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(replies.len(), 6, "one reply per request, none for the notification: {replies:?}");
+    assert_eq!(replies[0]["result"]["protocolVersion"], "2025-06-18");
+    assert!(replies[0]["result"]["capabilities"]["tools"].is_object());
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 4);
+    let text = replies[2]["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(format!("{text}\n"), stdout(&env.rkb(&["search", "undefined reference to vtable", "--toon"])));
+    assert_eq!(replies[2]["result"]["isError"], false);
+    assert_eq!(replies[3]["result"]["isError"], true);
+    assert_eq!((replies[4]["id"].as_i64(), replies[4]["error"]["code"].as_i64()), (Some(5), Some(-32601)));
+    assert_eq!(replies[5]["result"], serde_json::json!({}));
+}
+
 #[test]
 fn install_from_an_agent_needs_the_user() {
     let env = Env::new();

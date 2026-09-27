@@ -181,13 +181,29 @@ fn expand(data: &Value) -> String {
     toon_format::encode_default(data).map(|t| expand_lists(&t)).unwrap_or_else(|e| format!("error: {e}"))
 }
 
-pub fn print(format: Format, out: &Output) {
-    let text = match format {
+/// The text `print` writes for `out`.
+pub fn render(format: Format, out: &Output) -> String {
+    match format {
         Format::Toon if out.raw => out.human.trim_end().to_string(),
         Format::Toon => expand(&out.data),
         Format::Json => out.data.to_string(),
         Format::Human => out.human.trim_end().to_string(),
-    };
+    }
+}
+
+/// The error record as TOON, for callers that return text instead of printing it.
+pub fn render_error_toon(e: &CliError) -> String {
+    let mut record = json!({ "error": { "code": e.code.as_str(), "message": e.message, "fix": e.fix } });
+    if let Some(Value::Object(extra)) = e.extra.as_deref() {
+        for (k, v) in extra {
+            record["error"][k] = v.clone();
+        }
+    }
+    expand(&record)
+}
+
+pub fn print(format: Format, out: &Output) {
+    let text = render(format, out);
     // A closed pipe, as in `| head`, is not worth reporting.
     let _ = writeln!(std::io::stdout().lock(), "{text}");
 }
