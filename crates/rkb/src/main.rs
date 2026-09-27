@@ -1,5 +1,6 @@
 mod graphing;
 mod hook;
+mod inbox;
 mod list;
 mod output;
 mod rerankers;
@@ -297,6 +298,18 @@ enum Cmd {
         /// The folder with the lesson files.
         dir: std::path::PathBuf,
     },
+    /// Save a short finding to the inbox, to turn into a lesson later with /rkb-distill. Changes no lesson.
+    #[command(after_help = "Example:\n  rkb note \"the linker wants -lz after -lhdf5 on tuolumne\"\n  echo \"...\" | rkb note")]
+    Note {
+        /// The note. Default: stdin.
+        words: Vec<String>,
+    },
+    /// List the inbox: notes and session extracts waiting to become lessons.
+    #[command(after_help = "Example:\n  rkb inbox\n  rkb inbox show 0a1b2c3d4e\n  rkb inbox done 0a1b2c3d4e")]
+    Inbox {
+        #[command(subcommand)]
+        action: Option<InboxCmd>,
+    },
     /// Download or check model files for reranking.
     #[command(after_help = "Example:\n  rkb models fetch")]
     Models {
@@ -321,6 +334,19 @@ enum Cmd {
         /// The harness that calls: claude-code, pi or omp. Picks the heartbeat file only.
         #[arg(long, default_value = "claude-code")]
         harness: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum InboxCmd {
+    /// Print one inbox item in full.
+    #[command(after_help = "Example:\n  rkb inbox show 0a1b2c3d4e")]
+    Show { id: String },
+    /// Remove items that became lessons or held nothing worth one.
+    #[command(after_help = "Example:\n  rkb inbox done 0a1b2c3d4e 1b2c3d4e5f")]
+    Done {
+        #[arg(required = true, num_args = 1..)]
+        ids: Vec<String>,
     },
 }
 
@@ -515,6 +541,10 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Confirm { request, choice } => writes::confirm(&env, request, choice),
         Cmd::Hook { .. } => unreachable!("main runs hooks first"),
         Cmd::Import { dir } => writes::import(&env, &dir),
+        Cmd::Note { words } => inbox::note(&env, words),
+        Cmd::Inbox { action: None } => inbox::list(&env),
+        Cmd::Inbox { action: Some(InboxCmd::Show { id }) } => inbox::show(&env, &id),
+        Cmd::Inbox { action: Some(InboxCmd::Done { ids }) } => inbox::done(&env, &ids),
         Cmd::Models { action: ModelsCmd::Fetch { .. } } => models_fetch(),
         Cmd::Models { action: ModelsCmd::Warm { .. } } => models_warm(),
         Cmd::Sync { remote, bundle } => {

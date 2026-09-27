@@ -5,6 +5,7 @@ pub mod approval;
 pub mod body;
 pub mod conditions;
 pub mod config;
+pub mod distill;
 pub mod doctor;
 pub mod error;
 pub mod eval;

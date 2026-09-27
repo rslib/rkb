@@ -1,0 +1,12 @@
+{"type":"session","version":3,"id":"demo-pi-1","cwd":"/work/demo"}
+{"type":"thinking_level_change","thinkingLevel":"high"}
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"The configure step fails, can you fix it?"}]}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"PRIVATE REASONING that must not appear"},{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"cmake -B build"}}]}}
+{"type":"message","message":{"role":"toolResult","toolCallId":"c1","toolName":"bash","isError":true,"content":[{"type":"text","text":"-- The C compiler identification is GNU 13.2.0\nCMake Error at CMakeLists.txt:5 (find_package):\n  Could NOT find ZLIB (missing: ZLIB_LIBRARY ZLIB_INCLUDE_DIR)\n-- Configuring incomplete, errors occurred!\n\nCommand exited with code 1"}]}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"c2","name":"read","arguments":{"path":"CMakeLists.txt"}}]}}
+{"type":"message","message":{"role":"toolResult","toolCallId":"c2","toolName":"read","isError":false,"content":[{"type":"text","text":"FILE CONTENT that must not appear"}]}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"ZLIB is installed under /opt/zlib. Point CMake at it with ZLIB_ROOT."}]}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":"c3","name":"bash","arguments":{"command":"cmake -B build -DZLIB_ROOT=/opt/zlib"}}]}}
+{"type":"message","message":{"role":"toolResult","toolCallId":"c3","toolName":"bash","isError":false,"content":[{"type":"text","text":"-- Configuring done\n-- Generating done\nSUCCESS OUTPUT that must not appear"}]}}
+{"type":"custom","customType":"other-extension","data":{}}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"Configured. ZLIB_ROOT tells find_package where to look."}]}}

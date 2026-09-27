@@ -3,12 +3,18 @@
 // Env: XDG_STATE_HOME and RKB_HOME set up by the Rust test; RKB_KB is the knowledge base folder;
 // RKB_REQUEST and RKB_QUESTION name a stored request.
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 
 const [file, harness] = process.argv.slice(2);
 const handlers = {};
+const commands = {};
+const sent = [];
 const mod = await import(file);
-mod.default({ on: (name, fn) => (handlers[name] = fn) });
+mod.default({
+  on: (name, fn) => (handlers[name] = fn),
+  registerCommand: (name, options) => (commands[name] = options),
+  sendUserMessage: (content) => sent.push(content),
+});
 
 assert.equal(process.env.RKB_HARNESS, harness);
 const stopEvent = harness === "pi" ? "agent_before_settle" : "session_stop";
@@ -21,7 +27,7 @@ let asked = [];
 const ctx = (hasUI = true) => ({
   cwd: process.env.RKB_KB,
   hasUI,
-  sessionManager: { getSessionId: () => session },
+  sessionManager: { getSessionId: () => session, getSessionFile: () => process.env.RKB_TRANSCRIPT },
   ui: { confirm: async (title, message) => (asked.push(message), answer) },
 });
 const on = (name, event, c = ctx()) => handlers[name](event, c);
@@ -64,6 +70,34 @@ assert.deepEqual(inputReply, harness === "pi" ? { action: "continue" } : undefin
 const kinds = signals().map((s) => s.kind);
 assert.deepEqual(kinds, ["failed", "injected", "failed", "failed", "fixed", "correction", "remember"]);
 assert.ok(!JSON.stringify(signals()).includes("release"));
+
+// Compaction saves an extract, because the session has a fixed signal; shutdown then finds nothing new.
+const inbox = () => {
+  try {
+    return readdirSync(`${process.env.XDG_STATE_HOME}/rkb/inbox`).filter((f) => f.endsWith(".md"));
+  } catch {
+    return [];
+  }
+};
+const before = inbox().length;
+assert.equal(await on("session_before_compact", { reason: "threshold" }), undefined, "the compaction is not changed");
+assert.equal(inbox().length, before + 1);
+const item = readFileSync(`${process.env.XDG_STATE_HOME}/rkb/inbox/${inbox().find((f) => !f.startsWith("."))}`, "utf8");
+assert.match(item, /\[command failed, exit 1\] cmake -B build/);
+await on("session_shutdown", { reason: "quit" });
+assert.equal(inbox().length, before + 1, "nothing new at shutdown");
+const noFile = { ...ctx(), sessionManager: { getSessionId: () => session, getSessionFile: () => undefined } };
+await on("session_before_compact", {}, noFile);
+assert.equal(inbox().length, before + 1, "an ephemeral session is not forwarded");
+
+// The two commands send their prompts as user messages.
+assert.deepEqual(Object.keys(commands).sort(), ["rkb-distill", "rkb-retro"]);
+await commands["rkb-retro"].handler("the cmake part", ctx());
+assert.match(sent.at(-1), /^Review the work of this session/);
+assert.match(sent.at(-1), /Focus from the user, if any: the cmake part/);
+await commands["rkb-distill"].handler("", ctx());
+assert.match(sent.at(-1), /^Turn rkb inbox items into lessons/);
+assert.match(sent.at(-1), /the ids the user gave: none/);
 
 // Stop nudge: once, then quiet while the continuation settles.
 const stop = (active) =>

@@ -15,7 +15,7 @@ pub fn run(event: &str, harness: &str) {
     let state = paths::state_dir();
     let reply = if hooks::HARNESSES.contains(&harness) {
         let _ = hooks::beat(&state, harness);
-        read_payload().and_then(|p| handle(event, &p, &state))
+        read_payload().and_then(|p| handle(event, &p, &state, harness))
     } else {
         Err(format!("unknown harness `{harness}`; use one of {}", hooks::HARNESSES.join(", ")).into())
     };
@@ -39,7 +39,7 @@ fn read_payload() -> Result<Value> {
     Ok(v)
 }
 
-fn handle(event: &str, p: &Value, state: &Path) -> Result<Option<String>> {
+fn handle(event: &str, p: &Value, state: &Path, harness: &str) -> Result<Option<String>> {
     let session = p["session_id"].as_str().unwrap_or("");
     match event {
         "session-start" => session_start(p, state),
@@ -48,6 +48,7 @@ fn handle(event: &str, p: &Value, state: &Path) -> Result<Option<String>> {
         "tool-failed" => tool_failed(p, state, session),
         "prompt" => prompt(p, state, session),
         "stop" => stop(p, state, session),
+        "pre-compact" | "session-end" => capture(p, state, session, harness),
         _ => Err(format!("unknown hook event `{event}`").into()),
     }
 }
@@ -80,7 +81,11 @@ fn session_start(p: &Value, state: &Path) -> Result<Option<String>> {
     kb::open(&root)?;
     let place = state::locate(&root, &cwd(p), &Hints::default(), state)?;
     let s = state::build(&root, place, state)?;
-    Ok(Some(crate::session::context(&s).human))
+    let mut text = crate::session::context(&s).human;
+    if let Some(line) = rkb_core::distill::nudge(state, request::now()) {
+        text.push_str(&format!("\n{line}"));
+    }
+    Ok(Some(text))
 }
 
 fn pre_tool(p: &Value, state: &Path) -> Result<Option<String>> {
@@ -163,6 +168,12 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
         hit.id, hit.title, hit.id
     );
     Ok(Some(reply("PostToolUseFailure", "additionalContext", json!(context))))
+}
+
+fn capture(p: &Value, state: &Path, session: &str, harness: &str) -> Result<Option<String>> {
+    let transcript = p["transcript_path"].as_str().ok_or("the payload has no transcript_path")?;
+    rkb_core::distill::capture(state, harness, session, Path::new(transcript), p["cwd"].as_str())?;
+    Ok(None)
 }
 
 fn prompt(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {

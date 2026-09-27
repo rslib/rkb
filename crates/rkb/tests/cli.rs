@@ -1339,6 +1339,42 @@ fn graph_views() {
 }
 
 #[test]
+fn note_and_inbox() {
+    let env = search_kb();
+    let (v, code) = env.json(&["note", "tuolumne needs module load cmake"], "");
+    assert_eq!(code, Some(0), "{v}");
+    let first = v["id"].as_str().unwrap().to_string();
+    let (v, _) = env.json(&["note"], "the linker wants -lz after -lhdf5\n");
+    let second = v["id"].as_str().unwrap().to_string();
+    let (v, code) = env.json(&["note"], "  ");
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("usage"), Some(2)), "{v}");
+
+    let (v, _) = env.json(&["inbox"], "");
+    let ids: Vec<&str> = v["items"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap()).collect();
+    assert_eq!(ids.len(), 2, "{v}");
+    assert!(ids.contains(&first.as_str()) && ids.contains(&second.as_str()));
+    let (v, _) = env.json(&["inbox", "show", &second], "");
+    assert_eq!(v["body"], "the linker wants -lz after -lhdf5");
+
+    let (v, _) = env.json(&["search", "tuolumne cmake"], "");
+    assert!(!v.to_string().contains("module load"), "inbox items are not searched: {v}");
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "", "the knowledge base is unchanged");
+
+    let (v, code) = env.json(&["inbox", "done", &first, "0000000000"], "");
+    assert_eq!(code, Some(1), "an unknown id is reported: {v}");
+    assert_eq!(v["items"][0]["removed"], true);
+    let (v, _) = env.json(&["inbox"], "");
+    assert_eq!(v["items"].as_array().unwrap().len(), 1);
+    assert_eq!(v["items"][0]["id"], second.as_str());
+
+    let old = env.dir.path().join("state/rkb/inbox/0123456789.md");
+    std::fs::write(&old, "---\nkind: note\ntime: 1000\n---\n\nold\n").unwrap();
+    let (v, _) = env.json(&["inbox"], "");
+    assert_eq!((v["expired"].as_u64(), v["items"].as_array().unwrap().len()), (Some(1), 1), "{v}");
+    assert!(!old.exists());
+}
+
+#[test]
 fn install_from_an_agent_needs_the_user() {
     let env = Env::new();
     let home = env.dir.path();
@@ -1422,6 +1458,86 @@ fn hook(env: &Env, event: &str, payload: &serde_json::Value) -> String {
 
 fn bash(session: &str, cwd: &Path, command: &str) -> serde_json::Value {
     serde_json::json!({ "session_id": session, "cwd": cwd, "tool_name": "Bash", "tool_input": { "command": command } })
+}
+
+fn signal(env: &Env, session: &str, record: &str) {
+    let p = env.dir.path().join(format!("state/rkb/sessions/{session}.jsonl"));
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let old = std::fs::read_to_string(&p).unwrap_or_default();
+    std::fs::write(&p, format!("{old}{record}\n")).unwrap();
+}
+
+fn inbox_items(env: &Env) -> Vec<serde_json::Value> {
+    env.json(&["inbox"], "").0["items"].as_array().unwrap().clone()
+}
+
+#[test]
+fn session_end_saves_an_extract_only_after_a_signal() {
+    let env = search_kb();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/claude.jsonl");
+    let payload = |id: &str| serde_json::json!({ "session_id": id, "transcript_path": fixture, "cwd": "/work/demo", "reason": "exit" });
+
+    assert_eq!(hook(&env, "session-end", &payload("quiet")), "");
+    assert!(inbox_items(&env).is_empty(), "a quiet session saves nothing");
+
+    signal(&env, "busy", r#"{"kind":"failed","program":"cmake"}"#);
+    signal(&env, "busy", r#"{"kind":"fixed","program":"cmake"}"#);
+    assert_eq!(hook(&env, "pre-compact", &payload("busy")), "");
+    let items = inbox_items(&env);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["kind"], "transcript");
+    let (v, _) = env.json(&["inbox", "show", items[0]["id"].as_str().unwrap()], "");
+    assert_eq!((v["meta"]["session"].as_str(), v["meta"]["signals"][0].as_str()), (Some("busy"), Some("fixed cmake")), "{v}");
+    assert!(v["body"].as_str().unwrap().contains("[user] The configure step fails"), "{v}");
+
+    assert_eq!(hook(&env, "session-end", &payload("busy")), "");
+    assert_eq!(inbox_items(&env).len(), 1, "nothing new after the compaction extract");
+
+    let o = env.rkb_in(&["hook", "session-end", "--harness", "pi"], &serde_json::json!({ "session_id": "busy" }).to_string());
+    assert_eq!((o.status.code(), o.stdout.is_empty()), (Some(0), true), "a payload without a transcript is a logged hook error");
+}
+
+#[test]
+fn session_start_names_a_full_inbox() {
+    let env = search_kb();
+    let start =
+        |env: &Env| hook(env, "session-start", &serde_json::json!({ "session_id": "s", "cwd": env.dir.path(), "source": "startup" }));
+    for i in 0..2 {
+        env.json(&["note", &format!("finding {i}")], "");
+    }
+    assert!(!start(&env).contains("/rkb-distill"), "two fresh items say nothing");
+    for i in 2..5 {
+        env.json(&["note", &format!("finding {i}")], "");
+    }
+    let text = start(&env);
+    assert!(text.contains("5 items wait") && text.contains("/rkb-distill"), "{text}");
+}
+
+#[test]
+fn capture_of_a_large_transcript_is_fast() {
+    let env = search_kb();
+    let path = env.dir.path().join("big.jsonl");
+    let mut text = String::new();
+    let mut n = 0;
+    while text.len() < 20 << 20 {
+        n += 1;
+        text.push_str(&format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":format!("t{n}"),"name":"Read","input":{"file_path":"/work/demo/a.c"}}]}}),
+            serde_json::json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":format!("t{n}"),"content":"x".repeat(2000)}]}})
+        ));
+    }
+    text.push_str(&format!("{}\n", serde_json::json!({"type":"user","message":{"role":"user","content":"remember the flag"}})));
+    std::fs::write(&path, text).unwrap();
+    signal(&env, "big", r#"{"kind":"remember"}"#);
+    let start = std::time::Instant::now();
+    hook(&env, "session-end", &serde_json::json!({ "session_id": "big", "transcript_path": path }));
+    let took = start.elapsed();
+    assert_eq!(inbox_items(&env).len(), 1);
+    if !cfg!(debug_assertions) {
+        assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+    }
+    eprintln!("20 MB transcript captured in {took:?}");
 }
 
 #[test]
@@ -1567,7 +1683,12 @@ fn extension_drives_rkb_hook() {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/extension/run.mjs");
     for harness in ["pi", "omp"] {
         let file = env.dir.path().join(format!("rkb-{harness}.ts"));
-        std::fs::write(&file, include_str!("../../../extensions/rkb.ts").replace("__HARNESS__", harness)).unwrap();
+        let body = |t: &str| serde_json::to_string(t.split_once("\n---\n").unwrap().1.trim_start()).unwrap();
+        let text = include_str!("../../../extensions/rkb.ts")
+            .replace("__HARNESS__", harness)
+            .replace("\"__RETRO__\"", &body(include_str!("../../../skills/rkb/commands/rkb-retro.md")))
+            .replace("\"__DISTILL__\"", &body(include_str!("../../../skills/rkb/commands/rkb-distill.md")));
+        std::fs::write(&file, text).unwrap();
         let o = env
             .cmd("node")
             .arg(&script)
@@ -1576,6 +1697,7 @@ fn extension_drives_rkb_hook() {
             .env("RKB_KB", env.kb())
             .env("RKB_REQUEST", req["request"].as_str().unwrap())
             .env("RKB_QUESTION", req["question"].as_str().unwrap())
+            .env("RKB_TRANSCRIPT", PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/pi.jsonl"))
             .output()
             .unwrap();
         assert!(o.status.success(), "{harness}: {}", stdout(&o));

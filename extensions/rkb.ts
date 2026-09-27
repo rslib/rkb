@@ -10,10 +10,15 @@ const TIMEOUT_MS = 5000;
 const CONFIRM = /(^|[\s;&|('"/])rkb\s+confirm\b/;
 const NO_UI = "rkb confirm needs the user: ask them to run this command in their own terminal.";
 const DECLINED = "The user declined this rkb confirm.";
+// omp stops a session_shutdown handler after 2 s.
+const SHUTDOWN_TIMEOUT_MS = 1800;
+// The /rkb-retro and /rkb-distill prompts; rkb install fills them in.
+const RETRO: string = "__RETRO__";
+const DISTILL: string = "__DISTILL__";
 
 process.env.RKB_HARNESS = HARNESS;
 
-function hook(event: string, payload: Record<string, unknown>): Promise<string | undefined> {
+function hook(event: string, payload: Record<string, unknown>, timeoutMs = TIMEOUT_MS): Promise<string | undefined> {
   return new Promise((resolve) => {
     let out = "";
     let done = false;
@@ -33,7 +38,7 @@ function hook(event: string, payload: Record<string, unknown>): Promise<string |
     timer = setTimeout(() => {
       child.kill("SIGKILL");
       finish();
-    }, TIMEOUT_MS);
+    }, timeoutMs);
     child.on("error", () => finish());
     child.stdout.on("data", (d: Buffer) => {
       out += d.toString();
@@ -64,6 +69,19 @@ function base(ctx: any): Record<string, unknown> {
     session = String(ctx?.sessionManager?.getSessionId?.() ?? "");
   } catch {}
   return { session_id: session, cwd: String(ctx?.cwd ?? process.cwd()) };
+}
+
+function transcript(ctx: any): string | undefined {
+  try {
+    const file = ctx?.sessionManager?.getSessionFile?.();
+    return typeof file === "string" && file ? file : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function prompt(text: string, args: string): string {
+  return text.replace("$ARGUMENTS", args.trim() || "none");
 }
 
 function bash(event: any): string | undefined {
@@ -149,6 +167,36 @@ export default function rkb(pi: any) {
       return { content: [...(Array.isArray(event.content) ? event.content : []), { type: "text", text: note }] };
     }),
   );
+
+  pi.on(
+    "session_before_compact",
+    safe(async (_event, ctx) => {
+      const path = transcript(ctx);
+      if (path) await hook("pre-compact", { ...base(ctx), transcript_path: path });
+      return undefined;
+    }),
+  );
+
+  pi.on(
+    "session_shutdown",
+    safe(async (event, ctx) => {
+      const path = transcript(ctx);
+      if (path) await hook("session-end", { ...base(ctx), transcript_path: path, reason: String(event?.reason ?? "") }, SHUTDOWN_TIMEOUT_MS);
+      return undefined;
+    }),
+  );
+
+  for (const [name, text, description] of [
+    ["rkb-retro", RETRO, "Record the durable lessons of this session in rkb now"],
+    ["rkb-distill", DISTILL, "Turn a few rkb inbox items into lessons"],
+  ]) {
+    pi.registerCommand(name, {
+      description,
+      handler: async (args: string) => {
+        pi.sendUserMessage(prompt(text, String(args ?? "")));
+      },
+    });
+  }
 
   pi.on(
     "input",
