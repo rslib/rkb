@@ -21,6 +21,84 @@ pub fn command_body(text: &str) -> &str {
 
 /// The Claude Code permission rule that asks the user before `rkb confirm`.
 pub const ASK_RULE: &str = "Bash(rkb confirm:*)";
+/// The plugin's MCP tools, allowed without a prompt: every rkb write that needs the user still asks.
+pub const TOOL_RULES: [&str; 4] =
+    ["mcp__plugin_rkb_rkb__rkb_search", "mcp__plugin_rkb_rkb__rkb_show", "mcp__plugin_rkb_rkb__rkb_add", "mcp__plugin_rkb_rkb__rkb_note"];
+/// The Claude Code plugin id: plugin `rkb` from the local marketplace `rkb`.
+pub const PLUGIN: &str = "rkb@rkb";
+
+/// The local marketplace rkb writes for Claude Code: `$XDG_DATA_HOME/rkb/claude-plugin`.
+pub fn plugin_dir(home: &Path) -> PathBuf {
+    // Unit tests pass a temporary home; the real XDG_DATA_HOME must never leak into them.
+    if cfg!(test) {
+        return home.join(".local/share/rkb/claude-plugin");
+    }
+    std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| home.join(".local/share"), PathBuf::from)
+        .join("rkb/claude-plugin")
+}
+
+/// The `claude` program install runs: `RKB_CLAUDE` when set, so tests never touch a real Claude Code.
+pub fn claude_program() -> String {
+    // A unit test that forgets the fake must fail, never reach the user's real Claude Code.
+    if cfg!(test) {
+        return "/nonexistent/claude-in-unit-tests".into();
+    }
+    std::env::var("RKB_CLAUDE").unwrap_or_else(|_| "claude".into())
+}
+
+/// The marketplace files, relative to `plugin_dir`, and the plugin version, which carries a hash of
+/// the content so a changed binary path or prompt makes `claude plugin update` pick it up.
+pub fn plugin_files(bin: &str) -> (Vec<(String, String)>, String) {
+    use sha2::{Digest, Sha256};
+    let mut hooks = serde_json::Map::new();
+    for (event, matcher, name) in CLAUDE_HOOKS {
+        let mut entry = serde_json::json!({ "hooks": [{ "type": "command", "command": format!("{bin} hook {name}"), "timeout": 5 }] });
+        if let Some(m) = matcher {
+            entry["matcher"] = m.into();
+        }
+        hooks.insert(event.to_string(), serde_json::json!([entry]));
+    }
+    let pretty = |v: serde_json::Value| serde_json::to_string_pretty(&v).expect("json serializes") + "\n";
+    let mut files = vec![
+        ("plugins/rkb/skills/rkb/SKILL.md".to_string(), SKILL.to_string()),
+        ("plugins/rkb/commands/retro.md".to_string(), COMMANDS[0].1.to_string()),
+        ("plugins/rkb/commands/distill.md".to_string(), COMMANDS[1].1.to_string()),
+        ("plugins/rkb/hooks/hooks.json".to_string(), pretty(serde_json::json!({ "hooks": hooks }))),
+        ("plugins/rkb/.mcp.json".to_string(), pretty(serde_json::json!({ "mcpServers": { "rkb": { "command": bin, "args": ["mcp"] } } }))),
+    ];
+    let mut h = Sha256::new();
+    for (path, text) in &files {
+        h.update(path.as_bytes());
+        h.update(text.as_bytes());
+    }
+    let hash: String = h.finalize().iter().take(6).map(|b| format!("{b:02x}")).collect();
+    let version = format!("{}+{hash}", env!("CARGO_PKG_VERSION"));
+    let about = "rkb: search, read and record lessons learned in your knowledge base";
+    let author = serde_json::json!({ "name": "rkb" });
+    files.push((
+        ".claude-plugin/marketplace.json".into(),
+        pretty(serde_json::json!({
+            "name": "rkb",
+            "owner": author,
+            "metadata": { "description": "The rkb plugin, written by `rkb install claude`" },
+            "plugins": [{ "name": "rkb", "source": "./plugins/rkb", "description": about }],
+        })),
+    ));
+    files.push((
+        "plugins/rkb/.claude-plugin/plugin.json".into(),
+        pretty(serde_json::json!({ "name": "rkb", "version": version, "description": about, "author": author })),
+    ));
+    (files, version)
+}
+
+/// The version of the rkb plugin Claude Code has installed, from `~/.claude/plugins/installed_plugins.json`.
+pub fn installed_plugin_version(home: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(home.join(".claude/plugins/installed_plugins.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v["plugins"][PLUGIN].as_array()?.first()?["version"].as_str().map(str::to_string)
+}
 
 /// The harness name `trust.toml` and `request::trusted_harness` use for Claude Code.
 pub const CLAUDE_TRUST: &str = "claude-code";
@@ -150,6 +228,9 @@ pub enum Step {
     RemoveExtension { file: PathBuf },
     WriteCommand { file: PathBuf, text: &'static str },
     RemoveCommand { file: PathBuf },
+    WritePlugin { dir: PathBuf, bin: String },
+    ClaudePlugin { dir: PathBuf, program: String, bin: String },
+    RemovePlugin { dir: PathBuf, program: String },
     Trust { file: PathBuf, name: &'static str },
     Untrust { file: PathBuf, name: &'static str },
 }
@@ -165,6 +246,8 @@ impl Step {
             | Step::RemoveHooks { settings } => settings.clone(),
             Step::WriteExtension { file, .. } | Step::RemoveExtension { file } => file.clone(),
             Step::WriteCommand { file, .. } | Step::RemoveCommand { file } => file.clone(),
+            Step::WritePlugin { dir, .. } | Step::RemovePlugin { dir, .. } => dir.clone(),
+            Step::ClaudePlugin { .. } => PathBuf::from(format!("claude plugin {PLUGIN}")),
             Step::Trust { file, .. } | Step::Untrust { file, .. } => file.clone(),
         }
     }
@@ -189,20 +272,26 @@ pub fn plan(home: &Path, config_dir: &Path, harnesses: &[Harness], uninstall: bo
     let mut steps = vec![];
     for h in harnesses {
         let dir = h.skill_dir(home);
-        steps.push(if uninstall { Step::RemoveSkill { dir } } else { Step::WriteSkill { dir } });
         if *h == Harness::Claude {
             let settings = home.join(".claude/settings.json");
+            let (plugin, program) = (plugin_dir(home), claude_program());
             if uninstall {
+                steps.push(Step::RemovePlugin { dir: plugin, program });
                 steps.push(Step::RemoveAskRule { settings: settings.clone() });
-                steps.push(Step::RemoveHooks { settings });
             } else {
+                let bin = hook_binary();
+                steps.push(Step::WritePlugin { dir: plugin.clone(), bin: bin.clone() });
+                steps.push(Step::ClaudePlugin { dir: plugin, program, bin });
                 steps.push(Step::AddAskRule { settings: settings.clone() });
-                steps.push(Step::AddHooks { settings, bin: hook_binary() });
             }
-            for (name, text) in COMMANDS {
-                let file = home.join(".claude/commands").join(name);
-                steps.push(if uninstall { Step::RemoveCommand { file } } else { Step::WriteCommand { file, text } });
+            // What earlier versions wrote outside the plugin.
+            steps.push(Step::RemoveHooks { settings });
+            for (name, _) in COMMANDS {
+                steps.push(Step::RemoveCommand { file: home.join(".claude/commands").join(name) });
             }
+            steps.push(Step::RemoveSkill { dir });
+        } else {
+            steps.push(if uninstall { Step::RemoveSkill { dir } } else { Step::WriteSkill { dir } });
         }
         if let Some(file) = h.extension_file(home) {
             steps.push(if uninstall { Step::RemoveExtension { file } } else { Step::WriteExtension { file, text: h.extension() } });
@@ -235,39 +324,139 @@ fn write_settings(path: &Path, v: &serde_json::Value) -> Result<()> {
 }
 
 /// Adds or removes the ask rule. Returns whether the file changed.
+/// Adds or removes rkb's rules: `ASK_RULE` under `permissions.ask`, `TOOL_RULES` under `permissions.allow`.
 fn ask_rule(path: &Path, add: bool) -> Result<bool> {
     let mut v = read_settings(path)?;
     if !v.is_object() {
         return Err(Error::Refused(format!("{} is not a JSON object", path.display())));
     }
-    let has = v["permissions"]["ask"].as_array().is_some_and(|a| a.iter().any(|r| r == ASK_RULE));
-    if add == has {
-        return Ok(false);
+    let mut changed = false;
+    for (list, rules) in [("ask", &[ASK_RULE][..]), ("allow", &TOOL_RULES[..])] {
+        for rule in rules {
+            let has = v["permissions"][list].as_array().is_some_and(|a| a.iter().any(|r| r == rule));
+            if add && !has {
+                let perms = v.as_object_mut().unwrap().entry("permissions").or_insert_with(|| serde_json::json!({}));
+                perms
+                    .as_object_mut()
+                    .ok_or_else(|| Error::Refused(format!("`permissions` in {} is not an object", path.display())))?
+                    .entry(list)
+                    .or_insert_with(|| serde_json::json!([]))
+                    .as_array_mut()
+                    .ok_or_else(|| Error::Refused(format!("`permissions.{list}` in {} is not a list", path.display())))?
+                    .push((*rule).into());
+                changed = true;
+            } else if !add && has {
+                v["permissions"][list].as_array_mut().unwrap().retain(|r| r != rule);
+                changed = true;
+            }
+        }
     }
-    if add {
-        let perms = v.as_object_mut().unwrap().entry("permissions").or_insert_with(|| serde_json::json!({}));
-        let ask = perms
-            .as_object_mut()
-            .ok_or_else(|| Error::Refused(format!("`permissions` in {} is not an object", path.display())))?
-            .entry("ask")
-            .or_insert_with(|| serde_json::json!([]));
-        ask.as_array_mut()
-            .ok_or_else(|| Error::Refused(format!("`permissions.ask` in {} is not a list", path.display())))?
-            .push(ASK_RULE.into());
-    } else if let Some(ask) = v["permissions"]["ask"].as_array_mut() {
-        ask.retain(|r| r != ASK_RULE);
-        // Leave no empty list or block behind that only rkb's rule needed.
-        if ask.is_empty()
-            && let Some(perms) = v["permissions"].as_object_mut()
-        {
-            perms.remove("ask");
+    if !add {
+        // Leave no empty list or block behind that only rkb's rules needed.
+        if let Some(perms) = v["permissions"].as_object_mut() {
+            perms.retain(|_, l| l.as_array().is_none_or(|a| !a.is_empty()));
             if perms.is_empty() {
                 v.as_object_mut().unwrap().remove("permissions");
             }
         }
     }
-    write_settings(path, &v)?;
-    Ok(true)
+    if changed {
+        write_settings(path, &v)?;
+    }
+    Ok(changed)
+}
+
+fn run_claude(program: &str, args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| Error::Refused(format!("cannot run `{program}`: {e}")))?;
+    if !out.status.success() {
+        let text = String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
+        let tail: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).rev().take(3).collect();
+        return Err(Error::Refused(format!(
+            "`claude {}` failed: {}",
+            args.join(" "),
+            tail.into_iter().rev().collect::<Vec<_>>().join(" / ")
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn program_found(program: &str) -> bool {
+    if program.contains('/') {
+        return Path::new(program).is_file();
+    }
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(program).is_file()))
+}
+
+fn marketplace_known(program: &str) -> Result<bool> {
+    let v: serde_json::Value =
+        serde_json::from_str(&run_claude(program, &["plugin", "marketplace", "list", "--json"])?).unwrap_or_default();
+    Ok(v.as_array().is_some_and(|a| a.iter().any(|m| m["name"] == "rkb")))
+}
+
+fn plugin_version(program: &str) -> Result<Option<String>> {
+    let v: serde_json::Value = serde_json::from_str(&run_claude(program, &["plugin", "list", "--json"])?).unwrap_or_default();
+    Ok(v.as_array().and_then(|a| a.iter().find(|p| p["id"] == PLUGIN)).and_then(|p| p["version"].as_str()).map(str::to_string))
+}
+
+fn write_plugin(dir: &Path, bin: &str) -> Result<bool> {
+    let mut changed = false;
+    for (rel, text) in plugin_files(bin).0 {
+        let file = dir.join(rel);
+        if std::fs::read_to_string(&file).is_ok_and(|t| t == text) {
+            continue;
+        }
+        write_atomic(&file, &text)?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+/// Makes Claude Code run the plugin in `dir`: adds the marketplace, then installs or updates the plugin.
+fn claude_plugin(dir: &Path, program: &str, bin: &str) -> Result<bool> {
+    let dir_text = dir.display().to_string();
+    let mut changed = false;
+    if !marketplace_known(program)? {
+        run_claude(program, &["plugin", "marketplace", "add", &dir_text])?;
+        changed = true;
+    }
+    let want = plugin_files(bin).1;
+    match plugin_version(program)? {
+        None => {
+            run_claude(program, &["plugin", "install", PLUGIN])?;
+            changed = true;
+        }
+        Some(v) if v != want => {
+            run_claude(program, &["plugin", "marketplace", "update", "rkb"])?;
+            run_claude(program, &["plugin", "update", PLUGIN])?;
+            changed = true;
+        }
+        Some(_) => {}
+    }
+    Ok(changed)
+}
+
+fn remove_plugin(dir: &Path, program: &str) -> Result<bool> {
+    let mut changed = false;
+    if program_found(program) {
+        if plugin_version(program)?.is_some() {
+            run_claude(program, &["plugin", "uninstall", PLUGIN])?;
+            changed = true;
+        }
+        if marketplace_known(program)? {
+            run_claude(program, &["plugin", "marketplace", "remove", "rkb"])?;
+            changed = true;
+        }
+    }
+    let ours = std::fs::read_to_string(dir.join(".claude-plugin/marketplace.json")).is_ok_and(|t| t.contains("\"./plugins/rkb\""));
+    if ours {
+        std::fs::remove_dir_all(dir).map_err(io(dir))?;
+        changed = true;
+    }
+    Ok(changed)
 }
 
 fn is_rkb_command(c: &serde_json::Value) -> bool {
@@ -389,8 +578,9 @@ fn remove_extension(file: &Path) -> Result<bool> {
 }
 
 fn remove_command(file: &Path) -> Result<bool> {
-    let ours =
-        file.symlink_metadata().is_ok_and(|m| m.is_file()) && std::fs::read_to_string(file).is_ok_and(|t| t.contains(COMMAND_MARKER));
+    // Earlier versions marked the files with an HTML comment instead of the frontmatter key.
+    let ours = file.symlink_metadata().is_ok_and(|m| m.is_file())
+        && std::fs::read_to_string(file).is_ok_and(|t| t.contains(COMMAND_MARKER) || t.contains("<!-- Generated by rkb install;"));
     if !ours {
         return Ok(false);
     }
@@ -425,8 +615,42 @@ fn remove_skill(dir: &Path) -> Result<bool> {
 }
 
 /// Runs the steps. Every settings file is parsed first, so an invalid one stops the install before any write.
-pub fn apply(steps: &[Step], skill: &str) -> Result<Vec<Change>> {
+/// The lines that report `changes` to a person: clean-up steps that found nothing are left out, and a
+/// changed Claude Code plugin ends with the restart it needs.
+pub fn report(steps: &[Step], changes: &[Change]) -> Vec<String> {
+    let quiet: Vec<PathBuf> = steps.iter().filter(|s| !touches(s)).map(Step::file).collect();
+    let plugin = PathBuf::from(format!("claude plugin {PLUGIN}"));
+    let mut lines: Vec<String> = changes
+        .iter()
+        .filter(|c| !(c.effect == Effect::Unchanged && quiet.contains(&c.path)))
+        .map(|c| format!("{:<9} {}", format!("{:?}", c.effect).to_lowercase(), c.path.display()))
+        .collect();
+    if changes.iter().any(|c| c.path == plugin && c.effect != Effect::Unchanged) {
+        lines.push("Restart Claude Code to load the rkb plugin.".into());
+    }
+    lines
+}
+
+/// Whether the step changes something that exists or will exist; a clean-up step for a file
+/// that is not there changes nothing.
+pub fn touches(step: &Step) -> bool {
+    match step {
+        Step::RemoveCommand { file } | Step::RemoveExtension { file } => file.exists(),
+        Step::RemoveSkill { dir } => dir.join("SKILL.md").exists(),
+        _ => true,
+    }
+}
+
+/// The checks `apply` makes before it writes anything: the `claude` command, and every settings file parses.
+pub fn preflight(steps: &[Step]) -> Result<()> {
     for s in steps {
+        if let Step::ClaudePlugin { program, .. } = s
+            && !program_found(program)
+        {
+            return Err(Error::Refused(format!(
+                "installing into Claude Code needs its `{program}` command on PATH; install Claude Code, or install only pi or omp"
+            )));
+        }
         if let Step::AddAskRule { settings }
         | Step::RemoveAskRule { settings }
         | Step::AddHooks { settings, .. }
@@ -435,6 +659,12 @@ pub fn apply(steps: &[Step], skill: &str) -> Result<Vec<Change>> {
             read_settings(settings)?;
         }
     }
+    Ok(())
+}
+
+/// Runs the steps after `preflight`, so a missing `claude` or an invalid settings file stops it before any write.
+pub fn apply(steps: &[Step], skill: &str) -> Result<Vec<Change>> {
+    preflight(steps)?;
     let mut out = vec![];
     for s in steps {
         let effect = match s {
@@ -448,6 +678,9 @@ pub fn apply(steps: &[Step], skill: &str) -> Result<Vec<Change>> {
             Step::RemoveExtension { file } => changed(remove_extension(file)?, Effect::Removed),
             Step::WriteCommand { file, text } => changed(write_extension(file, text)?, Effect::Written),
             Step::RemoveCommand { file } => changed(remove_command(file)?, Effect::Removed),
+            Step::WritePlugin { dir, bin } => changed(write_plugin(dir, bin)?, Effect::Written),
+            Step::ClaudePlugin { dir, program, bin } => changed(claude_plugin(dir, program, bin)?, Effect::Written),
+            Step::RemovePlugin { dir, program } => changed(remove_plugin(dir, program)?, Effect::Removed),
             Step::Trust { file, name } => changed(trust(file, name, true)?, Effect::Written),
             Step::Untrust { file, name } => changed(trust(file, name, false)?, Effect::Written),
         };
@@ -474,8 +707,15 @@ pub fn extension_status(h: Harness, home: &Path) -> Option<(bool, bool)> {
     })
 }
 
-/// Whether the skill file of `h` exists, and whether it equals the built-in skill.
+/// Whether rkb is installed for `h`, and whether it equals what this binary installs: for Claude Code
+/// the plugin, for pi and omp the skill file.
 pub fn status(h: Harness, home: &Path) -> (bool, bool) {
+    if h == Harness::Claude {
+        return match installed_plugin_version(home) {
+            Some(v) => (true, v == plugin_files(&hook_binary()).1),
+            None => (false, false),
+        };
+    }
     match std::fs::read_to_string(h.skill_dir(home).join("SKILL.md")) {
         Ok(t) => (true, t == SKILL),
         Err(_) => (false, false),
@@ -505,39 +745,151 @@ mod tests {
         assert_eq!(Harness::parse("vscode"), None);
     }
 
+    /// `plan` with the plugin folder under `home` and the fake `claude` from the fixtures.
+    fn test_plan(home: &Path, cfg: &Path, hs: &[Harness], uninstall: bool) -> Vec<Step> {
+        let fake = home.parent().unwrap().join("bin/claude");
+        if !fake.exists() {
+            std::fs::create_dir_all(fake.parent().unwrap()).unwrap();
+            std::fs::write(&fake, include_str!("../../../tests/fixtures/fake-claude.sh")).unwrap();
+            std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        }
+        let (dir, program) = (home.join(".local/share/rkb/claude-plugin"), fake.display().to_string());
+        plan(home, cfg, hs, uninstall)
+            .into_iter()
+            .map(|s| match s {
+                Step::WritePlugin { bin, .. } => Step::WritePlugin { dir: dir.clone(), bin },
+                Step::ClaudePlugin { bin, .. } => Step::ClaudePlugin { dir: dir.clone(), program: program.clone(), bin },
+                Step::RemovePlugin { .. } => Step::RemovePlugin { dir: dir.clone(), program: program.clone() },
+                other => other,
+            })
+            .collect()
+    }
+
+    fn claude_log(home: &Path) -> Vec<String> {
+        std::fs::read_to_string(home.parent().unwrap().join("bin/log")).unwrap_or_default().lines().map(str::to_string).collect()
+    }
+
+    fn settings_of(home: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(home.join(".claude/settings.json")).unwrap()).unwrap()
+    }
+
     #[test]
-    fn install_merges_and_is_idempotent() {
+    fn plugin_install_is_idempotent_and_replaces_loose_files() {
         let (_d, home, cfg) = setup();
         let settings = home.join(".claude/settings.json");
-        std::fs::write(&settings, "{\"theme\": \"dark\", \"permissions\": {\"ask\": [\"Bash(rm:*)\"], \"defaultMode\": \"auto\"}}")
-            .unwrap();
-        let steps = plan(&home, &cfg, &[Harness::Claude, Harness::Pi], false);
-        assert_eq!(steps.len(), 9);
-        let changes = apply(&steps, "SKILL TEXT").unwrap();
-        assert!(changes.iter().all(|c| c.effect == Effect::Written), "{changes:?}");
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(v["theme"], "dark");
-        assert_eq!(v["permissions"]["defaultMode"], "auto");
-        assert_eq!(v["permissions"]["ask"], serde_json::json!(["Bash(rm:*)", ASK_RULE]));
-        assert!(std::fs::read_to_string(cfg.join("trust.toml")).unwrap().contains("gated = true"));
-        assert_eq!(std::fs::read_to_string(home.join(".pi/agent/skills/rkb/SKILL.md")).unwrap(), "SKILL TEXT");
-        let retro = home.join(".claude/commands/rkb-retro.md");
-        assert_eq!(std::fs::read_to_string(&retro).unwrap(), COMMANDS[0].1);
-        std::fs::write(home.join(".claude/commands/mine.md"), "the user's own command").unwrap();
+        let old_hook = serde_json::json!({ "hooks": [{ "type": "command", "command": "rkb hook stop", "timeout": 5 }] });
+        let mine = serde_json::json!({ "hooks": [{ "type": "command", "command": "echo hi" }] });
+        let start = serde_json::json!({
+            "theme": "dark",
+            "permissions": { "ask": ["Bash(rm:*)"], "defaultMode": "auto" },
+            "hooks": { "Stop": [old_hook], "SessionStart": [mine.clone()] },
+        });
+        std::fs::write(&settings, start.to_string()).unwrap();
+        let commands = home.join(".claude/commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(
+            commands.join("rkb-retro.md"),
+            "old prompt\n<!-- Generated by rkb install; rkb install --uninstall removes this file. -->\n",
+        )
+        .unwrap();
+        std::fs::write(commands.join("mine.md"), "the user's own command").unwrap();
+        std::fs::create_dir_all(home.join(".claude/skills/rkb")).unwrap();
+        std::fs::write(home.join(".claude/skills/rkb/SKILL.md"), "old skill").unwrap();
 
+        let steps = test_plan(&home, &cfg, &[Harness::Claude, Harness::Pi], false);
+        apply(&steps, "SKILL TEXT").unwrap();
+        let v = settings_of(&home);
+        assert_eq!((v["theme"].as_str(), v["permissions"]["defaultMode"].as_str()), (Some("dark"), Some("auto")));
+        assert_eq!(v["permissions"]["ask"], serde_json::json!(["Bash(rm:*)", ASK_RULE]));
+        assert_eq!(v["permissions"]["allow"], serde_json::json!(TOOL_RULES));
+        assert_eq!(v["hooks"], serde_json::json!({ "SessionStart": [mine] }), "old rkb hook entries go, the user's stay");
+        assert!(!commands.join("rkb-retro.md").exists() && commands.join("mine.md").exists());
+        assert!(!home.join(".claude/skills/rkb").exists());
+
+        let dir = home.join(".local/share/rkb/claude-plugin/plugins/rkb");
+        assert_eq!(std::fs::read_to_string(dir.join("skills/rkb/SKILL.md")).unwrap(), SKILL);
+        assert_eq!(std::fs::read_to_string(dir.join("commands/retro.md")).unwrap(), COMMANDS[0].1);
+        let hooks: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("hooks/hooks.json")).unwrap()).unwrap();
+        assert_eq!(hooks["hooks"].as_object().unwrap().len(), 8);
+        assert_eq!(hooks["hooks"]["PostToolUseFailure"][0]["matcher"], "Bash");
+        assert_eq!(hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"], format!("{} hook session-start", hook_binary()));
+        let mcp: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
+        assert_eq!(mcp["mcpServers"]["rkb"]["args"], serde_json::json!(["mcp"]));
+        let log = claude_log(&home);
+        assert!(
+            log.iter().any(|l| l.starts_with("plugin marketplace add ")) && log.contains(&"plugin install rkb@rkb".to_string()),
+            "{log:?}"
+        );
+        assert!(std::fs::read_to_string(cfg.join("trust.toml")).unwrap().contains("[harness.claude-code]"));
+
+        let before = claude_log(&home).len();
         let again = apply(&steps, "SKILL TEXT").unwrap();
         assert!(again.iter().all(|c| c.effect == Effect::Unchanged), "{again:?}");
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(v["permissions"]["ask"].as_array().unwrap().len(), 2);
+        assert!(
+            claude_log(&home)[before..].iter().all(|l| l.ends_with("--json")),
+            "only read-only calls: {:?}",
+            &claude_log(&home)[before..]
+        );
 
-        let removed = apply(&plan(&home, &cfg, &[Harness::Claude], true), "SKILL TEXT").unwrap();
-        assert_eq!(removed[0].effect, Effect::Removed);
-        assert!(!retro.exists() && !home.join(".claude/commands/rkb-distill.md").exists());
-        assert!(home.join(".claude/commands/mine.md").exists(), "only rkb's command files are removed");
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!((v["permissions"]["ask"].clone(), v["theme"].clone()), (serde_json::json!(["Bash(rm:*)"]), serde_json::json!("dark")));
+        let removed = apply(&test_plan(&home, &cfg, &[Harness::Claude], true), "SKILL TEXT").unwrap();
+        assert!(removed.iter().any(|c| c.effect == Effect::Removed), "{removed:?}");
+        let log = claude_log(&home);
+        assert!(
+            log.contains(&"plugin uninstall rkb@rkb".to_string()) && log.contains(&"plugin marketplace remove rkb".to_string()),
+            "{log:?}"
+        );
+        assert!(!home.join(".local/share/rkb/claude-plugin").exists());
+        let v = settings_of(&home);
+        assert_eq!(v["permissions"], serde_json::json!({ "ask": ["Bash(rm:*)"], "defaultMode": "auto" }));
         assert!(!std::fs::read_to_string(cfg.join("trust.toml")).unwrap().contains("claude-code"));
-        assert!(!home.join(".claude/skills/rkb").exists());
+    }
+
+    /// Runs only where Claude Code's `claude` command exists; `validate` reads files and changes nothing.
+    #[test]
+    fn rendered_plugin_validates() {
+        if !program_found("claude") {
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        write_plugin(d.path(), "rkb").unwrap();
+        let out = std::process::Command::new("claude").args(["plugin", "validate"]).arg(d.path()).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && !text.contains("warning"), "{text}");
+    }
+
+    #[test]
+    fn plugin_path_repair_updates_the_plugin() {
+        let (_d, home, cfg) = setup();
+        let mut steps = test_plan(&home, &cfg, &[Harness::Claude], false);
+        apply(&steps, "S").unwrap();
+        for s in &mut steps {
+            if let Step::WritePlugin { bin, .. } | Step::ClaudePlugin { bin, .. } = s {
+                *bin = "/new/place/rkb".into();
+            }
+        }
+        let changes = apply(&steps, "S").unwrap();
+        assert!(changes.iter().any(|c| c.path.display().to_string() == format!("claude plugin {PLUGIN}") && c.effect == Effect::Written));
+        let log = claude_log(&home);
+        assert_eq!(log.iter().filter(|l| *l == "plugin update rkb@rkb").count(), 1, "{log:?}");
+        let hooks = std::fs::read_to_string(home.join(".local/share/rkb/claude-plugin/plugins/rkb/hooks/hooks.json")).unwrap();
+        assert!(hooks.contains("/new/place/rkb hook stop"), "{hooks}");
+        assert_ne!(plugin_files("/new/place/rkb").1, plugin_files("rkb").1, "the version follows the content");
+    }
+
+    #[test]
+    fn no_claude_command_writes_nothing() {
+        let (_d, home, cfg) = setup();
+        let steps: Vec<Step> = test_plan(&home, &cfg, &[Harness::Pi, Harness::Claude], false)
+            .into_iter()
+            .map(|s| match s {
+                Step::ClaudePlugin { dir, bin, .. } => Step::ClaudePlugin { dir, program: "/no/such/claude".into(), bin },
+                other => other,
+            })
+            .collect();
+        let e = apply(&steps, "S").unwrap_err();
+        assert!(e.to_string().contains("claude"), "{e}");
+        assert!(!home.join(".pi/agent/skills/rkb/SKILL.md").exists());
+        assert!(!home.join(".local/share/rkb/claude-plugin").exists());
     }
 
     #[test]
@@ -545,46 +897,16 @@ mod tests {
         let (_d, home, cfg) = setup();
         let settings = home.join(".claude/settings.json");
         std::fs::write(&settings, "{\"theme\": \"dark\"}").unwrap();
-        apply(&plan(&home, &cfg, &[Harness::Claude], false), "S").unwrap();
-        apply(&plan(&home, &cfg, &[Harness::Claude], true), "S").unwrap();
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(v, serde_json::json!({"theme": "dark"}));
-    }
-
-    #[test]
-    fn hooks_merge_and_uninstall_keep_user_hooks() {
-        let (_d, home, cfg) = setup();
-        let settings = home.join(".claude/settings.json");
-        let mine = serde_json::json!({ "hooks": [{ "type": "command", "command": "echo hi" }] });
-        std::fs::write(&settings, serde_json::json!({ "model": "x", "hooks": { "SessionStart": [mine.clone()] } }).to_string()).unwrap();
-        let steps = plan(&home, &cfg, &[Harness::Claude], false);
-        apply(&steps, "S").unwrap();
-        assert!(hooks_installed(&home));
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(v["model"], "x");
-        assert_eq!(v["hooks"]["SessionStart"][0], mine);
-        assert_eq!(v["hooks"]["SessionStart"][1]["hooks"][0]["command"], format!("{} hook session-start", hook_binary()));
-        assert_eq!(v["hooks"]["PostToolUseFailure"][0]["matcher"], "Bash");
-        assert_eq!(v["hooks"]["PostToolUseFailure"][0]["hooks"][0]["timeout"], 5);
-        assert_eq!(v["hooks"].as_object().unwrap().len(), 8);
-        assert_eq!(v["hooks"]["PreCompact"][0]["hooks"][0]["command"], format!("{} hook pre-compact", hook_binary()));
-        assert_eq!(v["hooks"]["SessionEnd"][0]["hooks"][0]["command"], format!("{} hook session-end", hook_binary()));
-
-        let again = apply(&steps, "S").unwrap();
-        assert!(again.iter().all(|c| c.effect == Effect::Unchanged), "{again:?}");
-        assert_eq!(again.iter().filter(|c| c.path == settings).count(), 1, "one row per file");
-
-        apply(&plan(&home, &cfg, &[Harness::Claude], true), "S").unwrap();
-        assert!(!hooks_installed(&home));
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(v, serde_json::json!({ "model": "x", "hooks": { "SessionStart": [mine] } }));
+        apply(&test_plan(&home, &cfg, &[Harness::Claude], false), "S").unwrap();
+        apply(&test_plan(&home, &cfg, &[Harness::Claude], true), "S").unwrap();
+        assert_eq!(settings_of(&home), serde_json::json!({"theme": "dark"}));
     }
 
     #[test]
     fn extension_install_and_uninstall() {
         let (d, home, cfg) = setup();
         let ext = home.join(".pi/agent/extensions/rkb.ts");
-        apply(&plan(&home, &cfg, &[Harness::Claude, Harness::Pi], false), "S").unwrap();
+        apply(&test_plan(&home, &cfg, &[Harness::Claude, Harness::Pi], false), "S").unwrap();
         let text = std::fs::read_to_string(&ext).unwrap();
         assert!(text.starts_with(EXTENSION_MARKER) && text.contains("const HARNESS = \"pi\"") && !text.contains("__HARNESS__"));
         assert_eq!(extension_status(Harness::Pi, &home), Some((true, true)));
@@ -592,31 +914,31 @@ mod tests {
         let trust_file = std::fs::read_to_string(cfg.join("trust.toml")).unwrap();
         assert!(trust_file.contains("[harness.pi]") && trust_file.contains("[harness.claude-code]"), "{trust_file}");
 
-        let again = apply(&plan(&home, &cfg, &[Harness::Pi], false), "S").unwrap();
+        let again = apply(&test_plan(&home, &cfg, &[Harness::Pi], false), "S").unwrap();
         assert!(again.iter().all(|c| c.effect == Effect::Unchanged), "{again:?}");
 
         let bin = serde_json::to_string(&hook_binary()).unwrap();
         assert!(text.contains(&format!("const RKB: string = {bin};")) && !text.contains("__RKB__"), "{text}");
         std::fs::write(&ext, text.replace(&bin, "\"/old/place/rkb\"")).unwrap();
-        let repaired = apply(&plan(&home, &cfg, &[Harness::Pi], false), "S").unwrap();
+        let repaired = apply(&test_plan(&home, &cfg, &[Harness::Pi], false), "S").unwrap();
         assert!(repaired.iter().any(|c| c.path == ext && c.effect == Effect::Written), "a changed binary path is rewritten");
         assert_eq!(std::fs::read_to_string(&ext).unwrap(), text);
 
-        apply(&plan(&home, &cfg, &[Harness::Pi], true), "S").unwrap();
+        apply(&test_plan(&home, &cfg, &[Harness::Pi], true), "S").unwrap();
         assert!(!ext.exists());
         let trust_file = std::fs::read_to_string(cfg.join("trust.toml")).unwrap();
         assert!(!trust_file.contains("[harness.pi]") && trust_file.contains("[harness.claude-code]"), "{trust_file}");
 
         std::fs::create_dir_all(ext.parent().unwrap()).unwrap();
         std::fs::write(&ext, "// my own extension\n").unwrap();
-        apply(&plan(&home, &cfg, &[Harness::Pi], true), "S").unwrap();
+        apply(&test_plan(&home, &cfg, &[Harness::Pi], true), "S").unwrap();
         assert_eq!(std::fs::read_to_string(&ext).unwrap(), "// my own extension\n", "not rkb's, so kept");
 
         let elsewhere = d.path().join("elsewhere.ts");
         std::fs::write(&elsewhere, "linked").unwrap();
         std::fs::remove_file(&ext).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &ext).unwrap();
-        apply(&plan(&home, &cfg, &[Harness::Pi], false), "S").unwrap();
+        apply(&test_plan(&home, &cfg, &[Harness::Pi], false), "S").unwrap();
         assert!(!ext.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "linked");
     }
@@ -627,10 +949,10 @@ mod tests {
         let elsewhere = d.path().join("repo/skills/rkb");
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::fs::write(elsewhere.join("SKILL.md"), "repo copy").unwrap();
-        std::fs::create_dir_all(home.join(".claude/skills")).unwrap();
-        std::os::unix::fs::symlink(&elsewhere, home.join(".claude/skills/rkb")).unwrap();
-        apply(&plan(&home, &cfg, &[Harness::Claude], false), "SKILL TEXT").unwrap();
-        let link = home.join(".claude/skills/rkb");
+        std::fs::create_dir_all(home.join(".pi/agent/skills")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join(".pi/agent/skills/rkb")).unwrap();
+        apply(&test_plan(&home, &cfg, &[Harness::Pi], false), "SKILL TEXT").unwrap();
+        let link = home.join(".pi/agent/skills/rkb");
         assert!(!link.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(link.join("SKILL.md")).unwrap(), "SKILL TEXT");
         assert_eq!(std::fs::read_to_string(elsewhere.join("SKILL.md")).unwrap(), "repo copy");
@@ -640,7 +962,7 @@ mod tests {
     fn invalid_settings_stop_before_any_write() {
         let (_d, home, cfg) = setup();
         std::fs::write(home.join(".claude/settings.json"), "{ not json").unwrap();
-        let e = apply(&plan(&home, &cfg, &[Harness::Pi, Harness::Claude], false), "SKILL TEXT").unwrap_err();
+        let e = apply(&test_plan(&home, &cfg, &[Harness::Pi, Harness::Claude], false), "SKILL TEXT").unwrap_err();
         assert!(e.to_string().contains("settings.json"), "{e}");
         assert!(!home.join(".pi/agent/skills/rkb/SKILL.md").exists());
     }
@@ -648,9 +970,10 @@ mod tests {
     #[test]
     fn missing_settings_file_is_created() {
         let (_d, home, cfg) = setup();
-        apply(&plan(&home, &cfg, &[Harness::Claude], false), "S").unwrap();
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join(".claude/settings.json")).unwrap()).unwrap();
+        apply(&test_plan(&home, &cfg, &[Harness::Claude], false), "S").unwrap();
+        let v = settings_of(&home);
         assert_eq!(v["permissions"]["ask"], serde_json::json!([ASK_RULE]));
+        assert_eq!(v["permissions"]["allow"], serde_json::json!(TOOL_RULES));
     }
 
     #[test]

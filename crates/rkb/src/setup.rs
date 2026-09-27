@@ -60,7 +60,11 @@ fn list(env: &Env) -> Output {
                 "{:<7} {}  {}\n",
                 h.name(),
                 paint(env.colored, color, &format!("{state:<13}")),
-                tilde(&h.skill_dir(&home).join("SKILL.md"))
+                if *h == Harness::Claude {
+                    format!("claude plugin {}", install::PLUGIN)
+                } else {
+                    tilde(&h.skill_dir(&home).join("SKILL.md"))
+                }
             ));
             let mut row = json!({ "harness": h.name(), "detected": detected, "installed": installed, "current": current });
             if let (Some((ext_installed, ext_current)), Some(file)) = (install::extension_status(*h, &home), h.extension_file(&home)) {
@@ -104,9 +108,16 @@ pub fn install(env: &Env, names: Vec<String>, list_only: bool, uninstall: bool) 
     let hs = harnesses(&names, &home)?;
     let steps = install::plan(&home, &paths::config_dir(), &hs, uninstall);
 
+    install::preflight(&steps)?;
     let person = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if !person {
-        let files: Vec<String> = steps.iter().map(|s| format!("  {}", tilde(&s.file()))).collect();
+        let mut files: Vec<String> = vec![];
+        for s in steps.iter().filter(|s| install::touches(s)) {
+            let f = format!("  {}", tilde(&s.file()));
+            if !files.contains(&f) {
+                files.push(f);
+            }
+        }
         let verb = if uninstall { "Uninstall rkb from" } else { "Install rkb into" };
         let names: Vec<&str> = hs.iter().map(|h| h.name()).collect();
         let req = Request {
@@ -130,17 +141,26 @@ pub fn install(env: &Env, names: Vec<String>, list_only: bool, uninstall: bool) 
 
     let changes = install::apply(&steps, install::SKILL)?;
     let mut human = String::new();
-    for c in &changes {
-        let (word, color) = match c.effect {
-            Effect::Written => ("written", "32"),
-            Effect::Removed => ("removed", "33"),
-            Effect::Unchanged => ("unchanged", "2"),
+    for line in install::report(&steps, &changes) {
+        let color = if line.starts_with("written") {
+            "32"
+        } else if line.starts_with("removed") || line.starts_with("Restart") {
+            "33"
+        } else {
+            "2"
         };
-        human.push_str(&format!("{} {}\n", paint(env.colored, color, &format!("{word:<9}")), tilde(&c.path)));
+        let home_text = home.display().to_string();
+        human.push_str(&format!("{}\n", paint(env.colored, color, &line.replace(&home_text, "~"))));
     }
     if changes.iter().all(|c| c.effect == Effect::Unchanged) {
         human.push_str("Nothing changed; everything was already in place.\n");
     }
+    let plugin = format!("claude plugin {}", install::PLUGIN);
+    let restart = changes.iter().any(|c| c.path.display().to_string() == plugin && c.effect != Effect::Unchanged);
     let rows: Vec<serde_json::Value> = changes.iter().map(|c| json!({ "path": tilde(&c.path), "effect": c.effect })).collect();
-    Ok(Output { data: json!({ "status": "done", "changes": rows }), human, exit: 0, raw: false })
+    let mut data = json!({ "status": "done", "changes": rows });
+    if restart {
+        data["help"] = json!(["Restart Claude Code to load the rkb plugin"]);
+    }
+    Ok(Output { data, human, exit: 0, raw: false })
 }

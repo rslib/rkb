@@ -310,12 +310,12 @@ pub fn extract(steps: &[Step]) -> String {
 }
 
 /// The session-start line, only when the inbox holds at least 5 items or its oldest is over 7 days old.
-pub fn nudge(state: &Path, now: u64) -> Option<String> {
+pub fn nudge(state: &Path, now: u64, command: &str) -> Option<String> {
     let items = list(state);
     let oldest = items.first()?;
     let days = now.saturating_sub(oldest.meta.time) / 86400;
     (items.len() >= 5 || days > 7)
-        .then(|| format!("rkb inbox: {} items wait, the oldest {days} days old; run /rkb-distill to turn them into lessons", items.len()))
+        .then(|| format!("rkb inbox: {} items wait, the oldest {days} days old; run {command} to turn them into lessons", items.len()))
 }
 
 /// Session-state signals that make a session worth an extract.
@@ -431,10 +431,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = dir.path();
         let day = 86400;
-        assert_eq!(nudge(s, 100 * day), None);
+        assert_eq!(nudge(s, 100 * day, "/rkb-distill"), None);
         add(s, note(90 * day), "old").unwrap();
-        assert!(nudge(s, 97 * day).is_none(), "7 days is not yet old");
-        assert!(nudge(s, 98 * day).unwrap().contains("the oldest 8 days old"));
+        assert!(nudge(s, 97 * day, "/rkb-distill").is_none(), "7 days is not yet old");
+        assert!(nudge(s, 98 * day, "/rkb-distill").unwrap().contains("the oldest 8 days old"));
     }
 
     #[test]

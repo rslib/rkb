@@ -53,7 +53,7 @@ fn read_payload() -> Result<Value> {
 fn handle(event: &str, p: &Value, state: &Path, harness: &str) -> Result<Option<String>> {
     let session = p["session_id"].as_str().unwrap_or("");
     match event {
-        "session-start" => session_start(p, state),
+        "session-start" => session_start(p, state, harness),
         "pre-tool" => pre_tool(p, state),
         "tool-ok" => tool_ok(p, state, session),
         "tool-failed" => tool_failed(p, state, session),
@@ -86,14 +86,15 @@ fn reply(event: &str, key: &str, value: Value) -> String {
     json!({ "hookSpecificOutput": out }).to_string()
 }
 
-fn session_start(p: &Value, state: &Path) -> Result<Option<String>> {
+fn session_start(p: &Value, state: &Path, harness: &str) -> Result<Option<String>> {
     hooks::cleanup(state);
     let root = kb::home();
     kb::open(&root)?;
     let place = state::locate(&root, &cwd(p), &Hints::default(), state)?;
     let s = state::build(&root, place, state)?;
     let mut text = crate::session::context(&s).human;
-    if let Some(line) = rkb_core::distill::nudge(state, request::now()) {
+    let distill = if harness == "claude-code" { "/rkb:distill" } else { "/rkb-distill" };
+    if let Some(line) = rkb_core::distill::nudge(state, request::now(), distill) {
         text.push_str(&format!("\n{line}"));
     }
     Ok(Some(text))

@@ -115,8 +115,16 @@ pub fn hook_checks(home: &Path, state_dir: &Path) -> Vec<Check> {
             Harness::Pi => "pi",
             Harness::Omp => "omp",
         };
+        if h == Harness::Claude && crate::install::hooks_installed(home) {
+            out.push(check(
+                "hooks: claude",
+                Level::Warn,
+                "rkb hook entries from an earlier rkb are still in ~/.claude/settings.json",
+                Some("run `rkb install claude` in a terminal; the plugin carries the hooks now".into()),
+            ));
+        }
         match crate::install::extension_status(h, home) {
-            None if !crate::install::hooks_installed(home) => continue,
+            None if crate::install::installed_plugin_version(home).is_none() => continue,
             Some((false, _)) => continue,
             Some((true, false)) => {
                 out.push(check(
@@ -159,7 +167,7 @@ pub fn skill_checks(home: &Path) -> Vec<Check> {
         .filter(|h| h.detected(home))
         .map(|h| {
             let name = match h {
-                Harness::Claude => "skill: claude",
+                Harness::Claude => "plugin: claude",
                 Harness::Pi => "skill: pi",
                 Harness::Omp => "skill: omp",
             };
@@ -345,8 +353,12 @@ mod tests {
         let (home, state) = (dir.path().join("home"), dir.path().join("state"));
         std::fs::create_dir_all(home.join(".claude")).unwrap();
         assert!(hook_checks(&home, &state).is_empty());
-        let harnesses = [crate::install::Harness::Claude, crate::install::Harness::Omp];
-        crate::install::apply(&crate::install::plan(&home, &dir.path().join("cfg"), &harnesses, false), "S").unwrap();
+        let omp = [crate::install::Harness::Omp];
+        crate::install::apply(&crate::install::plan(&home, &dir.path().join("cfg"), &omp, false), "S").unwrap();
+        // The plugin as Claude Code records it; the unit tests never run a real `claude`.
+        std::fs::create_dir_all(home.join(".claude/plugins")).unwrap();
+        std::fs::write(home.join(".claude/plugins/installed_plugins.json"), r#"{"version":2,"plugins":{"rkb@rkb":[{"version":"x"}]}}"#)
+            .unwrap();
         let checks = hook_checks(&home, &state);
         let summary: Vec<(&str, Level, &str)> = checks.iter().map(|c| (c.name, c.level, c.detail.as_str())).collect();
         assert_eq!(
@@ -370,7 +382,7 @@ mod tests {
         std::fs::write(home.join(".pi/agent/skills/rkb/SKILL.md"), "old text").unwrap();
         let c = skill_checks(home);
         let got: Vec<(&str, Level)> = c.iter().map(|c| (c.name, c.level)).collect();
-        assert_eq!(got, [("skill: claude", Level::Warn), ("skill: pi", Level::Warn)]);
+        assert_eq!(got, [("plugin: claude", Level::Warn), ("skill: pi", Level::Warn)]);
         assert_eq!(c[1].detail, "installed, but differs from this rkb");
         assert_eq!(c[1].fix.as_deref(), Some("run `rkb install pi` in a terminal"));
         std::fs::write(home.join(".pi/agent/skills/rkb/SKILL.md"), crate::install::SKILL).unwrap();

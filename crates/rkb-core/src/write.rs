@@ -294,9 +294,7 @@ pub fn confirm(ctx: &Ctx, req: &Request, choice: &str) -> Result<Outcome> {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
         let steps = crate::install::plan(&home, &crate::paths::config_dir(), harnesses, *uninstall);
         let changes = crate::install::apply(&steps, crate::install::SKILL)?;
-        let lines: Vec<String> =
-            changes.iter().map(|c| format!("{:<9} {}", format!("{:?}", c.effect).to_lowercase(), c.path.display())).collect();
-        return Ok(Outcome::Info(lines.join("\n")));
+        return Ok(Outcome::Info(crate::install::report(&steps, &changes).join("\n")));
     }
     if let Action::BreakLock { path, holder } = &req.action {
         return Ok(Outcome::Info(if crate::doctor::break_lock(path, holder) {

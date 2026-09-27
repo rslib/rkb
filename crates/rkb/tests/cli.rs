@@ -9,6 +9,10 @@ impl Env {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("gitconfig"), "[user]\n\tname = Test\n\temail = test@example.org\n").unwrap();
+        let fake = dir.path().join("fake/claude");
+        std::fs::create_dir_all(fake.parent().unwrap()).unwrap();
+        std::fs::write(&fake, include_str!("../../../tests/fixtures/fake-claude.sh")).unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         Env { dir }
     }
 
@@ -28,6 +32,10 @@ impl Env {
             .env("PATH", path)
             .env("XDG_STATE_HOME", self.dir.path().join("state"))
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
+            .env("XDG_DATA_HOME", self.dir.path().join("data"))
+            .env("XDG_CACHE_HOME", self.dir.path().join("cache"))
+            .env("RKB_CLAUDE", self.dir.path().join("fake/claude"))
+            .env("FAKE_CLAUDE_HOME", self.dir.path())
             .env("RKB_TTY", self.dir.path().join("no-tty"))
             .env_remove("CLAUDECODE")
             .env_remove("RKB_FORMAT")
@@ -1509,6 +1517,23 @@ fn mcp_server_offers_the_tools() {
 }
 
 #[test]
+fn install_claude_needs_the_claude_command() {
+    let env = Env::new();
+    std::fs::create_dir_all(env.dir.path().join(".claude")).unwrap();
+    let o = env.cmd(env!("CARGO_BIN_EXE_rkb")).args(["install", "claude", "--toon"]).env("RKB_CLAUDE", "/no/such/claude").output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(out.contains("claude") && out.contains("PATH"), "{out}");
+    assert!(!env.dir.path().join("data/rkb/claude-plugin").exists() && !env.dir.path().join("state/rkb/requests").exists());
+
+    let (v, code) = env.json(&["install", "claude"], "");
+    assert_eq!(code, Some(3));
+    let q = v["question"].as_str().unwrap();
+    assert!(q.contains("claude plugin rkb@rkb") && q.contains("~/.claude/settings.json") && q.contains("trust.toml"), "{q}");
+    assert_eq!(q.matches("settings.json").count(), 1, "each file once: {q}");
+}
+
+#[test]
 fn install_from_an_agent_needs_the_user() {
     let env = Env::new();
     let home = env.dir.path();
@@ -1527,8 +1552,8 @@ fn install_from_an_agent_needs_the_user() {
     let (v, code) = env.json(&["install"], "");
     assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)));
     let q = v["question"].as_str().unwrap();
-    assert!(q.contains("~/.claude/skills/rkb/SKILL.md") && q.contains("~/.claude/settings.json") && q.contains("trust.toml"), "{q}");
-    assert!(!home.join(".claude/skills/rkb").exists(), "nothing written before confirm");
+    assert!(q.contains("claude plugin rkb@rkb") && q.contains("~/.claude/settings.json") && q.contains("trust.toml"), "{q}");
+    assert!(!home.join("data/rkb/claude-plugin").exists(), "nothing written before confirm");
 
     let (v, _) = env.json(&["confirm", v["request"].as_str().unwrap(), "--choice", "install"], "");
     assert_eq!(v["error"]["code"], "needs_terminal", "an agent cannot confirm its own install");
@@ -1545,8 +1570,11 @@ fn install_from_an_agent_needs_the_user() {
     assert_eq!(settings["permissions"]["ask"], serde_json::json!(["Bash(rm:*)", "Bash(rkb confirm:*)"]));
     assert_eq!(settings["theme"], "dark");
     assert!(std::fs::read_to_string(home.join("config/rkb/trust.toml")).unwrap().contains("gated = true"));
+    assert_eq!(settings["permissions"]["allow"].as_array().unwrap().len(), 4, "the plugin tools are allowed");
+    let message = v["message"].as_str().unwrap();
+    assert!(message.contains("Restart Claude Code") && !message.contains("rkb-retro.md"), "{message}");
     let (v, _) = env.json(&["install", "--list"], "");
-    assert_eq!(v["harnesses"][1]["current"], true);
+    assert_eq!((v["harnesses"][0]["current"].as_bool(), v["harnesses"][1]["current"].as_bool()), (Some(true), Some(true)), "{v}");
 
     let (v, code) = env.json(&["install", "vscode"], "");
     assert_eq!((v["error"]["code"].as_str(), code), (Some("usage"), Some(2)));
@@ -1644,7 +1672,12 @@ fn session_start_names_a_full_inbox() {
         env.json(&["note", &format!("finding {i}")], "");
     }
     let text = start(&env);
-    assert!(text.contains("5 items wait") && text.contains("/rkb-distill"), "{text}");
+    assert!(text.contains("5 items wait") && text.contains("/rkb:distill"), "Claude Code names its plugin command: {text}");
+    let o = env.rkb_in(
+        &["hook", "session-start", "--harness", "pi"],
+        &serde_json::json!({ "session_id": "p", "cwd": env.dir.path() }).to_string(),
+    );
+    assert!(String::from_utf8_lossy(&o.stdout).contains("run /rkb-distill"), "{}", stdout(&o));
 }
 
 #[test]
@@ -1707,8 +1740,11 @@ fn hook_full_session() {
     let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
     c.env("RKB_TTY", &tty);
     assert!(rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", "install"], "").status.success());
-    let settings: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join(".claude/settings.json")).unwrap()).unwrap();
-    assert_eq!(settings["hooks"]["PostToolUseFailure"][0]["hooks"][0]["command"], "rkb hook tool-failed");
+    let plugin = home.join("data/rkb/claude-plugin/plugins/rkb");
+    let hooks: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(plugin.join("hooks/hooks.json")).unwrap()).unwrap();
+    assert_eq!(hooks["hooks"]["PostToolUseFailure"][0]["hooks"][0]["command"], "rkb hook tool-failed");
+    let log = std::fs::read_to_string(home.join("fake/log")).unwrap();
+    assert!(log.contains("plugin install rkb@rkb"), "{log}");
     let doctor_hook = |env: &Env| {
         let (v, _) = env.json(&["doctor"], "");
         v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "hooks: claude").cloned().unwrap()
