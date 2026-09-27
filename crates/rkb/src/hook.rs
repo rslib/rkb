@@ -170,8 +170,7 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
         return Ok(None);
     }
     hooks::append(state, session, &json!({ "kind": "injected", "id": hit.id }))?;
-    let log =
-        json!({ "time": request::now(), "session": session, "id": hit.id, "ranked_by": ranked.describe(), "relevance": hit.relevance });
+    let log = json!({ "time": request::now(), "session": session, "id": hit.id, "ranked_by": ranked.describe(), "relevance": hit.relevance.map(crate::output::score2) });
     lock::append_line(&state.join("injections.jsonl"), &log.to_string())?;
     let summary = if hit.summary.is_empty() { String::new() } else { format!(" - {}", hit.summary) };
     let context = format!(

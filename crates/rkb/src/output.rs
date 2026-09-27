@@ -27,6 +27,11 @@ pub fn resolve(flag: Option<Format>) -> Result<Format, CliError> {
     }
 }
 
+/// A model score with two decimals. Rounding in `f32` and widening later brings back digits such as 0.8600000143.
+pub fn score2(r: f32) -> f64 {
+    (f64::from(r) * 100.0).round() / 100.0
+}
+
 /// `path` with the home folder shown as `~`.
 pub fn tilde(path: &std::path::Path) -> String {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();

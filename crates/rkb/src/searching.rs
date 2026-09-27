@@ -133,7 +133,7 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options, only: Option<
                 "applies": h.applies.as_str(),
             });
             if let Some(rel) = h.relevance {
-                row["relevance"] = json!((rel * 100.0).round() / 100.0);
+                row["relevance"] = json!(crate::output::score2(rel));
             }
             match &h.line {
                 Some((n, line)) => row["line"] = json!(format!("{n}: {}", crate::output::cut(line, SUMMARY_LIMIT, "rkb show <id>"))),

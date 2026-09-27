@@ -1185,6 +1185,7 @@ fn search_reranks_with_laya() {
     want.sort();
     assert_eq!(got, want, "nothing is removed or added");
     let rel: Vec<f64> = v["results"].as_array().unwrap().iter().map(|r| r["relevance"].as_f64().unwrap()).collect();
+    assert!(rel.iter().all(|r| ((r * 100.0).round() / 100.0 - r).abs() < 1e-12), "two decimals: {rel:?}");
     assert!(rel.windows(2).all(|w| w[0] >= w[1]), "{rel:?}");
 
     let q = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/search/queries.toml");
