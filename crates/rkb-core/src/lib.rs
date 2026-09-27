@@ -23,6 +23,7 @@ pub mod lock;
 pub mod matching;
 pub mod paths;
 pub mod request;
+pub mod rerank;
 pub mod review;
 pub mod script;
 pub mod search;

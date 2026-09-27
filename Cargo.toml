@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rkb", "crates/rkb-core"]
+members = ["crates/rkb", "crates/rkb-core", "crates/rkb-rerank"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,7 @@ license = "MIT"
 
 [workspace.dependencies]
 rkb-core = { path = "crates/rkb-core" }
+rkb-rerank = { path = "crates/rkb-rerank" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

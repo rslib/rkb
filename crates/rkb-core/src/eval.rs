@@ -7,7 +7,7 @@ use crate::conditions::Facts;
 use crate::error::{Error, Result};
 use crate::kb::{FileKind, Snapshot, classify};
 use crate::matching::{Matched, Place, Rule};
-use crate::search::{Mode, Options, search};
+use crate::search::{Mode, Options, Results, search};
 
 pub const DEPTH: usize = 10;
 
@@ -64,8 +64,9 @@ pub fn score(rows: &[Row]) -> (f64, f64) {
     (recall, mrr)
 }
 
-/// Runs every query against the knowledge base at `root`.
-pub fn run(root: &Path, queries: &[Query]) -> Result<Report> {
+/// Runs every query against the knowledge base at `root`. `rerank` reorders the results of a ranked
+/// query, which are searched `depth` deep and then cut to the first 10.
+pub fn run(root: &Path, queries: &[Query], depth: usize, rerank: &mut dyn FnMut(&str, &mut Results) -> Result<()>) -> Result<Report> {
     let snap = Snapshot::from_dir_where(root, |p| classify(p) == FileKind::Lesson)?;
     let (lessons, _) = snap.lessons();
     let ids: HashSet<&str> = lessons.iter().map(|l| l.frontmatter.id.as_str()).collect();
@@ -84,13 +85,17 @@ pub fn run(root: &Path, queries: &[Query]) -> Result<Report> {
             QueryMode::Search => Mode::Ranked(q.text.clone()),
             QueryMode::Literal => Mode::Literal(q.text.clone()),
         };
-        let res = search(
+        let mut res = search(
             root,
             &place,
             &facts,
             &mode,
-            &Options { all: false, every_status: false, limit: DEPTH, probes: crate::search::ProbeMode::Off },
+            &Options { all: false, every_status: false, limit: DEPTH.max(depth), probes: crate::search::ProbeMode::Off },
         )?;
+        if let Mode::Ranked(text) = &mode {
+            rerank(text, &mut res)?;
+        }
+        res.hits.truncate(DEPTH);
         let rank = res.hits.iter().position(|h| q.expect.contains(&h.id)).map(|i| i + 1);
         rows.push(Row { text: q.text.clone(), rank });
     }

@@ -118,7 +118,8 @@ pub fn doctor(env: &Env, place: &Place, break_lock: bool) -> Result<Output, CliE
             None => writes::outcome(env, rkb_core::write::Outcome::Info("There is no write lock; nothing to break".into())),
         });
     }
-    let checks = doctor::run(&env.root, place, &env.state, &paths::config_dir(), &env.lint);
+    let mut checks = doctor::run(&env.root, place, &env.state, &paths::config_dir(), &env.lint);
+    checks.extend(crate::rerankers::model_check(&rkb_core::rerank::Settings::load(&env.root)));
     let failed = checks.iter().filter(|c| c.level == Level::Fail).count();
     let warned = checks.iter().filter(|c| c.level == Level::Warn).count();
     Ok(Output {

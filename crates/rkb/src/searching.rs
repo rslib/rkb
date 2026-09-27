@@ -1,6 +1,7 @@
 use rkb_core::conditions::{Facts, Verdict};
 use rkb_core::eval;
 use rkb_core::lesson::Status;
+use rkb_core::rerank::{self, BM25, Ranked, Settings};
 use rkb_core::search::{self, Found, Mode, Options, RANKED_BY, Results};
 use serde_json::{Value, json};
 
@@ -25,15 +26,54 @@ fn hidden_text(r: &Results) -> Option<String> {
     })
 }
 
-pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options) -> Result<Output, CliError> {
+/// Whether the chain would try a model at all, so a BM25-only search skips building rerank texts.
+fn wants_model(settings: &Settings, only: Option<&str>) -> bool {
+    if std::env::var("RKB_NO_MODEL").is_ok_and(|v| v == "1") {
+        return false;
+    }
+    match only {
+        Some(b) => b != BM25,
+        None => settings.chain.first().is_some_and(|b| b != BM25),
+    }
+}
+
+/// Reranks the first `rerank.top` hits with the chain and cuts the list to `limit`.
+pub fn rerank_hits(
+    env: &Env,
+    query: &str,
+    r: &mut Results,
+    limit: usize,
+    only: Option<&str>,
+    timeout_ms: Option<u64>,
+) -> Result<Ranked, CliError> {
+    let settings = Settings::load(&env.root);
+    let n = if wants_model(&settings, only) { settings.top.min(r.hits.len()) } else { 0 };
+    let items = search::rerank_items(&env.root, &r.hits[..n]);
+    let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(settings.timeout_ms));
+    let ranked = rerank::run(&settings, only, &crate::rerankers::opener(&settings), query, &items, timeout)?;
+    if let Some(scores) = &ranked.scores {
+        search::apply_relevance(&mut r.hits, scores);
+    }
+    r.hits.truncate(limit);
+    Ok(ranked)
+}
+
+pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options, only: Option<&str>) -> Result<Output, CliError> {
     let place = env.place.clone().unwrap_or_default();
-    let r = search::search(&env.root, &place, facts, &mode, &opts)?;
+    let ranked = matches!(mode, Mode::Ranked(_));
+    let top = if ranked { Settings::load(&env.root).top } else { 0 };
+    let limit = opts.limit;
+    let mut r = search::search(&env.root, &place, facts, &mode, &Options { limit: limit.max(top), ..opts })?;
+    let ranking = match &mode {
+        Mode::Ranked(q) => Some(rerank_hits(env, q, &mut r, limit, only, None)?),
+        _ => None,
+    };
+    let ranked_by = ranking.as_ref().map(Ranked::describe).unwrap_or_else(|| RANKED_BY.to_string());
     let (label, query) = match &mode {
         Mode::Ranked(q) => ("search", q.clone()),
         Mode::Literal(t) => ("literal", t.clone()),
         Mode::Regex(p) => ("regex", p.clone()),
     };
-    let ranked = matches!(mode, Mode::Ranked(_));
     let m = marks();
     let w = width();
     let c = env.colored;
@@ -43,7 +83,7 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options) -> Result<Out
         paint(c, "1", &format!("{label} \"{query}\"")),
         m.sep,
         if r.hits.len() == 1 { "1 result".to_string() } else { format!("{} results", r.hits.len()) },
-        if ranked { format!("{} ranked by: {RANKED_BY}", m.sep) } else { String::new() }
+        if ranked { format!("{} reranker: {ranked_by}", m.sep) } else { String::new() }
     )
     .trim_end()
     .to_string();
@@ -52,6 +92,9 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options) -> Result<Out
         let mut right = vec![];
         if h.status != Status::Active {
             right.push(paint(c, "33", h.status.as_str()));
+        }
+        if let Some(rel) = h.relevance {
+            right.push(paint(c, "36", &format!("{rel:.2}")));
         }
         right.push(paint(c, applies_color(h.applies), h.applies.as_str()));
         let right_plain: usize = right.iter().map(|s| len(&strip(s)) + 2).sum();
@@ -89,6 +132,9 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options) -> Result<Out
                 "status": h.status.as_str(),
                 "applies": h.applies.as_str(),
             });
+            if let Some(rel) = h.relevance {
+                row["relevance"] = json!((rel * 100.0).round() / 100.0);
+            }
             match &h.line {
                 Some((n, line)) => row["line"] = json!(format!("{n}: {}", crate::output::cut(line, SUMMARY_LIMIT, "rkb show <id>"))),
                 None => row["summary"] = json!(crate::output::cut(&h.summary, SUMMARY_LIMIT, "rkb show <id>")),
@@ -98,7 +144,7 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options) -> Result<Out
         .collect();
     let mut data = json!({ "query": query, "mode": label, "results": rows });
     if ranked {
-        data["ranked_by"] = json!(RANKED_BY);
+        data["ranked_by"] = json!(ranked_by);
     }
     if r.hidden > 0 {
         data["hidden"] = json!(r.hidden);
@@ -159,7 +205,7 @@ pub fn find(env: &Env, query: &str, limit: usize) -> Result<Output, CliError> {
     Ok(Output { data: json!({ "query": query, "results": rows, "help": [help] }), human, exit: 0, raw: false })
 }
 
-pub fn eval(env: &Env, file: Option<String>, min_recall: Option<f64>) -> Result<Output, CliError> {
+pub fn eval(env: &Env, file: Option<String>, min_recall: Option<f64>, backend: &str) -> Result<Output, CliError> {
     let path = file.map(std::path::PathBuf::from).unwrap_or_else(|| env.root.join("eval/queries.toml"));
     let text = std::fs::read_to_string(&path).map_err(|e| {
         CliError::new(
@@ -175,7 +221,30 @@ pub fn eval(env: &Env, file: Option<String>, min_recall: Option<f64>) -> Result<
             "each [[query]] has text, expect and optionally mode, with, project, system",
         )
     })?;
-    let report = eval::run(&env.root, &queries)?;
+    let mut settings = Settings::load(&env.root);
+    settings.strict = true;
+    let opener = crate::rerankers::opener(&settings);
+    let mut ranked_by = BM25.to_string();
+    let depth = if backend == BM25 { 0 } else { settings.top };
+    let report = eval::run(&env.root, &queries, depth, &mut |q, r| {
+        if backend == BM25 {
+            return Ok(());
+        }
+        let items = search::rerank_items(&env.root, &r.hits[..settings.top.min(r.hits.len())]);
+        // Eval is not interactive, so a slow backend still counts; only a skip fails it.
+        let ranked = rerank::run(&settings, Some(backend), &opener, q, &items, std::time::Duration::from_secs(120))?;
+        if ranked.backend != backend {
+            return Err(rkb_core::Error::Refused(format!(
+                "rerank backend {backend} did not run ({}); unset RKB_NO_MODEL, or run `rkb models fetch`",
+                ranked.describe()
+            )));
+        }
+        if let Some(scores) = &ranked.scores {
+            search::apply_relevance(&mut r.hits, scores);
+        }
+        ranked_by = ranked.describe();
+        Ok(())
+    })?;
     let pass = min_recall.is_none_or(|m| report.recall_at_5 + 1e-9 >= m);
     let c = env.colored;
     let mut human = String::new();
@@ -186,7 +255,7 @@ pub fn eval(env: &Env, file: Option<String>, min_recall: Option<f64>) -> Result<
         human.push_str(&format!("{rank}  {}\n", r.text));
     }
     human.push_str(&format!(
-        "\n{} queries  recall@5 {:.2}  mrr {:.2}  ranked by: {RANKED_BY}",
+        "\n{} queries  recall@5 {:.2}  mrr {:.2}  ranked by: {ranked_by}",
         report.rows.len(),
         report.recall_at_5,
         report.mrr
@@ -199,7 +268,7 @@ pub fn eval(env: &Env, file: Option<String>, min_recall: Option<f64>) -> Result<
         "queries": report.rows.len(),
         "recall_at_5": (report.recall_at_5 * 1000.0).round() / 1000.0,
         "mrr": (report.mrr * 1000.0).round() / 1000.0,
-        "ranked_by": RANKED_BY,
+        "ranked_by": ranked_by,
         "rows": rows,
         "help": ["rank 0 means not in the first 10; add a missed search to the query file to keep it tested"],
     });

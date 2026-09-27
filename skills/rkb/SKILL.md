@@ -14,6 +14,8 @@ rkb manages a git repository of Markdown lessons at `$RKB_HOME` (default `~/Pers
 - Run `rkb list <topic folder>`, such as `rkb list general/cpp`, to see its lessons grouped by their first tag, with id, type, status, tags and conditions. Archived and superseded lessons come last.
 - Run `rkb search "<words from the problem or the error>"` first when you hit a problem. Results show `applies` for this place; act only on `yes`, and check a `unknown` lesson (run its `Check`, or ask the user) before you rely on it. A `hidden:` line counts lessons that do not apply here; `--all` shows them and other projects' lessons.
 - Run `rkb search --literal "<exact error text>"` for an exact string, or `--regex` for a pattern.
+- The `reranker:` line says what ordered the results. With `laya`, each result has a `relevance` from 0 to 1: above about 0.8 the lesson very likely fits the problem, below 0.5 it likely does not. A relevance says the lesson is about your problem, never that it is true; `applies` and the lesson's `Check` still decide that. With `bm25`, there is no relevance: read the summaries and judge.
+- A `reranker: bm25 (laya: ...)` line means the model was skipped for the reason given. When the reason says `rkb models fetch`, tell the user; do not download the model (about 850 MB) yourself.
 - Run `rkb find <rough name>` when you know roughly what a lesson is called.
 - When a search missed a lesson that exists, add the query and the lesson id to `$RKB_HOME/eval/queries.toml` as a `[[query]]` table (`text`, `expect`), so `rkb eval` keeps testing it.
 - Run `rkb show <id>` to read one lesson in full. The id is the `id:` field in the lesson's frontmatter.

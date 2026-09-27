@@ -2,10 +2,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rkb_core::conditions::{Facts, Verdict};
-use rkb_core::hooks::{self, DEFAULT_MIN_COVERAGE, MAX_NUDGES};
+use rkb_core::hooks::{self, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_MIN_COVERAGE, DEFAULT_MIN_RELEVANCE, MAX_NUDGES};
 use rkb_core::matching::Hints;
 use rkb_core::search::{Mode, Options};
-use rkb_core::{config, kb, lock, paths, request, search, state};
+use rkb_core::{config, kb, lock, paths, request, rerank, search, state};
 use serde_json::{Value, json};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -127,8 +127,18 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
     let query = hooks::error_query(command, error);
     let place = state::locate(&root, &cwd(p), &Hints::default(), state)?;
     let facts = Facts::gather(&root, &place, &[]);
-    let opts = Options { all: false, every_status: false, limit: 1, probes: rkb_core::search::ProbeMode::Cached };
-    let Some(hit) = search::search(&root, &place, &facts, &Mode::Ranked(query.clone()), &opts)?.hits.into_iter().next() else {
+    let settings = rerank::Settings::load(&root);
+    let cfg = hooks_config(&root);
+    let opts = Options { all: false, every_status: false, limit: settings.top.max(1), probes: rkb_core::search::ProbeMode::Cached };
+    let mut found = search::search(&root, &place, &facts, &Mode::Ranked(query.clone()), &opts)?;
+    let items = search::rerank_items(&root, &found.hits);
+    let timeout = cfg.get("hook_timeout_ms").and_then(toml::Value::as_integer).map_or(DEFAULT_HOOK_TIMEOUT_MS, |v| v.max(0) as u64);
+    let ranked =
+        rerank::run(&settings, None, &crate::rerankers::opener(&settings), &query, &items, std::time::Duration::from_millis(timeout))?;
+    if let Some(scores) = &ranked.scores {
+        search::apply_relevance(&mut found.hits, scores);
+    }
+    let Some(hit) = found.hits.into_iter().next() else {
         return Ok(None);
     };
     if hit.applies == Verdict::No {
@@ -137,14 +147,15 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
     if hooks::read(state, session).iter().any(|r| r["kind"] == "injected" && r["id"] == hit.id.as_str()) {
         return Ok(None);
     }
-    let min = hooks_config(&root).get("min_coverage").and_then(toml::Value::as_float).unwrap_or(DEFAULT_MIN_COVERAGE);
+    let min_coverage = cfg.get("min_coverage").and_then(toml::Value::as_float).unwrap_or(DEFAULT_MIN_COVERAGE);
+    let min_relevance = cfg.get("min_relevance").and_then(toml::Value::as_float).unwrap_or(DEFAULT_MIN_RELEVANCE);
     let (_, text) = kb::find(&root, &hit.id)?;
-    let coverage = hooks::coverage(error, &text);
-    if coverage < min {
+    if !hooks::strong_enough(hit.relevance, || hooks::coverage(error, &text), min_relevance, min_coverage) {
         return Ok(None);
     }
     hooks::append(state, session, &json!({ "kind": "injected", "id": hit.id }))?;
-    let log = json!({ "time": request::now(), "session": session, "id": hit.id, "coverage": coverage });
+    let log =
+        json!({ "time": request::now(), "session": session, "id": hit.id, "ranked_by": ranked.describe(), "relevance": hit.relevance });
     lock::append_line(&state.join("injections.jsonl"), &log.to_string())?;
     let summary = if hit.summary.is_empty() { String::new() } else { format!(" - {}", hit.summary) };
     let context = format!(

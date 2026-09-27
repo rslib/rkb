@@ -16,6 +16,8 @@ pub const HARNESSES: [&str; 3] = ["claude-code", "pi", "omp"];
 pub const SESSION_DAYS: u64 = 14;
 pub const MAX_QUERY_TERMS: usize = 40;
 pub const DEFAULT_MIN_COVERAGE: f64 = 0.6;
+pub const DEFAULT_MIN_RELEVANCE: f64 = 0.8;
+pub const DEFAULT_HOOK_TIMEOUT_MS: u64 = 500;
 pub const MAX_NUDGES: usize = 2;
 
 fn sessions_dir(state: &Path) -> PathBuf {
@@ -168,6 +170,15 @@ pub fn confirm_call(command: &str) -> Option<(Option<String>, Option<String>)> {
     Some((id, choice))
 }
 
+/// Whether a failed-command hook adds its top result: a model's relevance decides when a model
+/// ranked it, and the coverage rule decides for BM25.
+pub fn strong_enough(relevance: Option<f32>, coverage: impl FnOnce() -> f64, min_relevance: f64, min_coverage: f64) -> bool {
+    match relevance {
+        Some(r) => f64::from(r) >= min_relevance,
+        None => coverage() >= min_coverage,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +264,13 @@ mod tests {
             confirm_call("rkb show x && rkb  confirm r-abcdef --choice cancel"),
             Some((Some("r-abcdef".into()), Some("cancel".into())))
         );
+    }
+
+    #[test]
+    fn model_relevance_overrides_coverage() {
+        assert!(!strong_enough(Some(0.62), || 1.0, 0.8, 0.6));
+        assert!(strong_enough(Some(0.91), || 0.0, 0.8, 0.6));
+        assert!(strong_enough(None, || 0.7, 0.8, 0.6));
+        assert!(!strong_enough(None, || 0.5, 0.8, 0.6));
     }
 }

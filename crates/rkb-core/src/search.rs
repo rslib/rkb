@@ -138,6 +138,8 @@ pub struct Hit {
     pub score: f64,
     /// For literal and regex search: the first matching line and its number.
     pub line: Option<(usize, String)>,
+    /// How well the lesson fits the query, when a rerank model scored it.
+    pub relevance: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -205,7 +207,37 @@ fn hit(l: &Lesson, score: f64, line: Option<(usize, String)>) -> Hit {
         summary: summary(fm.kind, &l.body).unwrap_or_default(),
         score,
         line,
+        relevance: None,
     }
+}
+
+/// The text a reranker reads for each hit: the title, the type's first section, `Cause`, and `Fix` or `Steps`.
+/// Only these, so a long lesson does not cost more to score.
+pub fn rerank_items(root: &Path, hits: &[Hit]) -> Vec<String> {
+    hits.iter()
+        .map(|h| {
+            let body = std::fs::read_to_string(root.join(&h.path))
+                .ok()
+                .and_then(|t| crate::lesson::split(&t).ok().map(|(_, b, _)| b.to_string()))
+                .unwrap_or_default();
+            let mut out = format!("# {}\n", h.title);
+            for heading in [crate::text::lead_heading(h.kind), "Cause", "Fix", "Steps"] {
+                if let Some(text) = crate::body::section_text(&body, heading) {
+                    out.push_str(&format!("\n## {heading}\n{}\n", text.trim()));
+                }
+            }
+            out
+        })
+        .collect()
+}
+
+/// Gives the first `scores.len()` hits their relevance and sorts them by it; the rest keep their BM25 order.
+pub fn apply_relevance(hits: &mut [Hit], scores: &[f32]) {
+    let n = scores.len().min(hits.len());
+    for (h, s) in hits.iter_mut().zip(scores) {
+        h.relevance = Some(*s);
+    }
+    hits[..n].sort_by(|a, b| b.relevance.unwrap_or(0.0).total_cmp(&a.relevance.unwrap_or(0.0)));
 }
 
 fn when_text(v: &Value) -> String {

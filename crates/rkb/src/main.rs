@@ -1,6 +1,7 @@
 mod hook;
 mod list;
 mod output;
+mod rerankers;
 mod searching;
 mod session;
 mod setup;
@@ -86,6 +87,12 @@ enum Cmd {
         status: Option<String>,
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Rerank with this backend for this call instead of the chain in kb.toml: laya or bm25.
+        #[arg(long, conflicts_with = "no_model")]
+        rerank: Option<String>,
+        /// Rank with BM25 only; the same as --rerank bm25.
+        #[arg(long)]
+        no_model: bool,
     },
     /// Look up a lesson by a rough title, slug, path, tag or id.
     #[command(after_help = "Example:\n  rkb find hdf5 root")]
@@ -96,7 +103,9 @@ enum Cmd {
         limit: usize,
     },
     /// Measure search on a query file: recall at 5 and mean reciprocal rank.
-    #[command(after_help = "Example:\n  rkb eval\n  rkb eval --queries tests/fixtures/search/queries.toml --min-recall 0.9")]
+    #[command(
+        after_help = "Example:\n  rkb eval\n  rkb eval --queries tests/fixtures/search/queries.toml --min-recall 0.9\n  rkb eval --rerank laya"
+    )]
     Eval {
         /// Default: $RKB_HOME/eval/queries.toml.
         #[arg(long)]
@@ -104,6 +113,9 @@ enum Cmd {
         /// Exit non-zero when recall at 5 is below this.
         #[arg(long)]
         min_recall: Option<f64>,
+        /// Rerank with this backend; the eval fails if it cannot run, so a report never mixes backends.
+        #[arg(long, default_value = "bm25")]
+        rerank: String,
     },
     /// Put the rkb skill, hooks and confirm gate into Claude Code, pi and omp.
     #[command(after_help = "Example:\n  rkb install\n  rkb install --list\n  rkb install claude --uninstall")]
@@ -253,6 +265,12 @@ enum Cmd {
         /// The folder with the lesson files.
         dir: std::path::PathBuf,
     },
+    /// Download or check model files for reranking.
+    #[command(after_help = "Example:\n  rkb models fetch")]
+    Models {
+        #[command(subcommand)]
+        action: ModelsCmd,
+    },
     /// Pull lessons from a git remote, check them, and push when every check passes.
     #[command(after_help = "Example:\n  rkb sync\n  rkb sync --remote cluster\n  rkb sync --bundle /mnt/usb/kb.bundle")]
     Sync {
@@ -271,6 +289,23 @@ enum Cmd {
         /// The harness that calls: claude-code, pi or omp. Picks the heartbeat file only.
         #[arg(long, default_value = "claude-code")]
         harness: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelsCmd {
+    /// Download the pinned Laya files (843 MB) and check each against its SHA-256. Skips files already present.
+    #[command(after_help = "Example:\n  rkb models fetch\n  rkb models fetch laya")]
+    Fetch {
+        /// The model; only `laya` exists.
+        #[arg(default_value = "laya", value_parser = ["laya"])]
+        name: String,
+    },
+    /// Compile the GPU kernels for this rkb once (about 10 s), so searches can use the GPU. Needs no network.
+    #[command(after_help = "Example:\n  rkb models warm")]
+    Warm {
+        #[arg(default_value = "laya", value_parser = ["laya"])]
+        name: String,
     },
 }
 
@@ -345,7 +380,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         return Ok(session::status(&env, &s));
     };
     match cmd {
-        Cmd::Search { query, literal, regex, all, status, limit } => {
+        Cmd::Search { query, literal, regex, all, status, limit, rerank, no_model } => {
             kb::open(&root)?;
             let mode = match (query, literal, regex) {
                 (_, Some(t), _) => rkb_core::search::Mode::Literal(t),
@@ -356,15 +391,16 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             rkb_core::facts::refresh(&root, &env.place.clone().unwrap_or_default());
             let facts = rkb_core::conditions::Facts::gather(&root, &env.place.clone().unwrap_or_default(), with);
             let opts = rkb_core::search::Options { all, every_status: status.is_some(), limit, probes: rkb_core::search::ProbeMode::Run };
-            searching::search(&env, &facts, mode, opts)
+            let only = if no_model { Some(rkb_core::rerank::BM25.to_string()) } else { rerank };
+            searching::search(&env, &facts, mode, opts, only.as_deref())
         }
         Cmd::Find { words, limit } => {
             kb::open(&root)?;
             searching::find(&env, &words.join(" "), limit)
         }
-        Cmd::Eval { queries, min_recall } => {
+        Cmd::Eval { queries, min_recall, rerank } => {
             kb::open(&root)?;
-            searching::eval(&env, queries, min_recall)
+            searching::eval(&env, queries, min_recall, &rerank)
         }
         Cmd::Install { harnesses, list, uninstall } => setup::install(&env, harnesses, list, uninstall),
         Cmd::Context => {
@@ -428,6 +464,8 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Confirm { request, choice } => writes::confirm(&env, request, choice),
         Cmd::Hook { .. } => unreachable!("main runs hooks first"),
         Cmd::Import { dir } => writes::import(&env, &dir),
+        Cmd::Models { action: ModelsCmd::Fetch { .. } } => models_fetch(),
+        Cmd::Models { action: ModelsCmd::Warm { .. } } => models_warm(),
         Cmd::Sync { remote, bundle } => {
             kb::open(&root)?;
             let other = match &bundle {
@@ -537,6 +575,78 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             Ok(Output { data, human, exit: 0, raw: false })
         }
     }
+}
+
+#[cfg(feature = "laya")]
+fn models_fetch() -> Result<Output, CliError> {
+    let dir = rkb_rerank::files::default_dir();
+    let base = std::env::var("RKB_MODELS_URL").unwrap_or_else(|_| "https://huggingface.co".into());
+    let f = rkb_rerank::files::fetch(&dir, &base).map_err(|e| {
+        CliError::new(output::ErrorCode::Io, e.to_string(), "check the network and the disk space, then run `rkb models fetch` again")
+    })?;
+    let mb = f.bytes as f64 / 1e6;
+    let mut human = String::new();
+    for name in &f.downloaded {
+        human.push_str(&format!("{} {name}\n", paint(false, "32", "downloaded")));
+    }
+    for name in &f.present {
+        human.push_str(&format!("present    {name}\n"));
+    }
+    human.push_str(&format!("{mb:.0} MB downloaded into {}; every file matches its pinned hash", dir.display()));
+    let warm = rkb_rerank::warm(&dir).map_err(|e| {
+        CliError::new(
+            output::ErrorCode::Io,
+            format!("warming the GPU kernels failed: {e:#}"),
+            "run `rkb models warm` to try again; the CPU engine works without it",
+        )
+    })?;
+    if let Some(t) = warm {
+        human.push_str(&format!("\nGPU kernels compiled for this rkb in {:.1} s", t.as_secs_f64()));
+    }
+    let data = json!({
+        "dir": dir.display().to_string(),
+        "revision": rkb_rerank::files::REVISION,
+        "downloaded": f.downloaded,
+        "present": f.present,
+        "bytes": f.bytes,
+        "gpu_warm_s": warm.map(|t| (t.as_secs_f64() * 10.0).round() / 10.0),
+        "help": ["Add \"laya\" to `chain` under [rerank] in kb.toml to rerank with it"],
+    });
+    Ok(Output { data, human, exit: 0, raw: false })
+}
+
+#[cfg(feature = "laya")]
+fn models_warm() -> Result<Output, CliError> {
+    let dir = rkb_rerank::files::default_dir();
+    let t = rkb_rerank::warm(&dir).map_err(|e| {
+        CliError::new(
+            output::ErrorCode::Io,
+            format!("warming the GPU kernels failed: {e:#}"),
+            "run `rkb models fetch` if the files are missing; the CPU engine works without the GPU",
+        )
+    })?;
+    let (human, data) = match t {
+        Some(t) => (
+            format!("GPU kernels compiled for this rkb in {:.1} s; searches can use the GPU now", t.as_secs_f64()),
+            json!({ "gpu": true, "seconds": (t.as_secs_f64() * 10.0).round() / 10.0 }),
+        ),
+        None => ("This rkb has no GPU engine; searches use the CPU".to_string(), json!({ "gpu": false })),
+    };
+    Ok(Output { data, human, exit: 0, raw: false })
+}
+
+#[cfg(not(feature = "laya"))]
+fn models_warm() -> Result<Output, CliError> {
+    models_fetch()
+}
+
+#[cfg(not(feature = "laya"))]
+fn models_fetch() -> Result<Output, CliError> {
+    Err(CliError::new(
+        output::ErrorCode::Usage,
+        "this rkb was built without the laya feature",
+        "install an rkb built with the default features",
+    ))
 }
 
 fn commit_rows(label: &str, commits: &[rkb_core::sync::Commit], colored: bool) -> String {
