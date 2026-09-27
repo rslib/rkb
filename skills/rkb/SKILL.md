@@ -92,6 +92,7 @@ systems/<system>/<topic>/<file>.md      true on one machine or site
 ```
 
 - The scope folder follows `when`. One `when.project` means `projects/<project>/`. Otherwise one `when.system` means `systems/<system>/`. Several projects or systems stay in `general/`.
+- Decide the scope from the claim, not from where you learned it. A claim that holds only for one project (its code, its design decisions, its conventions, its numbers) gets `when: project: <name>`, even when the project has no git remote. A `general/` lesson must read correctly for someone who never saw that project: state the rule in general terms, and name the project only in `Evidence`, as where it was seen. When one session teaches both, write two lessons: the general rule, and the project's decision or fact.
 - A topic is the thing you work with: `cpp`, `cmake`, `lustre`, `flux`, `latex`, `git`, `writing`, `peer-review`. A quality such as `performance` or `debugging` is a tag, not a topic.
 - Use an existing topic folder when one fits. List them with `ls $RKB_HOME/general`. Ask the user before you create a new topic.
 - Never nest topics. `general/cpp/regex/` is an error. Use `general/cpp/` and the tag `regex`.

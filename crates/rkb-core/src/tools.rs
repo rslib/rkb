@@ -40,7 +40,7 @@ pub fn definitions() -> Vec<Value> {
         "title": { "type": "string", "description": "What the lesson says, as a short sentence, such as `CMake cannot find HDF5 unless HDF5_ROOT is set`" },
         "topic": { "type": "string", "description": "Topic folder, such as `cmake` or `git`; rkb picks the scope from `when`" },
         "tags": { "type": "array", "items": { "type": "string" }, "description": "A few words to find it by" },
-        "when": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Conditions under which it holds, such as {\"project\": \"dftracer\"} or {\"hdf5\": \"1.12:1.14.2\"}" },
+        "when": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Conditions under which it holds, such as {\"hdf5\": \"1.12:1.14.2\"}. Set {\"project\": \"<name>\"} when the claim holds only for one project (its code, decisions or conventions); leave it out for a general rule, and name the project only in evidence" },
         "verified_how": { "type": "string", "enum": ["ran", "read", "told"], "description": "ran: you ran it and saw it work; read: from docs or code; told: the user said so. Default: ran" },
     });
     for (f, types) in section_fields() {
