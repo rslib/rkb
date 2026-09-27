@@ -1627,7 +1627,8 @@ fn hook_full_session() {
     assert_eq!(doctor_hook(&env)["detail"], "installed but never called");
 
     let out = hook(&env, "session-start", &serde_json::json!({ "session_id": "s1", "source": "startup", "cwd": cwd }));
-    assert!(out.contains("see lessons: rkb list"), "{out}");
+    assert!(out.contains("rkb search \"<words>\" --toon") && out.contains("more: rkb list --toon"), "{out}");
+    assert!(out.lines().count() <= 5, "{out}");
     assert_eq!(doctor_hook(&env)["status"], "ok");
 
     let linker = "Exit code 1\n/usr/bin/ld: main.o: in function `main':\nmain.cpp:(.text+0x1f): undefined reference to `vtable for Widget'\ncollect2: error: ld returned 1 exit status\n";

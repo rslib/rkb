@@ -7,7 +7,7 @@ description: A personal knowledge base of lessons learned (pitfalls, recipes, fa
 
 rkb manages a git repository of Markdown lessons at `$RKB_HOME` (default `~/Personal/kb`). Pass `--toon` on every rkb command you run, such as `rkb search "cmake hdf5" --toon`: TOON is the compact, structured format meant for you. Without it rkb prints human text, which is for people at a terminal. Read the TOON as it is and tell the user the result in your own words. Only a script that parses the output uses `--format json`.
 
-- Run `rkb` (or `rkb context` for 3 short lines) at the start of a task. It shows the project and system rkb matched here, lesson counts, pending requests and uncommitted changes.
+- Run `rkb` (or `rkb context` for a few short lines) at the start of a task. It shows the project and system rkb matched here, lesson counts, pending requests and uncommitted changes.
 - Run `rkb doctor` when something looks wrong. Each check that is not `ok` has a `fix` line; run it or show it to the user.
 - Setup, once per machine: `rkb init` creates a new knowledge base, or `rkb init --clone <url>` sets up an existing one on a second machine. Then the user runs `rkb install` in a terminal to put this skill, the hooks and the confirm gate into Claude Code, pi and omp (in pi and omp the hooks are an extension file). If you run `rkb install` yourself, it returns `needs_user`; show the question to the user.
 - Run `rkb list` for a table of contents: every scope, project, system and topic with lesson counts. Run `rkb list <scope>` for one scope, such as `rkb list projects/dftracer`.

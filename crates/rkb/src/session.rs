@@ -80,6 +80,8 @@ pub fn status(env: &Env, s: &State) -> Output {
     Output { data, human, exit: 0, raw: false }
 }
 
+const SEARCH_FIRST: &str = "before a web search or a guess about a problem: rkb search \"<words>\" --toon";
+
 /// At most 5 lines, for a SessionStart hook.
 pub fn context(s: &State) -> Output {
     let part = |label: &str, m: &Option<Matched>| match m {
@@ -99,12 +101,14 @@ pub fn context(s: &State) -> Output {
     let next = next_list(&s.place);
     let pending = (s.pending > 0).then(|| format!("{}; ask the user before `rkb confirm`", plural(s.pending, "pending request")));
 
-    let mut human = format!("rkb: {place}\nlessons here: {lessons}\n");
+    // Every agent sees these lines, also when it never loads the skill, so they carry its two rules.
+    let first = SEARCH_FIRST;
+    let mut human = format!("rkb: {place}; lessons here: {lessons}\n");
     if let Some(p) = &pending {
         human.push_str(&format!("{p}\n"));
     }
-    human.push_str(&format!("see lessons: {next}"));
-    let mut data = json!({ "rkb": place, "lessons": lessons });
+    human.push_str(&format!("{first}\nmore: {next} --toon; load the rkb skill before you write a lesson"));
+    let mut data = json!({ "rkb": place, "lessons": lessons, "first": first });
     if let Some(p) = pending {
         data["pending"] = json!(p);
     }
