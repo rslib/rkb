@@ -413,6 +413,15 @@ pub(crate) fn add(
             notes.push(Note::Similar { id: l.frontmatter.id.clone(), title: other, path: l.path.clone() });
         }
     }
+    let new = Lesson { path: format!("{folder}/{base_slug}.md"), frontmatter: fm.clone(), body: body_text.to_string(), body_line: 1 };
+    let mut set: Vec<&Lesson> = lessons.iter().filter(|l| crate::graph::compared(l)).collect();
+    set.push(&new);
+    for (_, b, _) in crate::graph::Vectors::new(&set).pairs(&[set.len() - 1], crate::graph::min_from(Some(kb))) {
+        let l = set[b];
+        if !notes.iter().any(|n| matches!(n, Note::Similar { id, .. } if *id == l.frontmatter.id)) {
+            notes.push(Note::Similar { id: l.frontmatter.id.clone(), title: crate::graph::title(l), path: l.path.clone() });
+        }
+    }
     let mut path = format!("{folder}/{base_slug}.md");
     let mut n = 2;
     while snap.files.contains_key(&path) || ctx.root.join(&path).exists() {

@@ -283,7 +283,7 @@ fn count(l: &Lesson, title: &str, terms: &HashMap<String, usize>) -> Counts {
 }
 
 /// Runs `f` over `items` on all cores, keeping the order.
-fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+pub(crate) fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(items.len().max(1));
     let chunk = items.len().div_ceil(threads).max(1);
     std::thread::scope(|s| {

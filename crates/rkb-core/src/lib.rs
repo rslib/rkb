@@ -10,6 +10,7 @@ pub mod error;
 pub mod eval;
 pub mod facts;
 pub mod git;
+pub mod graph;
 pub mod hooks;
 pub mod import;
 pub mod init;

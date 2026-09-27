@@ -1196,6 +1196,148 @@ fn search_reranks_with_laya() {
     assert!(v["recall_at_5"].as_f64().unwrap() >= 0.9, "{v}");
 }
 
+fn graph_kb() -> Env {
+    let env = Env::new();
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
+    copy_dir(&fixtures.join("search/kb"), &env.kb());
+    copy_dir(&fixtures.join("graph/kb"), &env.kb());
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "-A"],
+        vec!["-c", "user.name=T", "-c", "user.email=t@example.org", "commit", "-q", "-m", "fixture"],
+    ] {
+        assert!(env.git(&args).status.success());
+    }
+    env
+}
+
+#[test]
+fn dupes_lists_only_the_duplicate_pair() {
+    let env = graph_kb();
+    let (v, code) = env.json(&["dupes"], "");
+    assert_eq!(code, Some(0));
+    let pairs = v["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 1, "{v}");
+    let ids = [pairs[0]["a"]["id"].as_str().unwrap(), pairs[0]["b"]["id"].as_str().unwrap()];
+    assert!(ids.contains(&"1a00000001") && ids.contains(&"1b00000001"), "{v}");
+    assert!(v["help"].to_string().contains("rkb supersede"), "{v}");
+
+    let (v, _) = env.json(&["dupes", "--min", "0.9"], "");
+    assert_eq!(v["pairs"], serde_json::json!([]));
+    let human = stdout(&env.rkb(&["dupes", "--min", "0.9", "--format", "human"]));
+    assert!(human.contains("No likely duplicates at 0.90"), "{human}");
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
+}
+
+#[test]
+fn add_names_a_similar_lesson_in_another_folder() {
+    let env = search_kb();
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/graph/kb/general/build/new-library-not-found-until-cmake-cache-is-cleared.md");
+    let text: String = std::fs::read_to_string(src)
+        .unwrap()
+        .lines()
+        .filter(|l| !["schema:", "id:", "status:"].iter().any(|k| l.starts_with(k)))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let (v, code) = env.json(&["add", "--topic", "build"], &text);
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(v["path"], "general/build/a-new-library-is-not-found-until-the-cmake-cache-is-cleared.md", "{v}");
+    assert!(v["notes"].to_string().contains("1a00000001"), "{v}");
+}
+
+fn near_duplicates(v: &serde_json::Value) -> Vec<String> {
+    v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "content/near-duplicate")
+        .map(|f| f["path"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn lint_warns_about_near_duplicates() {
+    let env = graph_kb();
+    let (v, code) = env.json(&["lint"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(near_duplicates(&v), ["general/build/new-library-not-found-until-cmake-cache-is-cleared.md"], "{v}");
+
+    let env = search_kb();
+    let (v, _) = env.json(&["lint"], "");
+    assert!(near_duplicates(&v).is_empty(), "{v}");
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/graph/kb/general/build");
+    copy_dir(&src, &env.kb().join("general/build"));
+    assert!(env.git(&["add", "-A"]).status.success());
+    let (v, code) = env.json(&["lint", "--staged"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(near_duplicates(&v).len(), 1, "{v}");
+    let hook = env.kb().join(".git/hooks/pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\nexec rkb lint --staged\n").unwrap();
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let o = env.git(&["-c", "user.name=T", "-c", "user.email=t@example.org", "commit", "-q", "-m", "dup"]);
+    assert!(o.status.success(), "the hook allows a near duplicate: {}", stdout(&o));
+}
+
+fn related_ids(env: &Env, id: &str) -> Vec<(String, Vec<String>)> {
+    let (v, code) = env.json(&["related", id], "");
+    assert_eq!(code, Some(0), "{v}");
+    v["related"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let kinds = r["edges"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap().to_string()).collect();
+            (r["id"].as_str().unwrap().to_string(), kinds)
+        })
+        .collect()
+}
+
+#[test]
+fn related_by_link_and_supersede() {
+    let env = graph_kb();
+    let hub = related_ids(&env, "1b00000002");
+    assert_eq!(hub.len(), 2, "{hub:?}");
+    assert!(hub.iter().all(|(_, k)| k[0] == "link"), "{hub:?}");
+    assert!(related_ids(&env, "1a00000013").iter().any(|(id, k)| id == "1b00000002" && k.contains(&"link".to_string())));
+    assert!(related_ids(&env, "1a00000007").iter().any(|(id, k)| id == "1b00000003" && k == &["supersedes"]));
+    let (v, code) = env.json(&["related", "0000000000"], "");
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("not_found"), Some(1)), "{v}");
+
+    let (v, _) = env.json(&["show", "1b00000002"], "");
+    let shown: Vec<&str> = v["related"].as_array().unwrap().iter().map(|r| r["edges"][0]["kind"].as_str().unwrap()).collect();
+    assert_eq!(shown, ["link", "link"], "{v}");
+    let human = stdout(&env.rkb(&["show", "1b00000002", "--format", "human"]));
+    assert!(human.contains("related") && human.contains("1a00000013"), "{human}");
+}
+
+#[test]
+fn graph_views() {
+    let env = graph_kb();
+    let (v, _) = env.json(&["graph"], "");
+    assert_eq!(
+        (v["edges"]["link"].as_u64(), v["edges"]["supersedes"].as_u64(), v["likely_duplicates"].as_u64()),
+        (Some(2), Some(1), Some(1)),
+        "{v}"
+    );
+    let (v, _) = env.json(&["graph", "--orphans"], "");
+    let orphans: Vec<&str> = v["orphans"].as_array().unwrap().iter().map(|o| o["id"].as_str().unwrap()).collect();
+    assert!(orphans.contains(&"1b00000004") && !orphans.contains(&"1b00000002"), "{orphans:?}");
+    let (v, _) = env.json(&["graph", "--clusters"], "");
+    assert!(v["clusters"].to_string().contains("1b00000001"), "{v}");
+
+    let edges = |text: &str, marks: &[&str]| text.lines().filter(|l| marks.iter().any(|m| l.contains(m))).count();
+    let mermaid = stdout(&env.rkb(&["graph", "--mermaid"]));
+    assert!(mermaid.starts_with("graph"), "{mermaid}");
+    let (counts, _) = env.json(&["graph"], "");
+    let total = ["link", "supersedes", "similar"].iter().map(|k| counts["edges"][k].as_u64().unwrap() as usize).sum::<usize>();
+    assert_eq!(edges(&mermaid, &[" --> ", " -.->", " ---|"]), total, "{mermaid}");
+    let dot = stdout(&env.rkb(&["graph", "--dot"]));
+    assert!(dot.starts_with("digraph rkb {") && dot.trim_end().ends_with('}'), "{dot}");
+    assert_eq!(edges(&dot, &[" -> "]), total, "{dot}");
+    assert_eq!(env.rkb(&["graph", "--dot", "--mermaid"]).status.code(), Some(2));
+}
+
 #[test]
 fn install_from_an_agent_needs_the_user() {
     let env = Env::new();

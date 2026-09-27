@@ -22,6 +22,7 @@ pub struct KbConfig {
     pub hooks: Option<toml::Table>,
     pub lock: Option<toml::Table>,
     pub jev: Option<toml::Table>,
+    pub dupes: Option<toml::Table>,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -227,10 +227,29 @@ pub fn lint(snap: &Snapshot, env: &LintEnv, focus: Option<&BTreeSet<String>>) ->
         }
     }
 
+    lint_near_duplicates(&mut out, kb.as_ref(), &lessons, &in_focus);
     lint_folders(&mut out, snap, &aliases);
     let mut findings = out.0;
     findings.sort();
     findings
+}
+
+/// Warns once per pair, on the path that sorts first; with a focus, only pairs that touch it.
+fn lint_near_duplicates(out: &mut Out, kb: Option<&KbConfig>, lessons: &[Lesson], in_focus: &dyn Fn(&str) -> bool) {
+    let set: Vec<&Lesson> = lessons.iter().filter(|l| crate::graph::compared(l)).collect();
+    let from: Vec<usize> = (0..set.len()).filter(|&i| in_focus(&set[i].path)).collect();
+    if from.is_empty() {
+        return;
+    }
+    for (a, b, s) in crate::graph::Vectors::new(&set).pairs(&from, crate::graph::min_from(kb)) {
+        let (first, other) = if set[a].path < set[b].path { (set[a], set[b]) } else { (set[b], set[a]) };
+        out.warning(
+            &first.path,
+            None,
+            "content/near-duplicate",
+            format!("similarity {s:.2} with {} ({}); see `rkb dupes`", other.frontmatter.id, other.path),
+        );
+    }
 }
 
 fn check_links(out: &mut Out, snap: &Snapshot, path: &str, offset: usize, b: &Body, linked: &mut BTreeSet<String>) {

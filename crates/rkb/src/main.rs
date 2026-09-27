@@ -1,3 +1,4 @@
+mod graphing;
 mod hook;
 mod list;
 mod output;
@@ -101,6 +102,37 @@ enum Cmd {
         words: Vec<String>,
         #[arg(long, default_value_t = 10)]
         limit: usize,
+    },
+    /// List pairs of lessons that may say the same thing, most similar first. Changes nothing.
+    #[command(after_help = "Example:\n  rkb dupes\n  rkb dupes --min 0.3")]
+    Dupes {
+        /// Similarity from 0 to 1. Default: `dupes.min_similarity` in kb.toml, or 0.4.
+        #[arg(long)]
+        min: Option<f64>,
+    },
+    /// List the lessons connected to one lesson: links, supersedes, similar words, shared tags.
+    #[command(after_help = "Example:\n  rkb related 7f3a9c2b41")]
+    Related {
+        id: String,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Show how lessons connect: counts, clusters, orphans, or the whole graph for drawing.
+    #[command(after_help = "Example:\n  rkb graph\n  rkb graph --clusters\n  rkb graph --mermaid > kb.mmd")]
+    #[command(group(clap::ArgGroup::new("view").args(["clusters", "orphans", "dot", "mermaid"])))]
+    Graph {
+        /// Groups of close lessons, candidates to merge.
+        #[arg(long)]
+        clusters: bool,
+        /// Lessons with no link, supersede or similar lesson.
+        #[arg(long)]
+        orphans: bool,
+        /// The graph in Graphviz DOT.
+        #[arg(long)]
+        dot: bool,
+        /// The graph as a Mermaid flowchart.
+        #[arg(long)]
+        mermaid: bool,
     },
     /// Measure search on a query file: recall at 5 and mean reciprocal rank.
     #[command(
@@ -402,6 +434,25 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             kb::open(&root)?;
             searching::eval(&env, queries, min_recall, &rerank)
         }
+        Cmd::Dupes { min } => {
+            kb::open(&root)?;
+            graphing::dupes(&env, min)
+        }
+        Cmd::Related { id, limit } => {
+            kb::open(&root)?;
+            graphing::related(&env, &id, limit)
+        }
+        Cmd::Graph { clusters, orphans, dot, mermaid } => {
+            kb::open(&root)?;
+            let view = match (clusters, orphans, dot, mermaid) {
+                (true, ..) => graphing::View::Clusters,
+                (_, true, ..) => graphing::View::Orphans,
+                (_, _, true, _) => graphing::View::Dot,
+                (.., true) => graphing::View::Mermaid,
+                _ => graphing::View::Counts,
+            };
+            graphing::graph(&env, view)
+        }
         Cmd::Install { harnesses, list, uninstall } => setup::install(&env, harnesses, list, uninstall),
         Cmd::Context => {
             kb::open(&root)?;
@@ -542,7 +593,12 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
                     applies_text.push_str(&format!("\n  {:<8} {:<10} {}", k.result.as_str(), k.key, k.reason));
                 }
             }
-            let human = format!(
+            let g = rkb_core::graph::Graph::load(&root)?;
+            let (related, related_text) = match g.find(&fm.id) {
+                Some(i) => graphing::related_of(&g, i, 3, colored),
+                None => (vec![], String::new()),
+            };
+            let mut human = format!(
                 "{}\n{}  {}  {}\n{}\n{}\n\n{}",
                 paint(colored, "1", &title),
                 paint(colored, "2", &lesson.path),
@@ -552,6 +608,9 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
                 applies_text,
                 text
             );
+            if !related.is_empty() {
+                human.push_str(&format!("\n{}{related_text}", paint(colored, "1", "related")));
+            }
             let data = json!({
                 "id": fm.id,
                 "path": lesson.path,
@@ -571,6 +630,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
                 },
                 "frontmatter": serde_json::to_value(fm).unwrap_or(Value::Null),
                 "body": lesson.body,
+                "related": related,
             });
             Ok(Output { data, human, exit: 0, raw: false })
         }
