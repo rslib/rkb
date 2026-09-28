@@ -167,10 +167,8 @@ fn needs_user(env: &Env, req: &Request) -> Output {
     let options = req.options();
     let next = format!("rkb confirm {} --choice {}", req.id, quote(&options[0]));
     let mut human = format!("{}\n{}\n", paint(env.colored, "33;1", "Needs your decision:"), req.question);
-    for (i, o) in options.iter().enumerate() {
-        human.push_str(&format!("  {}. {o}\n", i + 1));
-    }
-    human.push_str(&format!("Next: rkb confirm {} --choice \"<option>\"", req.id));
+    human.push_str(&format!("Options: {}\n", options.iter().map(|o| quote(o)).collect::<Vec<_>>().join(", ")));
+    human.push_str(&format!("Answer with: rkb confirm {} --choice \"<option>\"", req.id));
     let data = json!({
         "status": "needs_user",
         "request": req.id,
@@ -279,6 +277,53 @@ pub fn log(env: &Env, id: String) -> Result<Output, CliError> {
 }
 
 /// Asks the person at the terminal to type `yes`. `RKB_TTY` replaces `/dev/tty` in tests.
+/// Set when the person answered the question at the terminal, so confirm does not ask again.
+static ANSWERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The option a person typed: its number or its text. Anything else is `None`.
+fn pick(options: &[String], answer: &str) -> Option<String> {
+    let a = answer.trim();
+    a.parse::<usize>().ok().and_then(|n| options.get(n.wrapping_sub(1))).or_else(|| options.iter().find(|o| o.as_str() == a)).cloned()
+}
+
+/// For a person at a terminal, asks a `needs_user` question right away and returns the option they chose.
+/// Agents (Claude Code, rkb's pi/omp extension), pipes and machine formats get the question as output instead.
+pub fn ask_now(format: crate::output::Format, out: &Output) -> Option<String> {
+    let agent = std::env::var("CLAUDECODE").is_ok_and(|v| v == "1") || std::env::var_os("RKB_HARNESS").is_some();
+    if out.data["status"] != "needs_user"
+        || format != crate::output::Format::Human
+        || agent
+        || !std::io::stdin().is_terminal()
+        || !std::io::stdout().is_terminal()
+    {
+        return None;
+    }
+    let options: Vec<String> = out.data["options"].as_array()?.iter().filter_map(|o| o.as_str().map(String::from)).collect();
+    let mut prompt = format!("{}\n", out.data["question"].as_str()?);
+    for (i, o) in options.iter().enumerate() {
+        prompt.push_str(&format!("  {}. {o}\n", i + 1));
+    }
+    let cancel = options.iter().find(|o| *o == "cancel").cloned();
+    let mut stdout = std::io::stdout();
+    for _ in 0..3 {
+        let _ = write!(stdout, "{prompt}Choose 1-{}{}: ", options.len(), if cancel.is_some() { " (Enter cancels)" } else { "" });
+        let _ = stdout.flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).unwrap_or(0) == 0 {
+            return cancel;
+        }
+        if answer.trim().is_empty() && cancel.is_some() {
+            return cancel;
+        }
+        if let Some(choice) = pick(&options, &answer) {
+            ANSWERED.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Some(choice);
+        }
+        prompt = format!("`{}` is not an option.\n", answer.trim());
+    }
+    cancel
+}
+
 fn ask_terminal(req: &Request, choice: &str) -> Result<(), CliError> {
     let tty = std::env::var("RKB_TTY").unwrap_or_else(|_| "/dev/tty".into());
     let command = format!("rkb confirm {} --choice {}", req.id, quote(choice));
@@ -309,9 +354,25 @@ pub fn confirm(env: &Env, id: String, choice: String) -> Result<Output, CliError
     if !req.options().contains(&choice) {
         return Err(rkb_core::Error::BadChoice { choice, options: req.options() }.into());
     }
-    if choice != "cancel" && request::trusted_harness(&paths::config_dir()).is_none() {
+    let answered = ANSWERED.load(std::sync::atomic::Ordering::Relaxed);
+    if choice != "cancel" && !answered && request::trusted_harness(&paths::config_dir()).is_none() {
         ask_terminal(&req, &choice)?;
     }
     let o = write::confirm(&env.ctx(), &req, &choice)?;
     Ok(outcome(env, o))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick;
+
+    #[test]
+    fn pick_takes_a_number_or_the_option() {
+        let o = vec!["publish".to_string(), "cancel".to_string()];
+        assert_eq!(pick(&o, "1\n").as_deref(), Some("publish"));
+        assert_eq!(pick(&o, " cancel ").as_deref(), Some("cancel"));
+        assert_eq!(pick(&o, "0"), None);
+        assert_eq!(pick(&o, "3"), None);
+        assert_eq!(pick(&o, "yes"), None);
+    }
 }

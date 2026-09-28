@@ -708,7 +708,10 @@ fn long_diff_is_cut_and_needs_user_reads_well_for_people() {
     assert_eq!(o.status.code(), Some(3));
     let out = stdout(&o);
     assert!(
-        out.contains("Needs your decision:") && out.contains("  1. create general/cmak") && out.contains("Next: rkb confirm r-"),
+        out.contains("Needs your decision:")
+            && out.contains("Options: \"create general/cmak\"")
+            && out.contains("Answer with: rkb confirm r-")
+            && !out.contains("  1. "),
         "{out}"
     );
 }
@@ -2259,7 +2262,7 @@ fn import_report_then_import_all() {
     let old_line = q.lines().find(|l| l.contains("(from cmake/old.md)")).unwrap();
     assert!(old_line.contains(&format!("[looks like {}]", existing["id"].as_str().unwrap())), "{q}");
     let human = stdout(&env.rkb(&["import", dir.to_str().unwrap(), "--format", "human"]));
-    assert!(human.contains("Needs your decision") && human.contains("1. import all"), "{human}");
+    assert!(human.contains("Needs your decision") && human.contains("Options: \"import all\""), "{human}");
     let b_line = q.lines().find(|l| l.contains("(from cpp/b.md)")).unwrap();
     assert!(b_line.contains("[looks like"), "{q}");
     assert_eq!(v["options"], serde_json::json!(["import all", "import without duplicates", "cancel"]));

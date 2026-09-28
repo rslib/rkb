@@ -502,7 +502,13 @@ fn main() -> ExitCode {
             }
         }
     }
-    match run(cli.cmd, format, &hints, &with) {
+    let result = run(cli.cmd, format, &hints, &with).and_then(|out| match writes::ask_now(format, &out) {
+        Some(choice) => {
+            run(Some(Cmd::Confirm { request: out.data["request"].as_str().unwrap_or_default().to_string(), choice }), format, &hints, &with)
+        }
+        None => Ok(out),
+    });
+    match result {
         Ok(out) => {
             output::print(format, &out);
             ExitCode::from(out.exit)
