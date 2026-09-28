@@ -18,6 +18,11 @@ pub fn cache_dir() -> PathBuf {
     xdg(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"), ".cache")
 }
 
+/// Downloaded files such as model weights and rs-web. Never synced.
+pub fn data_dir() -> PathBuf {
+    xdg(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"), ".local/share")
+}
+
 /// Per-machine config such as `trust.toml`. Never synced.
 pub fn config_dir() -> PathBuf {
     xdg(std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME"), ".config")

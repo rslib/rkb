@@ -9,6 +9,7 @@ mod rerankers;
 mod searching;
 mod session;
 mod setup;
+mod site;
 mod writes;
 
 use std::process::ExitCode;
@@ -341,6 +342,12 @@ enum Cmd {
         #[command(subcommand)]
         action: ModelsCmd,
     },
+    /// Build or preview a static site of the lessons the `web` sink allows, with rs-web.
+    #[command(after_help = "Example:\n  rkb site build --out ~/site\n  rkb site serve\n  rkb site init")]
+    Site {
+        #[command(subcommand)]
+        action: SiteCmd,
+    },
     /// Pull lessons from a git remote, check them, and push when every check passes.
     #[command(after_help = "Example:\n  rkb sync\n  rkb sync --remote cluster\n  rkb sync --bundle /mnt/usb/kb.bundle")]
     Sync {
@@ -373,6 +380,26 @@ enum InboxCmd {
         #[arg(required = true, num_args = 1..)]
         ids: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum SiteCmd {
+    /// Build the site with rs-web (downloaded when missing), check it, and write it to --out.
+    #[command(after_help = "Example:\n  rkb site build\n  rkb site build --out ~/site")]
+    Build {
+        /// Where the built site goes. Default: $XDG_CACHE_HOME/rkb/site/dist.
+        #[arg(long, value_name = "DIR")]
+        out: Option<String>,
+    },
+    /// Stage the site and run `rs-web serve` on it for a live preview. Writes no output folder.
+    #[command(after_help = "Example:\n  rkb site serve --port 8080")]
+    Serve {
+        #[arg(long, default_value_t = 3000)]
+        port: u16,
+    },
+    /// Copy the built-in rs-web template to $RKB_HOME/site/ to customize it. Never overwrites a file.
+    #[command(after_help = "Example:\n  rkb site init")]
+    Init,
 }
 
 #[derive(Subcommand)]
@@ -661,6 +688,9 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Inbox { action: Some(InboxCmd::Done { ids }) } => inbox::done(&env, &ids),
         Cmd::Models { action: ModelsCmd::Fetch { .. } } => models_fetch(),
         Cmd::Models { action: ModelsCmd::Warm { .. } } => models_warm(),
+        Cmd::Site { action: SiteCmd::Build { out } } => site::run(&env, out, None, &site::Approved::default()),
+        Cmd::Site { action: SiteCmd::Serve { port } } => site::run(&env, None, Some(port), &site::Approved::default()),
+        Cmd::Site { action: SiteCmd::Init } => site::init(&env),
         Cmd::Sync { remote, bundle } => {
             kb::open(&root)?;
             let other = match &bundle {

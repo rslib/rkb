@@ -14,7 +14,7 @@ memmap2 = "0.9"
 half = "2"
 rayon = "1"
 sha2.workspace = true
-ureq = { version = "3", default-features = false, features = ["rustls"] }
+ureq.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.11", features = ["metal"] }

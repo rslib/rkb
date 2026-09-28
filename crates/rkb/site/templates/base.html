@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}{{ site.title }}{% endblock %}</title>
+  <link rel="alternate" type="application/rss+xml" title="{{ site.title }}" href="/feed.xml">
+  <style>
+    :root { --fg: #1d1d1f; --muted: #6e6e73; --line: #e5e5ea; --bg: #ffffff; --accent: #0a58ca; --code: #f5f5f7; }
+    @media (prefers-color-scheme: dark) {
+      :root { --fg: #e8e8ed; --muted: #98989f; --line: #2c2c2e; --bg: #111113; --accent: #6ea8fe; --code: #1c1c1e; }
+    }
+    body { background: var(--bg); color: var(--fg); font: 16px/1.6 system-ui, sans-serif; margin: 0 auto; max-width: 46rem; padding: 1.5rem 1rem 4rem; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    header { border-bottom: 1px solid var(--line); margin-bottom: 1.5rem; padding-bottom: .5rem; }
+    header a { color: var(--fg); font-weight: 600; }
+    pre, code { background: var(--code); border-radius: 4px; font: 14px/1.5 ui-monospace, monospace; }
+    pre { overflow-x: auto; padding: .75rem; }
+    code { padding: .1rem .3rem; }
+    pre code { padding: 0; }
+    .meta, .muted { color: var(--muted); font-size: 14px; }
+    .chips a, .chip { border: 1px solid var(--line); border-radius: 999px; display: inline-block; font-size: 13px; margin: 0 .3rem .3rem 0; padding: 0 .6rem; }
+    ul.cards { list-style: none; padding: 0; }
+    ul.cards li { border-bottom: 1px solid var(--line); padding: .5rem 0; }
+    .encrypted-content { border: 1px solid var(--line); border-radius: 8px; padding: 1rem; }
+    .encrypted-content input[type=password] { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; color: var(--fg); padding: .4rem .6rem; width: 16rem; max-width: 100%; }
+    .encrypted-content button { margin-top: .5rem; padding: .4rem .9rem; }
+    .remember-label { color: var(--muted); display: block; font-size: 14px; margin-top: .5rem; }
+  </style>
+</head>
+<body>
+  <header><a href="/">{{ site.title }}</a></header>
+  {% block content %}{% endblock %}
+</body>
+</html>

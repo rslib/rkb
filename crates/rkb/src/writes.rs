@@ -358,6 +358,13 @@ pub fn confirm(env: &Env, id: String, choice: String) -> Result<Output, CliError
     if choice != "cancel" && !answered && request::trusted_harness(&paths::config_dir()).is_none() {
         ask_terminal(&req, &choice)?;
     }
+    if let request::Action::Publish { ids, encrypted, out, serve } = &req.action {
+        request::remove(&env.state.join("requests"), &req.id);
+        if choice == "cancel" {
+            return Ok(outcome(env, Outcome::Cancelled));
+        }
+        return crate::site::run(env, out.clone(), *serve, &crate::site::Approved { clear: ids.clone(), encrypted: encrypted.clone() });
+    }
     let o = write::confirm(&env.ctx(), &req, &choice)?;
     Ok(outcome(env, o))
 }

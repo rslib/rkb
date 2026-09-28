@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+
+{% block title %}{{ page.title }} | {{ site.title }}{% endblock %}
+
+{% block content %}
+<h1><span class="muted">{{ page.data.kind }}</span> {{ page.title }}</h1>
+{% if page.data.lessons | length > 0 %}
+<ul class="cards">
+{% for l in page.data.lessons %}
+  <li><a href="{{ l.url }}">{{ l.title }}</a> <span class="meta">{{ l.type }} · {{ l.verified }}</span></li>
+{% endfor %}
+</ul>
+{% else %}
+<p class="muted">No published lessons yet.</p>
+{% endif %}
+{% endblock %}

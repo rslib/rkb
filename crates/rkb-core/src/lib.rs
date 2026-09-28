@@ -29,6 +29,7 @@ pub mod rerank;
 pub mod review;
 pub mod script;
 pub mod search;
+pub mod site;
 pub mod state;
 pub mod sync;
 pub mod text;

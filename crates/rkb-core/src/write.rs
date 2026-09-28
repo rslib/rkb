@@ -193,7 +193,7 @@ fn note_labels(text: &str) -> BTreeMap<String, String> {
     labels.iter().filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string()))).collect()
 }
 
-fn effective(snap: &Snapshot, path: &str, own: &Mapping) -> BTreeMap<String, String> {
+pub(crate) fn effective(snap: &Snapshot, path: &str, own: &Mapping) -> BTreeMap<String, String> {
     let notes: Vec<BTreeMap<String, String>> =
         note_chain(path).iter().filter_map(|n| snap.files.get(n)).map(|d| note_labels(&String::from_utf8_lossy(d))).collect();
     let refs: Vec<&BTreeMap<String, String>> = notes.iter().collect();
@@ -253,7 +253,12 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
         Action::Unarchive { id } => unarchive(&snap, id)?,
         Action::Move { id, folder } => return saved(ctx, relocate(ctx, snap, action, approved, id, Some(folder), None)?),
         Action::Rename { id, slug } => return saved(ctx, relocate(ctx, snap, action, approved, id, None, Some(slug))?),
-        Action::BreakLock { .. } | Action::Install { .. } | Action::Import { .. } | Action::Approve { .. } | Action::ApproveFact { .. } => {
+        Action::BreakLock { .. }
+        | Action::Install { .. }
+        | Action::Import { .. }
+        | Action::Approve { .. }
+        | Action::ApproveFact { .. }
+        | Action::Publish { .. } => {
             unreachable!("confirm handles these itself")
         }
     };

@@ -99,6 +99,14 @@ systems/<system>/<topic>/<file>.md      true on one machine or site
 - Put the most specific tag first. `rkb list` groups lessons by their first tag.
 - One lesson per file. The file name is a readable slug of the title. Folder names are lowercase letters, digits and hyphens.
 
+## Publishing a site
+
+- `rkb site build [--out <dir>]` builds a static site with rs-web from the lessons that `[sinks.web]` in `kb.toml` allows. rkb downloads rs-web when it is missing. `rkb site serve` previews it; `rkb site init` copies the template to `$RKB_HOME/site/` for the user to change.
+- A lesson with no `sensitivity` label is `internal` and is never published. Only the user decides that a lesson is public: never add `labels: sensitivity: public` to a lesson or a folder note unless the user asked for that lesson or folder.
+- The first build that would publish a lesson returns `needs_user`: show the user the list and wait for their answer, as for any other question.
+- A build fails when a published lesson links to one that is not published. Tell the user; do not relabel the target yourself.
+- With `SITE_PASSWORD` set (16 or more characters), lessons that `[sinks.web-protected]` allows and `[sinks.web]` does not (by default the unlabeled, `internal` ones) are published encrypted: their pages show nothing about them until a reader enters the password, and they are in no public list or feed. Without it they are left out. Never put the password in a file or a command line the user did not ask for; suggest a long random one (`openssl rand -base64 24`). Anyone who saves an encrypted page can try passwords offline forever, so the password must be strong.
+
 ## Folder notes
 
 A folder can have a `README.md`. The user writes its body. Its frontmatter holds the facts rkb needs:

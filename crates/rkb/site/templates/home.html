@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+
+{% block content %}
+<p class="muted">{{ site.description }}</p>
+{% if page.data.topics | length > 0 %}
+<h2>Topics</h2>
+<p class="chips">{% for g in page.data.topics %}<a href="{{ g.url }}">{{ g.name }} ({{ g.count }})</a>{% endfor %}</p>
+{% endif %}
+{% if page.data.projects | length > 0 %}
+<h2>Projects</h2>
+<p class="chips">{% for g in page.data.projects %}<a href="{{ g.url }}">{{ g.name }} ({{ g.count }})</a>{% endfor %}</p>
+{% endif %}
+{% if page.data.systems | length > 0 %}
+<h2>Systems</h2>
+<p class="chips">{% for g in page.data.systems %}<a href="{{ g.url }}">{{ g.name }} ({{ g.count }})</a>{% endfor %}</p>
+{% endif %}
+{% if page.data.protected_count > 0 %}
+<p class="muted"><a href="/protected/">{{ page.data.protected_count }} protected lessons</a> need the site password.</p>
+{% endif %}
+<h2>Recent lessons</h2>
+{% if page.data.lessons | length > 0 %}
+<ul class="cards">
+{% for l in page.data.lessons %}
+  <li><a href="{{ l.url }}">{{ l.title }}</a> <span class="meta">{{ l.type }} · {{ l.topic }} · {{ l.verified }}</span></li>
+{% endfor %}
+</ul>
+{% else %}
+<p class="muted">No published lessons yet.</p>
+{% endif %}
+{% if page.data.tags | length > 0 %}
+<h2>Tags</h2>
+<p class="chips">{% for g in page.data.tags %}<a href="{{ g.url }}">{{ g.name }}</a>{% endfor %}</p>
+{% endif %}
+{% endblock %}

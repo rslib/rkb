@@ -1,0 +1,575 @@
+//! `rkb site`: build, preview and customize an rs-web site of the lessons the `web` sink allows.
+
+use std::collections::BTreeSet;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use rkb_core::leak::LeakScanner;
+use rkb_core::request::{self, Action, Choice, Decision, Request};
+use rkb_core::{kb, paths, site};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+use crate::output::{CliError, ErrorCode, Output, paint};
+use crate::writes::{self, Env};
+
+/// The rs-web release this rkb downloads and its template is tested with. An older rs-web is refused.
+pub const RS_WEB_VERSION: &str = "0.4.3";
+const RELEASES: &str = "https://github.com/rslib/web/releases/download";
+/// `(os, arch, asset stem, SHA-256 of the .tar.gz)`.
+const ASSETS: [(&str, &str, &str, &str); 3] = [
+    ("macos", "aarch64", "rs-web-darwin-aarch64", "df3f0145233cc77e36a23b8396462f5eb8d47aaa6250c975e8f2d1df56025343"),
+    ("linux", "aarch64", "rs-web-linux-aarch64", "a06038f1801d726a8d36c8cf80d417101c78d5bd418348078d30304ce700a87b"),
+    ("linux", "x86_64", "rs-web-linux-x86_64", "da5f75d0b5165329138f84743076ed28f735999124610fb9b2f83d9484c6db3f"),
+];
+
+const TEMPLATE: [(&str, &str); 10] = [
+    ("config.lua", include_str!("../site/config.lua")),
+    ("templates/base.html", include_str!("../site/templates/base.html")),
+    ("templates/home.html", include_str!("../site/templates/home.html")),
+    ("templates/lesson.html", include_str!("../site/templates/lesson.html")),
+    ("templates/list.html", include_str!("../site/templates/list.html")),
+    ("templates/protected.html", include_str!("../site/templates/protected.html")),
+    ("templates/protected-index.html", include_str!("../site/templates/protected-index.html")),
+    ("static/decrypt.js", include_str!("../site/static/decrypt.js")),
+    // hash-wasm 4.12.0, MIT (https://www.npmjs.com/package/hash-wasm): Argon2id in the browser.
+    ("static/argon2.umd.min.js", include_str!("../site/static/argon2.umd.min.js")),
+    ("static/hash-wasm.LICENSE", include_str!("../site/static/hash-wasm.LICENSE")),
+];
+
+const TEXT: [&str; 7] = ["html", "xml", "json", "js", "css", "txt", "md"];
+
+fn io_error(what: impl std::fmt::Display, fix: &str) -> CliError {
+    CliError::new(ErrorCode::Io, what.to_string(), fix)
+}
+
+fn site_dir() -> PathBuf {
+    paths::cache_dir().join("site")
+}
+
+fn install_dir() -> PathBuf {
+    paths::data_dir().join("bin")
+}
+
+/// `rs-web 0.4.3` -> `(0, 4, 3)`.
+fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+    let v = text.split_whitespace().map(|w| w.trim_start_matches('v')).find(|w| w.starts_with(|c: char| c.is_ascii_digit()))?;
+    let mut it = v.split('.').map(|p| p.parse::<u64>().ok());
+    Some((it.next()??, it.next()??, it.next().flatten().unwrap_or(0)))
+}
+
+fn version_of(bin: &Path) -> Option<(u64, u64, u64)> {
+    let out = Command::new(bin).arg("--version").output().ok()?;
+    out.status.success().then(|| parse_version(&String::from_utf8_lossy(&out.stdout))).flatten()
+}
+
+fn on_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(name)).find(|p| p.is_file())
+}
+
+/// The rs-web to run, and a note when rkb had to download it.
+fn rs_web() -> Result<(PathBuf, Option<String>), CliError> {
+    let fix_update = format!("install rs-web {RS_WEB_VERSION} or later (`cargo install rs-web`), or set RKB_RS_WEB to one");
+    let (bin, note) = match std::env::var_os("RKB_RS_WEB").filter(|v| !v.is_empty()) {
+        Some(p) => (PathBuf::from(p), None),
+        None => match on_path("rs-web").or_else(|| Some(install_dir().join("rs-web")).filter(|p| p.is_file())) {
+            Some(p) => (p, None),
+            None => {
+                let base = std::env::var("RKB_RS_WEB_URL").unwrap_or_else(|_| RELEASES.into());
+                let (stem, sha) = asset().ok_or_else(|| {
+                    CliError::new(
+                        ErrorCode::NotFound,
+                        format!(
+                            "rs-web is not installed, and rs-web {RS_WEB_VERSION} has no release for {} {}",
+                            std::env::consts::OS,
+                            std::env::consts::ARCH
+                        ),
+                        &fix_update,
+                    )
+                })?;
+                let url = format!("{}/v{RS_WEB_VERSION}/{stem}-v{RS_WEB_VERSION}.tar.gz", base.trim_end_matches('/'));
+                let bin = download(&url, sha, &install_dir())?;
+                let note = format!("downloaded rs-web {RS_WEB_VERSION} to {}", bin.display());
+                (bin, Some(note))
+            }
+        },
+    };
+    match version_of(&bin) {
+        Some(v) if v >= parse_version(RS_WEB_VERSION).expect("pinned version parses") => Ok((bin, note)),
+        Some((a, b, c)) => Err(CliError::new(
+            ErrorCode::Refused,
+            format!("{} is rs-web {a}.{b}.{c}; rkb's site template needs {RS_WEB_VERSION} or later", bin.display()),
+            &fix_update,
+        )),
+        None => {
+            Err(CliError::new(ErrorCode::NotFound, format!("{} does not run as rs-web (`--version` failed)", bin.display()), &fix_update))
+        }
+    }
+}
+
+fn asset() -> Option<(&'static str, &'static str)> {
+    ASSETS.iter().find(|(os, arch, ..)| *os == std::env::consts::OS && *arch == std::env::consts::ARCH).map(|(.., stem, sha)| (*stem, *sha))
+}
+
+/// Downloads the archive at `url`, checks it against `sha`, and installs the `rs-web` in it to `dir`.
+fn download(url: &str, sha: &str, dir: &Path) -> Result<PathBuf, CliError> {
+    let fix = "check the network and try again, or install rs-web yourself and put it on PATH";
+    std::fs::create_dir_all(dir).map_err(|e| io_error(format!("{}: {e}", dir.display()), fix))?;
+    let work = dir.join(format!(".rs-web-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).map_err(|e| io_error(e, fix))?;
+    let result = (|| {
+        let mut resp = ureq::get(url).call().map_err(|e| io_error(format!("{url}: {e}"), fix))?;
+        let mut body = vec![];
+        resp.body_mut().with_config().limit(200 << 20).reader().read_to_end(&mut body).map_err(|e| io_error(format!("{url}: {e}"), fix))?;
+        let got: String = Sha256::digest(&body).iter().map(|b| format!("{b:02x}")).collect();
+        if got != sha {
+            return Err(CliError::new(
+                ErrorCode::Refused,
+                format!("{url} does not match its pinned hash: expected {sha}, got {got}; nothing was installed"),
+                fix,
+            ));
+        }
+        let archive = work.join("rs-web.tar.gz");
+        std::fs::write(&archive, &body).map_err(|e| io_error(e, fix))?;
+        let tar =
+            Command::new("tar").arg("-xzf").arg(&archive).arg("-C").arg(&work).status().map_err(|e| io_error(format!("tar: {e}"), fix))?;
+        if !tar.success() {
+            return Err(io_error(format!("tar could not unpack {url}"), fix));
+        }
+        let found = walk(&work)
+            .into_iter()
+            .find(|p| p.file_name().is_some_and(|n| n == "rs-web"))
+            .ok_or_else(|| io_error(format!("{url} holds no rs-web"), fix))?;
+        let target = dir.join("rs-web");
+        std::fs::rename(&found, &target).map_err(|e| io_error(e, fix))?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).map_err(|e| io_error(e, fix))?;
+        Ok(target)
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    result
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = vec![];
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() { todo.push(p) } else { out.push(p) }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Minimum length of `SITE_PASSWORD`. Pages can be guessed at offline, so the password must be long.
+pub const MIN_PASSWORD: usize = 16;
+
+/// Ids the user agreed to publish for the first time, in the clear and encrypted.
+#[derive(Default)]
+pub struct Approved {
+    pub clear: Vec<String>,
+    pub encrypted: Vec<String>,
+}
+
+/// Whether protected lessons are built: `SITE_PASSWORD` is set and long enough.
+fn protection() -> Result<bool, CliError> {
+    match std::env::var("SITE_PASSWORD").ok().filter(|p| !p.is_empty()) {
+        None => Ok(false),
+        Some(p) if p.chars().count() < MIN_PASSWORD => Err(CliError::new(
+            ErrorCode::Refused,
+            format!("SITE_PASSWORD has {} characters; protected pages need at least {MIN_PASSWORD}", p.chars().count()),
+            "use a long random password, such as the output of `openssl rand -base64 24`, or unset SITE_PASSWORD to leave internal lessons out",
+        )),
+        Some(_) => Ok(true),
+    }
+}
+
+fn published_file(env: &Env) -> PathBuf {
+    env.state.join("site-published.json")
+}
+
+/// Ids published in the clear and encrypted. An older file's `ids` are in the clear.
+#[derive(Default)]
+struct Published {
+    clear: BTreeSet<String>,
+    encrypted: BTreeSet<String>,
+}
+
+fn published(env: &Env) -> Published {
+    let v: Value = std::fs::read_to_string(published_file(env)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let set = |k: &str| -> BTreeSet<String> {
+        v[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
+    };
+    let mut clear = set("clear");
+    clear.extend(set("ids"));
+    Published { clear, encrypted: set("encrypted") }
+}
+
+/// Adds `clear` and `encrypted` ids; a lesson now public no longer counts as encrypted only.
+fn record(env: &Env, clear: &[String], encrypted: &[String]) -> Result<(), CliError> {
+    let mut p = published(env);
+    p.clear.extend(clear.iter().cloned());
+    p.encrypted.extend(encrypted.iter().cloned());
+    p.encrypted.retain(|i| !p.clear.contains(i) || encrypted.contains(i));
+    let fix = "check that the state folder is writable";
+    std::fs::create_dir_all(&env.state).map_err(|e| io_error(e, fix))?;
+    std::fs::write(published_file(env), json!({ "clear": p.clear, "encrypted": p.encrypted }).to_string()).map_err(|e| io_error(e, fix))
+}
+
+/// Writes the staging folder: the template, the allowed lessons and `site.json`.
+fn stage(env: &Env, s: &site::Site, dir: &Path) -> Result<(), CliError> {
+    let fix = "check the disk space and that the cache folder is writable";
+    let _ = std::fs::remove_dir_all(dir);
+    let put = |rel: &str, data: &[u8]| -> Result<(), CliError> {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().expect("staged files are in a folder")).map_err(|e| io_error(e, fix))?;
+        std::fs::write(&p, data).map_err(|e| io_error(format!("{}: {e}", p.display()), fix))
+    };
+    let custom = env.root.join("site");
+    if custom.join("config.lua").is_file() {
+        for p in walk(&custom) {
+            let rel = p.strip_prefix(&custom).expect("walk stays under the folder").to_string_lossy().into_owned();
+            put(&rel, &std::fs::read(&p).map_err(|e| io_error(e, fix))?)?;
+        }
+    } else {
+        for (rel, text) in TEMPLATE {
+            put(rel, text.as_bytes())?;
+        }
+    }
+    for (path, data) in &s.files {
+        put(path, data)?;
+    }
+    put("site.json", serde_json::to_string_pretty(&s.index).expect("the index serializes").as_bytes())
+}
+
+/// Removes the values of the encrypted-content attributes, so random base64 cannot look like a finding.
+/// A minified page may drop the quotes around a value.
+fn without_ciphertext(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = ["data-encrypted=", "data-salt=", "data-nonce="].iter().filter_map(|a| rest.find(a).map(|i| i + a.len())).min() {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let end = match rest.strip_prefix('"') {
+            Some(r) => r.find('"').map_or(rest.len(), |j| j + 2),
+            None => rest.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(rest.len()),
+        };
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Leak findings in the built text files, lesson pages that belong to no published lesson, and
+/// protected titles, tags and paths in plain text. A finding names a protected lesson by id only.
+fn check(env: &Env, dist: &Path, s: &site::Site) -> Vec<String> {
+    let kb: rkb_core::config::KbConfig =
+        std::fs::read_to_string(env.root.join("kb.toml")).ok().and_then(|t| rkb_core::config::parse(&t).ok()).unwrap_or_default();
+    let scanner = LeakScanner::new(&kb.leak, env.lint.user.as_deref(), env.lint.home.as_deref());
+    // Text that public lessons show anyway cannot give a protected lesson away.
+    let public: String =
+        s.files.iter().filter(|(p, _)| p.starts_with("lessons/")).map(|(_, d)| String::from_utf8_lossy(d).into_owned()).collect();
+    let secrets: Vec<(&str, Vec<&str>)> = s
+        .secrets
+        .iter()
+        .map(|x| {
+            let mut words: Vec<&str> = vec![x.title.as_str(), x.path.as_str()];
+            words.extend(x.tags.iter().map(String::as_str).filter(|t| t.chars().count() >= 4));
+            (x.id.as_str(), words.into_iter().filter(|w| !public.contains(w)).collect())
+        })
+        .collect();
+    let mut out = vec![];
+    for p in walk(dist) {
+        let rel = p.strip_prefix(dist).expect("walk stays under the folder").to_string_lossy().into_owned();
+        if p.extension().and_then(|e| e.to_str()).is_some_and(|e| TEXT.contains(&e))
+            && let Ok(text) = std::fs::read_to_string(&p)
+        {
+            // The vendored Argon2 build is minified code whose tokens look like job ids; rkb ships it as is.
+            if TEMPLATE.iter().any(|(rel, body)| rel.ends_with(".min.js") && *body == text) {
+                continue;
+            }
+            let text = without_ciphertext(&text);
+            for m in scanner.scan(&text) {
+                out.push(format!("{rel}: {} `{}`", m.kind.rule(), m.text));
+            }
+            for (id, words) in &secrets {
+                if words.iter().any(|w| text.contains(w)) {
+                    out.push(format!("{rel}: shows protected lesson `{id}` in plain text"));
+                }
+            }
+        }
+        for (prefix, ids, what) in [("lessons/", &s.ids, "public"), ("protected/", &s.protected, "protected")] {
+            if let Some(id) = rel.strip_prefix(prefix).and_then(|r| r.split('/').next()).filter(|id| !id.contains('.'))
+                && !ids.iter().any(|i| i == id)
+            {
+                out.push(format!("{rel}: a {what} lesson page for `{id}`, which is not published that way"));
+            }
+        }
+    }
+    out.dedup();
+    out
+}
+
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    for p in walk(from) {
+        let target = to.join(p.strip_prefix(from).expect("walk stays under the folder"));
+        std::fs::create_dir_all(target.parent().expect("copied files are in a folder"))?;
+        std::fs::copy(&p, &target)?;
+    }
+    Ok(())
+}
+
+/// Replaces `out` with `dist`, through a sibling folder so a failed copy leaves `out` as it was.
+fn replace(dist: &Path, out: &Path) -> std::io::Result<()> {
+    let parent = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "site".into());
+    let new = parent.join(format!(".{name}.new"));
+    let _ = std::fs::remove_dir_all(&new);
+    std::fs::create_dir_all(&new)?;
+    copy_tree(dist, &new)?;
+    if out.exists() {
+        std::fs::remove_dir_all(out)?;
+    }
+    std::fs::rename(&new, out)
+}
+
+fn listed(index: &Value, key: &str, ids: &[String]) -> Vec<String> {
+    index[key]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|l| ids.iter().any(|i| l["id"] == *i))
+        .map(|l| format!("  {} {}", l["id"].as_str().unwrap_or(""), l["title"].as_str().unwrap_or("")))
+        .collect()
+}
+
+/// `rkb site build` and `rkb site serve`. `approved` holds the ids the user just agreed to publish.
+pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approved) -> Result<Output, CliError> {
+    kb::open(&env.root)?;
+    let protect = protection()?;
+    let s = site::collect(&env.root, protect)?;
+    let before = published(env);
+    let new_clear: Vec<String> = s.ids.iter().filter(|i| !before.clear.contains(*i) && !approved.clear.contains(i)).cloned().collect();
+    let new_enc: Vec<String> =
+        s.protected.iter().filter(|i| !before.encrypted.contains(*i) && !approved.encrypted.contains(i)).cloned().collect();
+    if !new_clear.is_empty() || !new_enc.is_empty() {
+        let mut question = format!("Publish {} lessons for the first time?", new_clear.len() + new_enc.len());
+        if !new_clear.is_empty() {
+            question.push_str(&format!("\nIn the clear:\n{}", listed(&s.index, "lessons", &new_clear).join("\n")));
+        }
+        if !new_enc.is_empty() {
+            question.push_str(&format!("\nEncrypted with SITE_PASSWORD:\n{}", listed(&s.index, "protected", &new_enc).join("\n")));
+        }
+        let req = Request {
+            id: request::new_id(),
+            created: request::now(),
+            action: Action::Publish { ids: new_clear, encrypted: new_enc, out, serve },
+            approved: vec![],
+            question,
+            choices: vec![
+                Choice { text: "publish".into(), decision: Some(Decision::Publish) },
+                Choice { text: "cancel".into(), decision: None },
+            ],
+        };
+        request::save(&env.state.join("requests"), &req)?;
+        return Ok(writes::needs_user_output(env, &req));
+    }
+    let gone: Vec<String> = before
+        .clear
+        .iter()
+        .filter(|i| !s.ids.contains(i))
+        .chain(before.encrypted.iter().filter(|i| !s.protected.contains(i) && !s.ids.contains(i)))
+        .cloned()
+        .collect();
+    let (bin, note) = rs_web()?;
+    let dir = site_dir().join("stage");
+    stage(env, &s, &dir)?;
+    let mut notes: Vec<String> = note.into_iter().collect();
+    if !gone.is_empty() {
+        notes.push(format!(
+            "{} lessons published before are no longer published the same way ({}); the old web copy, feeds and caches may still hold them",
+            gone.len(),
+            gone.join(", ")
+        ));
+    }
+    if s.left_out > 0 {
+        notes.push(format!(
+            "{} internal lessons were left out; set SITE_PASSWORD ({MIN_PASSWORD}+ characters) to publish them encrypted",
+            s.left_out
+        ));
+    }
+    let count = s.ids.len() + s.protected.len();
+    if let Some(port) = serve {
+        record(env, &approved.clear, &approved.encrypted)?;
+        for n in &notes {
+            eprintln!("note: {n}");
+        }
+        eprintln!("serving {count} lessons ({} protected) from {} on port {port}; stop with Ctrl-C", s.protected.len(), dir.display());
+        let status = Command::new(&bin)
+            .args(["serve", "--port", &port.to_string()])
+            .current_dir(&dir)
+            .status()
+            .map_err(|e| io_error(format!("{}: {e}", bin.display()), "check that rs-web runs"))?;
+        return Ok(Output {
+            data: json!({ "status": "stopped", "lessons": count }),
+            human: String::new(),
+            exit: u8::from(!status.success()),
+            raw: false,
+        });
+    }
+    let dist = dir.join("dist");
+    let run = Command::new(&bin)
+        .arg("build")
+        .current_dir(&dir)
+        .output()
+        .map_err(|e| io_error(format!("{}: {e}", bin.display()), "check that rs-web runs"))?;
+    if !run.status.success() {
+        let text = format!("{}{}", String::from_utf8_lossy(&run.stderr), String::from_utf8_lossy(&run.stdout));
+        let tail: Vec<&str> = text.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect();
+        return Err(CliError::new(
+            ErrorCode::Refused,
+            format!("rs-web build failed:\n{}", tail.join("\n")),
+            format!("fix the template (run `rs-web build` in {} to see the whole output); nothing was written", dir.display()),
+        ));
+    }
+    let findings = check(env, &dist, &s);
+    if !findings.is_empty() {
+        return Err(CliError::new(
+            ErrorCode::Refused,
+            format!("the built site failed its checks:\n{}", findings.join("\n")),
+            "fix the lesson or the template; nothing was written",
+        ));
+    }
+    let out = out.map(PathBuf::from).unwrap_or_else(|| site_dir().join("dist"));
+    replace(&dist, &out).map_err(|e| io_error(format!("{}: {e}", out.display()), "check that the output folder is writable"))?;
+    record(env, &s.ids, &s.protected)?;
+    let mut human = format!("{} {count} lessons ({} protected) to {}", paint(env.colored, "32", "built"), s.protected.len(), out.display());
+    for n in &notes {
+        human.push_str(&format!("\n{} {n}", paint(env.colored, "33", "note:")));
+    }
+    let data = json!({
+        "status": "built",
+        "out": out.display().to_string(),
+        "lessons": count,
+        "protected": s.protected.len(),
+        "rs_web": bin.display().to_string(),
+        "notes": notes,
+        "help": [format!("Open {}/index.html, or run `rkb site serve` for a live preview", out.display())],
+    });
+    Ok(Output { data, human, exit: 0, raw: false })
+}
+
+/// `rkb site init`: the built-in template into `$RKB_HOME/site/`, keeping files that exist.
+pub fn init(env: &Env) -> Result<Output, CliError> {
+    kb::open(&env.root)?;
+    let kbc: rkb_core::config::KbConfig =
+        std::fs::read_to_string(env.root.join("kb.toml")).ok().and_then(|t| rkb_core::config::parse(&t).ok()).unwrap_or_default();
+    let _lock = rkb_core::write::kb_lock(&env.root, &kbc)?;
+    let fix = "check that the knowledge base is writable";
+    let (mut written, mut skipped) = (vec![], vec![]);
+    for (rel, text) in TEMPLATE {
+        let path = format!("site/{rel}");
+        let p = env.root.join(&path);
+        if p.exists() {
+            skipped.push(path);
+            continue;
+        }
+        std::fs::create_dir_all(p.parent().expect("template files are in a folder")).map_err(|e| io_error(e, fix))?;
+        let mut f = std::fs::File::create(&p).map_err(|e| io_error(format!("{}: {e}", p.display()), fix))?;
+        f.write_all(text.as_bytes()).map_err(|e| io_error(e, fix))?;
+        written.push(path);
+    }
+    if !written.is_empty() {
+        let refs: Vec<&str> = written.iter().map(String::as_str).collect();
+        let mut add = vec!["add", "--"];
+        add.extend(&refs);
+        rkb_core::git::run(&env.root, &add)?;
+        let mut status = vec!["status", "--porcelain", "--"];
+        status.extend(&refs);
+        // A file removed and written again is unchanged, and git would refuse an empty commit.
+        if !rkb_core::git::run(&env.root, &status)?.is_empty() {
+            rkb_core::git::commit_paths(&env.root, "site: add the rs-web template", &refs)?;
+        }
+    }
+    let mut human = String::new();
+    for p in &written {
+        human.push_str(&format!("{} {p}\n", paint(env.colored, "32", "wrote  ")));
+    }
+    for p in &skipped {
+        human.push_str(&format!("{} {p} (exists)\n", paint(env.colored, "2", "skipped")));
+    }
+    human.push_str("`rkb site build` now uses site/ as the template");
+    let data = json!({
+        "written": written,
+        "skipped": skipped,
+        "help": ["Edit site/config.lua and site/templates/, then run `rkb site build`"],
+    });
+    Ok(Output { data, human, exit: 0, raw: false })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ciphertext_is_skipped_with_or_without_quotes() {
+        assert_eq!(
+            without_ciphertext(r#"<div data-encrypted="QUJD" data-nonce=Tm9u>x</div>"#),
+            r#"<div data-encrypted= data-nonce=>x</div>"#
+        );
+        assert_eq!(without_ciphertext("a data-salt=abc"), "a data-salt=");
+    }
+
+    #[test]
+    fn versions() {
+        assert_eq!(parse_version("rs-web 0.4.3\n"), Some((0, 4, 3)));
+        assert_eq!(parse_version("rs-web v1.2"), Some((1, 2, 0)));
+        assert_eq!(parse_version("nothing"), None);
+        assert!(parse_version("rs-web 0.10.0") > parse_version(RS_WEB_VERSION));
+    }
+
+    /// Serves `body` once over HTTP on a local port and returns the URL.
+    fn serve_once(body: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+            s.write_all(head.as_bytes()).unwrap();
+            s.write_all(&body).unwrap();
+        });
+        format!("http://127.0.0.1:{port}/rs-web.tar.gz")
+    }
+
+    fn archive() -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("rs-web-x");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::write(inner.join("rs-web"), "#!/bin/sh\necho 'rs-web 0.4.3'\n").unwrap();
+        let tgz = dir.path().join("a.tar.gz");
+        assert!(Command::new("tar").arg("-czf").arg(&tgz).arg("-C").arg(dir.path()).arg("rs-web-x").status().unwrap().success());
+        std::fs::read(tgz).unwrap()
+    }
+
+    #[test]
+    fn download_checks_the_hash_before_installing() {
+        let body = archive();
+        let sha: String = Sha256::digest(&body).iter().map(|b| format!("{b:02x}")).collect();
+        let dir = tempfile::tempdir().unwrap();
+
+        let e = download(&serve_once(body.clone()), &"0".repeat(64), dir.path()).unwrap_err();
+        assert!(e.message.contains("does not match its pinned hash") && e.message.contains(&sha), "{}", e.message);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "nothing installed");
+
+        let bin = download(&serve_once(body), &sha, dir.path()).unwrap();
+        assert_eq!(bin, dir.path().join("rs-web"));
+        assert_eq!(version_of(&bin), Some((0, 4, 3)));
+    }
+}
