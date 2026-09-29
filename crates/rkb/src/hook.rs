@@ -5,7 +5,7 @@ use rkb_core::conditions::{Facts, Verdict};
 use rkb_core::hooks::{
     self, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_MIN_COVERAGE, DEFAULT_MIN_RELEVANCE, MAX_NUDGES, RECALL_MIN_MARGIN, RECALL_MIN_RELEVANCE,
 };
-use rkb_core::matching::Hints;
+use rkb_core::matching::{Hints, Place};
 use rkb_core::search::{Mode, Options};
 use rkb_core::{config, kb, lock, paths, request, rerank, search, state, usage};
 use serde_json::{Value, json};
@@ -150,6 +150,12 @@ fn tool_ok(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// `missing here: …` for the names a project lesson gives that this checkout lacks.
+fn missing_note(place: &Place, path: &str, text: &str) -> Vec<String> {
+    let missing = hooks::missing_here(place, path, text);
+    if missing.is_empty() { vec![] } else { vec![format!("missing here: {}", missing.join(", "))] }
+}
+
 /// A search hit as an injected lesson block.
 fn injected(h: &search::Hit, notes: Vec<String>) -> hooks::Injected<'_> {
     hooks::Injected {
@@ -182,7 +188,7 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
     let error = p["error"].as_str().unwrap_or("");
     let query = hooks::error_query(command, error);
     let cfg = hooks_config(&root);
-    let (hits, ranked) = ranked_search(&root, p, state, &cfg, &query)?;
+    let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, &query)?;
     let Some(hit) = hits.into_iter().next() else {
         return Ok(None);
     };
@@ -200,7 +206,7 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
     }
     hooks::append(state, session, &json!({ "kind": "injected", "id": hit.id }))?;
     record_use(&root, state, &hit.id, "injected", session, Some(format!("tool-failed, {}", ranked.describe())))?;
-    let context = hooks::render(&[injected(&hit, vec![])]);
+    let context = hooks::render(&[injected(&hit, missing_note(&place, &hit.path, &text))]);
     Ok(Some(reply("PostToolUseFailure", "additionalContext", json!(context))))
 }
 
@@ -211,7 +217,13 @@ fn capture(p: &Value, state: &Path, session: &str, harness: &str) -> Result<Opti
 }
 
 /// The hits for `query` from the current place, reranked by the chain within the hook time limit.
-fn ranked_search(root: &Path, p: &Value, state: &Path, cfg: &toml::Table, query: &str) -> Result<(Vec<search::Hit>, rerank::Ranked)> {
+fn ranked_search(
+    root: &Path,
+    p: &Value,
+    state: &Path,
+    cfg: &toml::Table,
+    query: &str,
+) -> Result<(Vec<search::Hit>, rerank::Ranked, Place)> {
     let place = state::locate(root, &cwd(p), &Hints::default(), state)?;
     let facts = Facts::gather(root, &place, &[]);
     let settings = rerank::Settings::load(root);
@@ -224,7 +236,7 @@ fn ranked_search(root: &Path, p: &Value, state: &Path, cfg: &toml::Table, query:
     if let Some(scores) = &ranked.scores {
         search::apply_relevance(&mut found.hits, scores);
     }
-    Ok((found.hits, ranked))
+    Ok((found.hits, ranked, place))
 }
 
 fn prompt(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {
@@ -252,7 +264,7 @@ fn recall(p: &Value, state: &Path, session: &str, text: &str) -> Result<Option<S
     }
     let min = cfg.get("recall_min_relevance").and_then(toml::Value::as_float).unwrap_or(RECALL_MIN_RELEVANCE);
     let margin = cfg.get("recall_min_margin").and_then(toml::Value::as_float).unwrap_or(RECALL_MIN_MARGIN);
-    let (hits, ranked) = ranked_search(&root, p, state, &cfg, text)?;
+    let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, text)?;
     // A BM25 score means different things for different queries, so without a model there is no threshold.
     if ranked.scores.is_none() {
         return Ok(None);
@@ -273,7 +285,8 @@ fn recall(p: &Value, state: &Path, session: &str, text: &str) -> Result<Option<S
     for h in &strong {
         hooks::append(state, session, &json!({ "kind": "injected", "id": h.id }))?;
         record_use(&root, state, &h.id, "injected", session, Some(format!("recall, {}", ranked.describe())))?;
-        blocks.push(injected(h, vec![]));
+        let text = kb::find(&root, &h.id).map(|(_, t)| t).unwrap_or_default();
+        blocks.push(injected(h, missing_note(&place, &h.path, &text)));
     }
     Ok(Some(reply("UserPromptSubmit", "additionalContext", json!(hooks::render(&blocks)))))
 }

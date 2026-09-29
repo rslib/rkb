@@ -238,9 +238,50 @@ pub fn render(lessons: &[Injected]) -> String {
     out
 }
 
+/// For a lesson of the current project, the paths and commits it names that this checkout lacks. Other
+/// lessons, and places without a checkout, are not checked: their names are not about this checkout.
+pub fn missing_here(place: &crate::matching::Place, lesson_path: &str, body: &str) -> Vec<String> {
+    let Some(project) = place.project.as_ref().map(|p| p.name.as_str()) else { return vec![] };
+    if !lesson_path.starts_with(&format!("projects/{project}/")) {
+        return vec![];
+    }
+    let Some(root) = place.repo.as_ref().map(|r| r.top.clone()).or_else(|| place.dir.clone()) else { return vec![] };
+    let git = place.repo.is_some();
+    crate::body::anchors(body, 8)
+        .into_iter()
+        .filter_map(|a| match a {
+            crate::body::Anchor::Path(p) => (!root.join(&p).exists()).then_some(p),
+            crate::body::Anchor::Commit(c) => {
+                (git && crate::git::run(&root, &["cat-file", "-e", &format!("{c}^{{commit}}")]).is_err()).then_some(c)
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_here_checks_project_lessons_only() {
+        use crate::matching::{Matched, Place, Repo, Rule};
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().to_path_buf();
+        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&top).status().unwrap().success());
+        std::fs::create_dir_all(top.join("src")).unwrap();
+        std::fs::write(top.join("src/new.rs"), "").unwrap();
+        let place = Place {
+            project: Some(Matched { name: "p".into(), rule: Rule::Flag }),
+            system: None,
+            repo: Some(Repo { top: top.clone(), remotes: vec![], root_commits: vec![] }),
+            dir: Some(top.clone()),
+        };
+        let body = "Use `src/new.rs`, not `src/old.rs`; fixed in `3f9a1c0d2e`.";
+        assert_eq!(missing_here(&place, "projects/p/io/a.md", body), ["src/old.rs", "3f9a1c0d2e"]);
+        assert!(missing_here(&place, "general/io/a.md", body).is_empty(), "general lessons are not about this checkout");
+        let elsewhere = Place { project: None, ..place.clone() };
+        assert!(missing_here(&elsewhere, "projects/p/io/a.md", body).is_empty(), "no project here");
+    }
 
     #[test]
     fn render_frames_caps_and_neutralizes() {

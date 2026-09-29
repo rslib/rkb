@@ -68,6 +68,67 @@ fn heading(line: &str, level: usize) -> Option<&str> {
     rest.starts_with([' ', '\t']).then(|| rest.trim().trim_end_matches('#').trim())
 }
 
+/// A name a lesson gives in inline code that can be checked against a checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Anchor {
+    /// A relative file path, such as `src/io/reader.rs`.
+    Path(String),
+    /// A git commit, 7 to 40 hex characters with at least one digit.
+    Commit(String),
+}
+
+/// The file paths and commits named in inline code outside fenced blocks (fences hold commands, not
+/// names), at most `limit`, in order, without repeats.
+pub fn anchors(body: &str, limit: usize) -> Vec<Anchor> {
+    let mut out: Vec<Anchor> = vec![];
+    let mut fence: Option<(char, usize)> = None;
+    for line in body.lines() {
+        if let Some((c, n)) = fence {
+            if is_fence_close(line, c, n) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some((c, n, _)) = fence_open(line) {
+            fence = Some((c, n));
+            continue;
+        }
+        for m in CODE_SPAN.find_iter(line) {
+            let t = m.as_str().trim_matches('`').trim();
+            let a = if t.len() >= 7
+                && t.len() <= 40
+                && t.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                && t.chars().any(|c| c.is_ascii_digit())
+            {
+                Anchor::Commit(t.to_string())
+            } else if looks_like_path(t) {
+                Anchor::Path(t.trim_start_matches("./").to_string())
+            } else {
+                continue;
+            };
+            if !out.contains(&a) {
+                out.push(a);
+            }
+            if out.len() >= limit {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// A relative path: only path characters, and a `/` or a file extension with a letter.
+fn looks_like_path(t: &str) -> bool {
+    if t.is_empty() || (t.starts_with(['/', '~', '-', '$', '.']) && !t.starts_with("./")) || t.contains("://") || t.contains("..") {
+        return false;
+    }
+    if !t.chars().all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c)) {
+        return false;
+    }
+    let ext = t.rsplit_once('/').map_or(t, |(_, f)| f).rsplit_once('.').map(|(_, e)| e);
+    t.contains('/') || ext.is_some_and(|e| (1..=5).contains(&e.len()) && e.chars().any(|c| c.is_ascii_alphabetic()))
+}
+
 /// The text under an H2 heading, up to the next H2.
 pub fn section_text(body_text: &str, heading: &str) -> Option<String> {
     let scan = scan(body_text);
@@ -149,6 +210,23 @@ pub fn scan(body: &str) -> Body {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anchors_in_inline_code() {
+        let body = "Edit `src/io/reader.rs` and `./build.sh`, then check `CMakeLists.txt`.\nFixed in `3f9a1c0d2e`; see `deadbeef` and `facade1` and `v1.2.3`.\nNot `/etc/hosts`, `~/x.rs`, `std::fs`, `*.rs`, `rm -rf build`, `https://a.org/x.md`, `../up.rs`.\n```sh\ncat `src/in/fence.rs`\n```\n`src/io/reader.rs` again.\n";
+        let got = anchors(body, 8);
+        assert_eq!(
+            got,
+            [
+                Anchor::Path("src/io/reader.rs".into()),
+                Anchor::Path("build.sh".into()),
+                Anchor::Path("CMakeLists.txt".into()),
+                Anchor::Commit("3f9a1c0d2e".into()),
+                Anchor::Commit("facade1".into()),
+            ]
+        );
+        assert_eq!(anchors(body, 2).len(), 2);
+    }
 
     #[test]
     fn headings_sections_and_content() {
