@@ -2135,7 +2135,7 @@ fn hook_full_session() {
         session.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["kind"].as_str().unwrap().to_string()).collect();
     assert_eq!(
         kinds,
-        ["failed", "injected", "failed", "fixed", "inferred", "failed", "failed", "fixed", "correction", "remember"],
+        ["failed", "injected", "failed", "fixed", "inferred", "failed", "nohit", "failed", "nohit", "fixed", "correction", "remember"],
         "{session}"
     );
     assert!(
@@ -2144,16 +2144,25 @@ fn hook_full_session() {
     );
 
     let stop = serde_json::json!({ "session_id": "s1", "stop_hook_active": false });
-    assert_eq!(hook(&env, "stop", &stop), "", "nudge is off by default");
-    let toml = std::fs::read_to_string(cwd.join("kb.toml")).unwrap();
-    std::fs::write(cwd.join("kb.toml"), format!("{toml}\n[hooks]\nstop_nudge = true\n")).unwrap();
     let out = hook(&env, "stop", &stop);
     let reply: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
-    let note = reply["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
-    assert!(note.contains("cmake") && note.contains("rkb add"), "{note}");
+    assert_eq!(reply["decision"], "block", "a correction, a remember and fixes score high, so the agent records it now: {out}");
+    let reason = reply["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("worth a lesson") && reason.contains("cmake") && reason.contains("rkb_search") && reason.contains("rkb_add"),
+        "{reason}"
+    );
     assert_eq!(hook(&env, "stop", &stop), "", "no new signal");
     hook(&env, "prompt", &serde_json::json!({ "session_id": "s1", "prompt": "no, use ninja" }));
     assert_eq!(hook(&env, "stop", &serde_json::json!({ "session_id": "s1", "stop_hook_active": true })), "");
+    let out = hook(&env, "stop", &stop);
+    let reply: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+    assert!(reply.get("decision").is_none(), "asked once already, so only a note: {out}");
+    assert!(reply["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("1 correction(s)"), "{out}");
+    hook(&env, "prompt", &serde_json::json!({ "session_id": "s1", "prompt": "remember that ninja is faster" }));
+    let toml = std::fs::read_to_string(cwd.join("kb.toml")).unwrap();
+    std::fs::write(cwd.join("kb.toml"), format!("{toml}\n[hooks]\nstop_nudge = false\n")).unwrap();
+    assert_eq!(hook(&env, "stop", &stop), "", "turned off");
 
     assert_eq!(hook(&env, "pre-tool", &bash("s1", &cwd, "ls -la")), "");
     let (v, _) = env.json(&["install", "claude", "--uninstall"], "");

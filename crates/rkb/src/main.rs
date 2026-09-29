@@ -347,6 +347,9 @@ enum Cmd {
     Note {
         /// The note. Default: stdin.
         words: Vec<String>,
+        /// 1 (default) to 3; distill takes the highest first.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=3))]
+        priority: Option<u8>,
     },
     /// List the inbox: notes and session extracts waiting to become lessons.
     #[command(after_help = "Example:\n  rkb inbox\n  rkb inbox show 0a1b2c3d4e\n  rkb inbox done 0a1b2c3d4e")]
@@ -707,7 +710,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Confirm { request, choice } => writes::confirm(&env, request, choice),
         Cmd::Hook { .. } => unreachable!("main runs hooks first"),
         Cmd::Import { dir } => writes::import(&env, &dir),
-        Cmd::Note { words } => inbox::note(&env, words),
+        Cmd::Note { words, priority } => inbox::note(&env, words, priority),
         Cmd::Tools => Ok(agent::list()),
         Cmd::Tool { .. } | Cmd::Mcp => unreachable!("main runs tools and the MCP server first"),
         Cmd::Inbox { action: None } => inbox::list(&env),

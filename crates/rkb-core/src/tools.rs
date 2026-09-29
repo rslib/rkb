@@ -70,9 +70,10 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rkb_note",
-            "description": "Save a short finding to the rkb inbox when you cannot write the full lesson now, with the error text and what fixed it. Inbox items become lessons later with the distill command.",
+            "description": "Save a finding to the rkb inbox when you cannot write the full lesson now. Write it as dense dated notes, one event per line: `- YYYY-MM-DD [high|med|low] what happened, the exact error, what fixed it`. Inbox items become lessons later with the distill command, highest priority first.",
             "inputSchema": { "type": "object", "properties": {
-                "text": { "type": "string", "description": "What you found" },
+                "text": { "type": "string", "description": "What you found, one event per line" },
+                "priority": { "type": "integer", "minimum": 1, "description": "1 (default) to 3: 3 for a fix that cost real time or a mistake that repeats" },
             }, "required": ["text"], "additionalProperties": false },
         }),
         json!({

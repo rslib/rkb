@@ -71,7 +71,11 @@ assert.equal(await on("tool_result", { ...bash("cmake -B build -DX=1"), content:
 const inputReply = await on("input", { text: "actually, use the release build and remember this", source: "interactive" });
 assert.deepEqual(inputReply, harness === "pi" ? { action: "continue" } : undefined);
 const kinds = signals().map((s) => s.kind);
-assert.deepEqual(kinds, ["failed", "injected", "failed", "failed", "fixed", "inferred", "correction", "remember"]);
+// omp runs second on the same machine state, so it sees pi's errors again and records `repeat`.
+const expected = harness === "omp"
+  ? ["failed", "repeat", "injected", "failed", "failed", "repeat", "nohit", "fixed", "inferred", "correction", "remember"]
+  : ["failed", "injected", "failed", "failed", "nohit", "fixed", "inferred", "correction", "remember"];
+assert.deepEqual(kinds, expected);
 assert.ok(!JSON.stringify(signals()).includes("release"));
 
 // Compaction saves an extract, because the session has a fixed signal; shutdown then finds nothing new.

@@ -19,6 +19,8 @@ pub const DEFAULT_MIN_COVERAGE: f64 = 0.6;
 pub const DEFAULT_MIN_RELEVANCE: f64 = 0.8;
 pub const DEFAULT_HOOK_TIMEOUT_MS: u64 = 500;
 pub const MAX_NUDGES: usize = 2;
+/// The Stop hook asks the agent to record a lesson at this "worth a lesson" score (`hooks.record_score`).
+pub const DEFAULT_RECORD_SCORE: u32 = 3;
 
 fn sessions_dir(state: &Path) -> PathBuf {
     state.join("sessions")
@@ -190,6 +192,53 @@ pub fn clear_winner(top: f64, next: f64, min: f64, margin: f64) -> bool {
     top >= min && top - next >= margin
 }
 
+/// Session records that count toward "worth a lesson".
+pub const WORTH_KINDS: [&str; 5] = ["fixed", "correction", "remember", "nohit", "repeat"];
+
+/// How much the session records `signals` say "worth a lesson", with `all` the session's records:
+/// remember 3, correction 2, a fix after three or more failures of its program 2 (else 1), a failure no
+/// lesson matched 1, and an error seen in an earlier session 2.
+pub fn score(signals: &[serde_json::Value], all: &[serde_json::Value]) -> u32 {
+    signals
+        .iter()
+        .map(|r| match r["kind"].as_str().unwrap_or("") {
+            "remember" => 3,
+            "correction" | "repeat" => 2,
+            "fixed" => {
+                let failures = all.iter().filter(|x| x["kind"] == "failed" && x["program"] == r["program"]).count();
+                if failures >= 3 { 2 } else { 1 }
+            }
+            "nohit" => 1,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// A hash of a failure, with digits, hex runs and paths masked, so the same error on another day or in
+/// another folder has the same signature. Only the hash is stored.
+pub fn signature(program: &str, error: &str) -> String {
+    use sha2::Digest;
+    static MASK: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(/[^\s:'\x22]+)+|\b[0-9a-f]{7,}\b|\d+").unwrap());
+    let key: Vec<String> = error_query(program, error).split_whitespace().map(|w| MASK.replace_all(w, "#").into_owned()).collect();
+    sha2::Sha256::digest(format!("{program}\n{}", key.join(" ")).as_bytes()).iter().take(12).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Records `sig` for `session` and says whether another session on this machine saw it in the last
+/// 90 days.
+pub fn seen_before(state: &Path, sig: &str, session: &str) -> bool {
+    let path = state.join("signatures.jsonl");
+    let cutoff = crate::request::now().saturating_sub(90 * 86400);
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let seen = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|r| r["sig"] == sig && r["session"] != session && r["time"].as_u64().is_some_and(|t| t >= cutoff));
+    let _ =
+        crate::lock::append_line(&path, &serde_json::json!({ "time": crate::request::now(), "sig": sig, "session": session }).to_string());
+    seen
+}
+
 /// A lesson a hook adds to the context, with what the agent needs to judge it.
 pub struct Injected<'a> {
     pub id: &'a str,
@@ -261,6 +310,34 @@ pub fn missing_here(place: &crate::matching::Place, lesson_path: &str, body: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn score_and_signature() {
+        let r = |v: serde_json::Value| v;
+        let all = vec![
+            r(serde_json::json!({ "kind": "failed", "program": "cmake" })),
+            r(serde_json::json!({ "kind": "failed", "program": "cmake" })),
+            r(serde_json::json!({ "kind": "failed", "program": "cmake" })),
+            r(serde_json::json!({ "kind": "fixed", "program": "cmake" })),
+            r(serde_json::json!({ "kind": "failed", "program": "make" })),
+            r(serde_json::json!({ "kind": "fixed", "program": "make" })),
+        ];
+        assert_eq!(score(&all[3..4], &all), 2, "a fix after three failures");
+        assert_eq!(score(&all[5..6], &all), 1, "an edit-compile loop");
+        let signals = vec![serde_json::json!({ "kind": "remember" }), serde_json::json!({ "kind": "nohit", "program": "x" })];
+        assert_eq!(score(&signals, &all), 4);
+
+        let a = signature("cmake", "Exit code 1\nCMake Error at /home/a/x/CMakeLists.txt:12: could not find HDF5 1.14");
+        let b = signature("cmake", "Exit code 1\nCMake Error at /scratch/b/y/CMakeLists.txt:40: could not find HDF5 1.12");
+        let c = signature("cmake", "Exit code 1\nCMake Error: could not find Boost");
+        assert_eq!(a, b, "paths and numbers are masked");
+        assert_ne!(a, c);
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!seen_before(dir.path(), &a, "s1"));
+        assert!(!seen_before(dir.path(), &a, "s1"), "the same session is not a repeat");
+        assert!(seen_before(dir.path(), &a, "s2"));
+        assert!(!std::fs::read_to_string(dir.path().join("signatures.jsonl")).unwrap().contains("HDF5"), "only hashes are stored");
+    }
 
     #[test]
     fn missing_here_checks_project_lessons_only() {

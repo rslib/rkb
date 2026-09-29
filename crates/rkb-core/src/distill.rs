@@ -42,6 +42,18 @@ pub struct Meta {
     /// The signals that caused a transcript extract, such as `fixed cmake`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signals: Vec<String>,
+    /// 1 to 3, highest first in the inbox; an item without one counts as 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,
+    /// Where an imported note came from, such as a Claude Code memory file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl Meta {
+    pub fn priority(&self) -> u8 {
+        self.priority.unwrap_or(1).clamp(1, 3)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,7 +125,7 @@ pub fn list(state: &Path) -> Vec<Item> {
             parse(&id, &std::fs::read_to_string(e.path()).ok()?)
         })
         .collect();
-    items.sort_by(|a, b| a.meta.time.cmp(&b.meta.time).then(a.id.cmp(&b.id)));
+    items.sort_by(|a, b| b.meta.priority().cmp(&a.meta.priority()).then(a.meta.time.cmp(&b.meta.time)).then(a.id.cmp(&b.id)));
     items
 }
 
@@ -301,6 +313,15 @@ pub fn extract(steps: &[Step]) -> String {
             }
         }
     }
+    // Repeated identical output lines (a warning printed per file, say) collapse to one with a count.
+    let mut runs: Vec<(String, usize)> = vec![];
+    for line in out {
+        match runs.last_mut() {
+            Some((prev, n)) if line.starts_with("  ") && *prev == line => *n += 1,
+            _ => runs.push((line, 1)),
+        }
+    }
+    let mut out: Vec<String> = runs.into_iter().map(|(l, n)| if n > 1 { format!("{l} (×{n})") } else { l }).collect();
     if out.len() > MAX_LINES {
         let cut = out.len() - (MAX_LINES - 1);
         out.drain(..cut);
@@ -312,10 +333,16 @@ pub fn extract(steps: &[Step]) -> String {
 /// The session-start line, only when the inbox holds at least 5 items or its oldest is over 7 days old.
 pub fn nudge(state: &Path, now: u64, command: &str) -> Option<String> {
     let items = list(state);
-    let oldest = items.first()?;
-    let days = now.saturating_sub(oldest.meta.time) / 86400;
-    (items.len() >= 5 || days > 7)
-        .then(|| format!("rkb inbox: {} items wait, the oldest {days} days old; run {command} to turn them into lessons", items.len()))
+    let oldest = items.iter().map(|i| i.meta.time).min()?;
+    let days = now.saturating_sub(oldest) / 86400;
+    let urgent = items.iter().filter(|i| i.meta.priority() == 3).count();
+    (items.len() >= 5 || days > 7 || urgent > 0).then(|| {
+        let high = if urgent > 0 { format!(" ({urgent} of high priority)") } else { String::new() };
+        format!(
+            "rkb inbox: {} items wait{high}, the oldest {days} days old. At a natural pause in the work, run {command} for up to 3 of them, without waiting for the user.",
+            items.len()
+        )
+    })
 }
 
 /// Session-state signals that make a session worth an extract.
@@ -361,6 +388,8 @@ pub fn capture(state: &Path, harness: &str, session: &str, transcript: &Path, cw
             session: Some(session.to_string()),
             cwd: cwd.map(str::to_string),
             signals: signals.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect(),
+            priority: Some(crate::hooks::score(since, &records).clamp(1, 3) as u8),
+            source: None,
         };
         Some(add(state, meta, &body)?)
     };
@@ -372,8 +401,27 @@ pub fn capture(state: &Path, harness: &str, session: &str, transcript: &Path, cw
 mod tests {
     use super::*;
 
+    #[test]
+    fn priority_order_nudge_and_collapse() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = add(dir.path(), note(100), "old low").unwrap();
+        let high = add(dir.path(), Meta { priority: Some(3), ..note(200) }, "new high").unwrap();
+        let ids: Vec<String> = list(dir.path()).into_iter().map(|i| i.id).collect();
+        assert_eq!(ids, [high.id.clone(), old.id.clone()], "priority first, then oldest");
+        let line = nudge(dir.path(), 300, "/rkb:distill").expect("a high-priority item is enough");
+        assert!(line.contains("1 of high priority") && line.contains("without waiting for the user"), "{line}");
+
+        let steps = vec![Step::Command {
+            command: "cc a.c".into(),
+            ok: false,
+            output: "Exit code 1\nerror: x undefined\nerror: x undefined\nerror: x undefined\nerror: failed".into(),
+        }];
+        let text = extract(&steps);
+        assert!(text.contains("error: x undefined (×3)") && text.matches("x undefined").count() == 1, "{text}");
+    }
+
     fn note(time: u64) -> Meta {
-        Meta { kind: Kind::Note, time, harness: None, session: None, cwd: None, signals: vec![] }
+        Meta { kind: Kind::Note, time, harness: None, session: None, cwd: None, signals: vec![], priority: None, source: None }
     }
 
     #[test]

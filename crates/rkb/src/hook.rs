@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use rkb_core::conditions::{Facts, Verdict};
 use rkb_core::hooks::{
-    self, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_MIN_COVERAGE, DEFAULT_MIN_RELEVANCE, MAX_NUDGES, RECALL_MIN_MARGIN, RECALL_MIN_RELEVANCE,
+    self, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_MIN_COVERAGE, DEFAULT_MIN_RELEVANCE, DEFAULT_RECORD_SCORE, MAX_NUDGES, RECALL_MIN_MARGIN,
+    RECALL_MIN_RELEVANCE,
 };
 use rkb_core::matching::{Hints, Place};
 use rkb_core::search::{Mode, Options};
@@ -60,7 +61,7 @@ fn handle(event: &str, p: &Value, state: &Path, harness: &str) -> Result<Option<
         "tool-ok" => tool_ok(p, state, session),
         "tool-failed" => tool_failed(p, state, session),
         "prompt" => prompt(p, state, session),
-        "stop" => stop(p, state, session),
+        "stop" => stop(p, state, session, harness),
         "pre-compact" | "session-end" => capture(p, state, session, harness),
         _ => Err(format!("unknown hook event `{event}`").into()),
     }
@@ -182,17 +183,29 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
     let Some(command) = bash_command(p) else { return Ok(None) };
     let Some(program) = hooks::program(command) else { return Ok(None) };
     hooks::append(state, session, &json!({ "kind": "failed", "program": program }))?;
+    let error = p["error"].as_str().unwrap_or("");
+    // Signals for "worth a lesson": the same error in an earlier session, and failures no lesson covers.
+    let once = |kind: &str| -> Result<()> {
+        if !hooks::read(state, session).iter().any(|r| r["kind"] == kind && r["program"] == program.as_str()) {
+            hooks::append(state, session, &json!({ "kind": kind, "program": program }))?;
+        }
+        Ok(())
+    };
+    if hooks::seen_before(state, &hooks::signature(&program, error), session) {
+        once("repeat")?;
+    }
 
     let root = kb::home();
     kb::open(&root)?;
-    let error = p["error"].as_str().unwrap_or("");
     let query = hooks::error_query(command, error);
     let cfg = hooks_config(&root);
     let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, &query)?;
     let Some(hit) = hits.into_iter().next() else {
+        once("nohit")?;
         return Ok(None);
     };
     if hit.applies == Verdict::No {
+        once("nohit")?;
         return Ok(None);
     }
     if hooks::read(state, session).iter().any(|r| r["kind"] == "injected" && r["id"] == hit.id.as_str()) {
@@ -202,6 +215,7 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
     let min_relevance = cfg.get("min_relevance").and_then(toml::Value::as_float).unwrap_or(DEFAULT_MIN_RELEVANCE);
     let (_, text) = kb::find(&root, &hit.id)?;
     if !hooks::strong_enough(hit.relevance, || hooks::coverage(error, &text), min_relevance, min_coverage) {
+        once("nohit")?;
         return Ok(None);
     }
     hooks::append(state, session, &json!({ "kind": "injected", "id": hit.id }))?;
@@ -291,46 +305,66 @@ fn recall(p: &Value, state: &Path, session: &str, text: &str) -> Result<Option<S
     Ok(Some(reply("UserPromptSubmit", "additionalContext", json!(hooks::render(&blocks)))))
 }
 
-fn stop(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {
+fn stop(p: &Value, state: &Path, session: &str, harness: &str) -> Result<Option<String>> {
     if p["stop_hook_active"] == true {
         return Ok(None);
     }
     let root = kb::home();
-    if hooks_config(&root).get("stop_nudge").and_then(toml::Value::as_bool) != Some(true) {
+    let cfg = hooks_config(&root);
+    if cfg.get("stop_nudge").and_then(toml::Value::as_bool) == Some(false) {
         return Ok(None);
     }
     let records = hooks::read(state, session);
-    if records.iter().filter(|r| r["kind"] == "nudged").count() >= MAX_NUDGES {
+    let from = records.iter().rev().find_map(|r| (r["kind"] == "offered").then(|| r["upto"].as_u64()).flatten()).unwrap_or(0);
+    let new: Vec<Value> =
+        records.iter().skip(from as usize).filter(|r| hooks::WORTH_KINDS.iter().any(|k| r["kind"] == *k)).cloned().collect();
+    let score = hooks::score(&new, &records);
+    if score == 0 {
         return Ok(None);
     }
-    let from = records.iter().rev().find_map(|r| (r["kind"] == "offered").then(|| r["upto"].as_u64()).flatten()).unwrap_or(0);
-    let new: Vec<&Value> = records
-        .iter()
-        .skip(from as usize)
-        .filter(|r| r["kind"] == "fixed" || r["kind"] == "correction" || r["kind"] == "remember")
-        .collect();
-    if new.is_empty() {
+    let threshold = cfg.get("record_score").and_then(toml::Value::as_integer).map_or(DEFAULT_RECORD_SCORE, |v| v.max(1) as u32);
+    let asked = records.iter().any(|r| r["kind"] == "asked");
+    let nudged = records.iter().filter(|r| r["kind"] == "nudged").count();
+    let strong = score >= threshold && !asked;
+    if !strong && nudged >= MAX_NUDGES {
         return Ok(None);
     }
     let count = |k: &str| new.iter().filter(|r| r["kind"] == k).count();
-    let mut programs: Vec<&str> = new.iter().filter_map(|r| r["program"].as_str()).collect();
+    let mut programs: Vec<&str> = new.iter().filter(|r| r["kind"] == "fixed").filter_map(|r| r["program"].as_str()).collect();
     programs.sort_unstable();
     programs.dedup();
     let mut parts = vec![];
     if !programs.is_empty() {
         parts.push(format!("{} fixed failure(s) ({})", count("fixed"), programs.join(", ")));
     }
-    if count("correction") > 0 {
-        parts.push(format!("{} correction(s) from the user", count("correction")));
+    for (kind, what) in [
+        ("correction", "correction(s) from the user"),
+        ("remember", "request(s) to remember something"),
+        ("repeat", "error(s) seen in an earlier session"),
+        ("nohit", "failure(s) no lesson covered"),
+    ] {
+        if count(kind) > 0 {
+            parts.push(format!("{} {what}", count(kind)));
+        }
     }
-    if count("remember") > 0 {
-        parts.push(format!("{} request(s) to remember something", count("remember")));
+    let ask = "Search first (rkb_search); if a lesson covers it, report rkb_used or improve it with rkb_edit; otherwise record it with rkb_add (verified_how: ran when you saw the fix work), or rkb_note with a priority when you are not sure. Keep the real error text and the command that fixed it.";
+    hooks::append(state, session, &json!({ "kind": "offered", "upto": records.len() }))?;
+    if strong {
+        hooks::append(state, session, &json!({ "kind": "asked" }))?;
+        let reason = format!(
+            "rkb: this session looks worth a lesson ({}). Before you stop, record what would help next time. {ask} If nothing here would help next time, say so and stop.",
+            parts.join(", ")
+        );
+        // Claude Code continues on a blocking reason; pi and omp continue on the extension's context.
+        if harness == "claude-code" {
+            return Ok(Some(json!({ "decision": "block", "reason": reason }).to_string()));
+        }
+        return Ok(Some(reply("Stop", "additionalContext", json!(reason))));
     }
+    hooks::append(state, session, &json!({ "kind": "nudged" }))?;
     let context = format!(
-        "rkb: this session had {}. If one taught something durable, record it with `rkb add`; otherwise ignore this note.",
+        "rkb: this session had {}. If one taught something durable, record it. {ask} Otherwise ignore this note.",
         parts.join(", ")
     );
-    hooks::append(state, session, &json!({ "kind": "offered", "upto": records.len() }))?;
-    hooks::append(state, session, &json!({ "kind": "nudged" }))?;
     Ok(Some(reply("Stop", "additionalContext", json!(context))))
 }

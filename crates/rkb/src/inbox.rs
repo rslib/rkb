@@ -20,13 +20,14 @@ fn row(i: &Item, now: u64) -> Value {
     json!({
         "id": i.id,
         "kind": i.meta.kind.as_str(),
+        "priority": i.meta.priority(),
         "age": age(now.saturating_sub(i.meta.time)),
         "lines": i.body.lines().count(),
         "preview": i.preview(),
     })
 }
 
-pub fn note(env: &Env, words: Vec<String>) -> Result<Output, CliError> {
+pub fn note(env: &Env, words: Vec<String>, priority: Option<u8>) -> Result<Output, CliError> {
     let mut text = words.join(" ");
     if text.trim().is_empty() && !std::io::stdin().is_terminal() {
         std::io::stdin()
@@ -36,7 +37,16 @@ pub fn note(env: &Env, words: Vec<String>) -> Result<Output, CliError> {
     if text.trim().is_empty() {
         return Err(CliError::new(ErrorCode::Usage, "the note is empty", "run `rkb note \"<what you found>\"`"));
     }
-    let meta = Meta { kind: Kind::Note, time: request::now(), harness: None, session: None, cwd: None, signals: vec![] };
+    let meta = Meta {
+        kind: Kind::Note,
+        time: request::now(),
+        harness: None,
+        session: rkb_core::usage::env_session(),
+        cwd: None,
+        signals: vec![],
+        priority: priority.map(|p| p.clamp(1, 3)),
+        source: None,
+    };
     let item = distill::add(&env.state, meta, &text)?;
     let human = format!("noted {} in the inbox; `/rkb-distill` turns inbox items into lessons", item.id);
     Ok(Output { data: json!({ "id": item.id, "help": ["Run `rkb inbox` to list the inbox"] }), human, exit: 0, raw: false })
