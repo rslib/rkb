@@ -201,10 +201,160 @@ fn note_labels(text: &str) -> BTreeMap<String, String> {
 }
 
 pub(crate) fn effective(snap: &Snapshot, path: &str, own: &Mapping) -> BTreeMap<String, String> {
-    let notes: Vec<BTreeMap<String, String>> =
-        note_chain(path).iter().filter_map(|n| snap.files.get(n)).map(|d| note_labels(&String::from_utf8_lossy(d))).collect();
+    effective_with(snap, path, own, None)
+}
+
+/// Like `effective`, with the note at `.0` read as the text `.1` instead of the file.
+fn effective_with(snap: &Snapshot, path: &str, own: &Mapping, note: Option<(&str, &str)>) -> BTreeMap<String, String> {
+    let notes: Vec<BTreeMap<String, String>> = note_chain(path)
+        .iter()
+        .filter_map(|n| match note {
+            Some((p, text)) if p == n => Some(note_labels(text)),
+            _ => snap.files.get(n).map(|d| note_labels(&String::from_utf8_lossy(d))),
+        })
+        .collect();
     let refs: Vec<&BTreeMap<String, String>> = notes.iter().collect();
     config::effective_labels(own, &refs)
+}
+
+/// Whether the lesson at `path` or a folder note above it sets `key`, rather than the default.
+pub(crate) fn labeled(snap: &Snapshot, path: &str, own: &Mapping, key: &str) -> bool {
+    own.contains_key(key)
+        || note_chain(path).iter().filter_map(|n| snap.files.get(n)).any(|d| note_labels(&String::from_utf8_lossy(d)).contains_key(key))
+}
+
+/// A folder's own labels, its effective labels, and how many current lessons under it have each
+/// effective `key=value`. Reads only.
+pub fn folder_labels(root: &Path, folder: &str) -> Result<FolderLabels> {
+    let folder = folder.trim_end_matches('/');
+    if folder.is_empty() || !root.join(folder).is_dir() {
+        return Err(Error::NoFolder(folder.to_string()));
+    }
+    let snap = Snapshot::from_dir(root)?;
+    let own = snap.files.get(&format!("{folder}/README.md")).map(|d| note_labels(&String::from_utf8_lossy(d))).unwrap_or_default();
+    let effective = effective(&snap, &format!("{folder}/x.md"), &Mapping::new());
+    let mut lessons: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let (all, _) = snap.lessons();
+    for l in all.iter().filter(|l| l.frontmatter.status.is_current() && l.path.starts_with(&format!("{folder}/"))) {
+        for kv in effective_of(&snap, l, None) {
+            *lessons.entry(kv).or_default() += 1;
+        }
+    }
+    Ok(FolderLabels { folder: folder.to_string(), own, effective, lessons })
+}
+
+pub struct FolderLabels {
+    pub folder: String,
+    pub own: BTreeMap<String, String>,
+    pub effective: BTreeMap<String, String>,
+    /// Current lessons under the folder per effective `(key, value)`.
+    pub lessons: BTreeMap<(String, String), usize>,
+}
+
+fn effective_of(snap: &Snapshot, l: &Lesson, note: Option<(&str, &str)>) -> BTreeMap<String, String> {
+    effective_with(snap, &l.path, &l.frontmatter.labels, note)
+}
+
+/// The note text with `labels.<key>` set to `value`, or removed for `None`. The other keys stay; the
+/// body stays byte for byte. A note without frontmatter gets one; a missing note gets `# <folder name>`.
+fn with_label(text: Option<&str>, folder: &str, key: &str, value: Option<&str>) -> Result<String> {
+    let name = folder.rsplit('/').next().unwrap_or(folder);
+    let (mut fm, body) = match text {
+        None => (Mapping::new(), format!("\n# {name}\n")),
+        Some(t) => match config::note_frontmatter(t) {
+            Some(raw) => {
+                let (_, body, _) = lesson::split(t).map_err(|e| refused(format!("{folder}/README.md: {}", e.message)))?;
+                let fm = if raw.trim().is_empty() {
+                    Mapping::new()
+                } else {
+                    serde_norway::from_str(raw).map_err(|e| refused(format!("{folder}/README.md: frontmatter: {e}")))?
+                };
+                (fm, body.to_string())
+            }
+            None => (Mapping::new(), t.to_string()),
+        },
+    };
+    let mut labels = match fm.remove("labels") {
+        Some(Value::Mapping(m)) => m,
+        _ => Mapping::new(),
+    };
+    match value {
+        Some(v) => {
+            labels.insert(key.into(), v.into());
+        }
+        None => {
+            labels.remove(key);
+        }
+    }
+    if !labels.is_empty() {
+        fm.insert("labels".into(), Value::Mapping(labels));
+    }
+    if fm.is_empty() {
+        return Ok(body.trim_start_matches('\n').to_string());
+    }
+    Ok(format!("---\n{}---\n{body}", crate::yaml::block(&Value::Mapping(fm))))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn label(
+    ctx: &Ctx,
+    kb: &KbConfig,
+    snap: &Snapshot,
+    action: &Action,
+    approved: &[Decision],
+    folder: &str,
+    key: &str,
+    value: Option<&str>,
+) -> Result<Step> {
+    let folder = folder.trim_end_matches('/');
+    let Some(allowed) = kb.labels.get(key) else {
+        let keys: Vec<&String> = kb.labels.keys().collect();
+        return Err(refused(format!(
+            "`{key}` is not a label in kb.toml; the labels are: {}",
+            keys.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
+        )));
+    };
+    if let Some(v) = value
+        && !allowed.iter().any(|a| a == v)
+    {
+        return Err(refused(format!("`{v}` is not a value of {key}; kb.toml allows: {}", allowed.join(", "))));
+    }
+    if folder.is_empty() || folder.starts_with('.') || folder.split('/').any(|p| p == "..") || !ctx.root.join(folder).is_dir() {
+        return Err(Error::NoFolder(folder.to_string()));
+    }
+    let note = format!("{folder}/README.md");
+    let old = snap.files.get(&note).map(|d| String::from_utf8_lossy(d).into_owned());
+    let text = with_label(old.as_deref(), folder, key, value)?;
+    if old.as_deref() == Some(text.as_str()) || (old.is_none() && value.is_none()) {
+        return Ok(Err(Outcome::Unchanged { id: String::new(), path: note }));
+    }
+    let (lessons, _) = snap.lessons();
+    let mut loosened: Option<(String, String, String)> = None;
+    let mut count = 0;
+    for l in lessons.iter().filter(|l| l.frontmatter.status.is_current() && l.path.starts_with(&format!("{folder}/"))) {
+        let before = effective_of(snap, l, None);
+        if let Some((k, v)) = looser(kb, &before, &effective_of(snap, l, Some((&note, &text)))) {
+            count += 1;
+            loosened.get_or_insert((k.clone(), before.get(&k).cloned().unwrap_or_default(), v));
+        }
+    }
+    if let Some((k, from, to)) = loosened
+        && !approved.contains(&Decision::Loosen { key: k.clone(), value: to.clone() })
+    {
+        let question = format!("This makes label {k} looser, from `{from}` to `{to}`, for {count} lesson(s) under {folder}. Allow it?");
+        let choices = vec![Choice { text: format!("loosen {k} to {to}"), decision: Some(Decision::Loosen { key: k, value: to }) }];
+        return ask(action, approved, question, choices).map(Err);
+    }
+    Ok(Ok(Prepared {
+        kind: "label",
+        id: String::new(),
+        path: note,
+        title: folder.to_string(),
+        text,
+        extra: vec![],
+        notes: vec![],
+        message: Some(format!("label({folder}): {key} {}", value.unwrap_or("unset"))),
+    }))
 }
 
 /// The first label that becomes looser: an earlier value in that key's list in `kb.toml`.
@@ -270,6 +420,7 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
         Action::Supersede { id, by, reason } => supersede(&snap, id, by, reason)?,
         Action::Archive { target, reason } => archive(ctx, &snap, action, approved, target, reason)?,
         Action::Unarchive { id } => unarchive(&snap, id)?,
+        Action::Label { folder, key, value } => label(ctx, &kb, &snap, action, approved, folder, key, value.as_deref())?,
         Action::Move { id, folder } => return saved(ctx, relocate(ctx, snap, approved, id, Some(folder), None)?),
         Action::Rename { id, slug } => return saved(ctx, relocate(ctx, snap, approved, id, None, Some(slug))?),
         Action::BreakLock { .. }
@@ -1191,6 +1342,25 @@ pub(crate) fn finish(ctx: &Ctx, mut snap: Snapshot, p: Prepared) -> Result<Outco
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_edits_only_the_labels() {
+        let project = "---\nremotes:\n  - github.com/llnl/rait\nroot_commit: a1b2c3\n---\n\n# rait\n\nKeep  this   body.\n";
+        let out = with_label(Some(project), "projects/rait", "sensitivity", Some("public")).unwrap();
+        assert_eq!(
+            out,
+            "---\nremotes:\n  - github.com/llnl/rait\nroot_commit: a1b2c3\nlabels:\n  sensitivity: public\n---\n\n# rait\n\nKeep  this   body.\n"
+        );
+        assert_eq!(with_label(Some(&out), "projects/rait", "sensitivity", None).unwrap(), project, "unset gives the note back");
+        assert_eq!(
+            with_label(Some("# Rust\n\nNotes.\n"), "general/rust", "sensitivity", Some("internal")).unwrap(),
+            "---\nlabels:\n  sensitivity: internal\n---\n# Rust\n\nNotes.\n"
+        );
+        assert_eq!(
+            with_label(None, "projects/rait", "sensitivity", Some("public")).unwrap(),
+            "---\nlabels:\n  sensitivity: public\n---\n\n# rait\n"
+        );
+    }
 
     #[test]
     fn grace_expires_and_has_a_commit_budget() {

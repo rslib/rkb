@@ -313,6 +313,18 @@ enum Cmd {
     /// Bring an archived lesson back into search.
     #[command(after_help = "Example:\n  rkb unarchive 7f3a9c2b41")]
     Unarchive { id: String },
+    /// Show or set a folder's labels, kept in its README.md; every lesson under it without its own label takes them.
+    #[command(
+        after_help = "Example:\n  rkb label projects/rait\n  rkb label projects/rait sensitivity=public\n  rkb label projects/rait sensitivity --unset"
+    )]
+    Label {
+        folder: String,
+        /// `key=value` to set, or `key` with --unset. Without it, show the labels.
+        assignment: Option<String>,
+        /// Remove the key from the folder note.
+        #[arg(long, requires = "assignment")]
+        unset: bool,
+    },
     /// Record that you applied a lesson and whether it worked.
     #[command(
         after_help = "Example:\n  rkb used 7f3a9c2b41 --worked\n  rkb used 7f3a9c2b41 --failed --reason \"still fails on 1.14.3\"\n  rkb used 7f3a9c2b41 --irrelevant --reason \"about pi events, not sed\"",
@@ -750,6 +762,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             Ok(writes::outcome(&env, o))
         }
         Cmd::Unarchive { id } => writes::lifecycle(&env, rkb_core::request::Action::Unarchive { id }),
+        Cmd::Label { folder, assignment, unset } => writes::label(&env, folder, assignment, unset),
         Cmd::Used { id, failed, irrelevant, reason, session, .. } => {
             let result = if failed {
                 "failed"

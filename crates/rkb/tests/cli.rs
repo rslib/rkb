@@ -3455,6 +3455,69 @@ fn site_build_publishes_only_allowed_lessons() {
     assert!(notes.contains("internal lessons were left out; set SITE_PASSWORD"), "{v}");
 }
 
+/// Adds `projects/rait` with a note that has no labels and one unlabeled lesson, committed.
+fn with_rait(env: &Env) {
+    env.write("projects/rait/README.md", "---\nremotes:\n  - github.com/example/rait\n---\n\n# rait\n");
+    let src = std::fs::read_to_string(env.kb().join("general/git/shallow-clones-break-git-describe.md")).unwrap();
+    env.write("projects/rait/git/shallow-clones.md", &src.replace("id: 1a00000004", "id: 1a000000aa"));
+    env.git(&["add", "-A"]);
+    assert!(env.git(&["-c", "user.name=T", "-c", "user.email=t@example.org", "commit", "-qm", "rait"]).status.success());
+}
+
+#[test]
+fn folder_labels_show_set_and_ask() {
+    let env = search_kb();
+    env.trust_claude();
+    with_rait(&env);
+    let (v, code) = env.json(&["label", "projects/rait"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!((v["own"].clone(), v["effective"]["sensitivity"].as_str()), (serde_json::json!({}), Some("internal")), "{v}");
+    assert_eq!(v["lessons"], serde_json::json!([{ "key": "sensitivity", "value": "internal", "count": 1 }]), "{v}");
+
+    let before = commit_count(&env);
+    let (v, code) = env.json(&["label", "projects/rait", "sensitivity=public"], "");
+    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{v}");
+    assert_eq!(v["options"][0], "loosen sensitivity to public", "{v}");
+    assert!(v["question"].as_str().unwrap().contains("1 lesson(s) under projects/rait"), "{v}");
+    assert_eq!(commit_count(&env), before);
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("CLAUDECODE", "1");
+    let o = rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", "loosen sensitivity to public", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["status"], "written", "{v}");
+    let note = std::fs::read_to_string(env.kb().join("projects/rait/README.md")).unwrap();
+    assert_eq!(note, "---\nremotes:\n  - github.com/example/rait\nlabels:\n  sensitivity: public\n---\n\n# rait\n");
+    assert_eq!(stdout(&env.git(&["log", "-1", "--format=%s"])).trim(), "label(projects/rait): sensitivity public");
+
+    let (v, _) = env.json(&["label", "projects/rait", "sensitivity=internal"], "");
+    assert_eq!(v["status"], "written", "stricter writes at once: {v}");
+    let (v, _) = env.json(&["label", "projects/rait", "sensitivity", "--unset"], "");
+    assert_eq!(v["status"], "written", "back to the default, which is not looser: {v}");
+    assert_eq!(stdout(&env.git(&["log", "-1", "--format=%s"])).trim(), "label(projects/rait): sensitivity unset");
+    assert!(!std::fs::read_to_string(env.kb().join("projects/rait/README.md")).unwrap().contains("labels"));
+
+    let (v, code) = env.json(&["label", "general", "sensitivity=secret"], "");
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("refused"), Some(1)), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("public, internal, confidential"), "{v}");
+    let (v, _) = env.json(&["label", "no/such", "sensitivity=internal"], "");
+    assert_eq!(v["error"]["code"], "not_found", "{v}");
+    assert_eq!(env.rkb(&["label", "general", "sensitivity=public", "--unset"]).status.code(), Some(2));
+}
+
+#[test]
+fn site_names_folders_that_are_internal_by_default() {
+    let env = site_kb();
+    with_rait(&env);
+    let out = env.dir.path().join("out");
+    let v = site_built(&env, out.to_str().unwrap());
+    let notes = v["notes"].to_string();
+    assert!(
+        notes.contains("1 lesson(s) in projects/rait are internal by default")
+            && notes.contains("run `rkb label projects/rait sensitivity=public`"),
+        "{v}"
+    );
+}
+
 const PASSWORD: &str = "correct-horse-battery-staple";
 
 #[test]

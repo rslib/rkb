@@ -55,6 +55,12 @@ pub enum Action {
         id: String,
         slug: String,
     },
+    /// Set (`value`) or remove (`None`) `labels.<key>` in the folder note `<folder>/README.md`.
+    Label {
+        folder: String,
+        key: String,
+        value: Option<String>,
+    },
     /// Approve a lesson's script on this system; with `then_verify`, run the check right after.
     Approve {
         id: String,

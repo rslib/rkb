@@ -79,7 +79,8 @@ pub fn outcome(env: &Env, o: Outcome) -> Output {
             } else {
                 w.diff.trim_end().to_string()
             };
-            let mut human = format!("{} {} [{}] in commit {}\n\n{diff}", paint(env.colored, "32", w.kind), w.path, w.id, w.commit);
+            let id = if w.id.is_empty() { String::new() } else { format!(" [{}]", w.id) };
+            let mut human = format!("{} {}{id} in commit {}\n\n{diff}", paint(env.colored, "32", w.kind), w.path, w.commit);
             for n in &w.notes {
                 human.push_str(&format!("\n{} {}", paint(env.colored, "33", "note:"), n.message()));
             }
@@ -92,7 +93,7 @@ pub fn outcome(env: &Env, o: Outcome) -> Output {
                 "commit": w.commit,
                 "diff": diff.lines().collect::<Vec<_>>(),
                 "notes": w.notes.iter().map(|n| n.message()).collect::<Vec<_>>(),
-                "help": [format!("Run `rkb show {}` to read the lesson", w.id)],
+                "help": [if w.id.is_empty() { format!("Run `rkb label {}` to see its labels", w.title) } else { format!("Run `rkb show {}` to read the lesson", w.id) }],
             });
             Output { data, human, exit: 0, raw: false }
         }
@@ -250,6 +251,42 @@ pub fn flag(env: &Env, id: String, reason: String) -> Result<Output, CliError> {
     kb::open(&env.root)?;
     let o = write::apply(&env.ctx(), &Action::Flag { id, reason }, &[])?;
     Ok(outcome(env, o))
+}
+
+/// `rkb label <folder> [key=value | key --unset]`; with no assignment it shows the labels and writes nothing.
+pub fn label(env: &Env, folder: String, assignment: Option<String>, unset: bool) -> Result<Output, CliError> {
+    kb::open(&env.root)?;
+    let Some(a) = assignment else {
+        let f = write::folder_labels(&env.root, &folder)?;
+        let kv = |m: &std::collections::BTreeMap<String, String>| m.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ");
+        let mut human = format!(
+            "{}\n  own:       {}\n  effective: {}",
+            paint(env.colored, "1", &f.folder),
+            if f.own.is_empty() { "none".to_string() } else { kv(&f.own) },
+            kv(&f.effective)
+        );
+        for ((k, v), n) in &f.lessons {
+            human.push_str(&format!("\n  {n} lesson(s) with {k}={v}"));
+        }
+        let data = json!({
+            "folder": f.folder,
+            "own": f.own,
+            "effective": f.effective,
+            "lessons": f.lessons.iter().map(|((k, v), n)| json!({ "key": k, "value": v, "count": n })).collect::<Vec<_>>(),
+        });
+        return Ok(Output { data, human, exit: 0, raw: false });
+    };
+    let (key, value) = match (a.split_once('='), unset) {
+        (Some((k, v)), false) => (k.trim().to_string(), Some(v.trim().to_string())),
+        (None, true) => (a.trim().to_string(), None),
+        _ => {
+            return Err(usage_error(
+                "give `key=value` to set a label, or `key --unset` to remove it",
+                &format!("label {folder} sensitivity=public"),
+            ));
+        }
+    };
+    Ok(outcome(env, write::apply(&env.ctx(), &Action::Label { folder, key, value }, &[])?))
 }
 
 pub fn lifecycle(env: &Env, action: Action) -> Result<Output, CliError> {

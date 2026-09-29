@@ -48,7 +48,19 @@ pub struct Site {
     pub left_out: BTreeMap<String, usize>,
     /// Lessons held back: the held ids given to `collect_holding` and the lessons that link to them.
     pub held: Vec<String>,
+    /// Lessons left out or encrypted only because no label set their sensitivity, by project, system
+    /// or scope folder, so the build can name `rkb label <folder>`.
+    pub defaulted: BTreeMap<String, usize>,
     pub index: Value,
+}
+
+/// The folder a label for `path` belongs on: `projects/<p>`, `systems/<s>`, or the scope, such as `general`.
+fn label_folder(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').collect();
+    match parts.as_slice() {
+        ["projects" | "systems", name, _, ..] => format!("{}/{name}", parts[0]),
+        _ => parts[0].to_string(),
+    }
 }
 
 /// The record of first publications, in the knowledge base so every machine and CI share it.
@@ -182,6 +194,7 @@ pub fn collect_holding(root: &Path, usable: impl Fn(&str) -> bool, held: &BTreeS
     let (mut lessons, _) = snap.lessons();
     lessons.sort_by(|a, b| a.path.cmp(&b.path));
     let mut left_out: BTreeMap<String, usize> = BTreeMap::new();
+    let mut defaulted: BTreeMap<String, usize> = BTreeMap::new();
     let mut passwords: Vec<Option<String>> = vec![];
     let mut kinds: Vec<Option<Kind>> = lessons
         .iter()
@@ -195,6 +208,9 @@ pub fn collect_holding(root: &Path, usable: impl Fn(&str) -> bool, held: &BTreeS
             }
             if public && group.is_none() {
                 return Some(Kind::Public);
+            }
+            if !crate::write::labeled(&snap, &l.path, &l.frontmatter.labels, "sensitivity") {
+                *defaulted.entry(label_folder(&l.path)).or_default() += 1;
             }
             if !public && !protectable {
                 return None;
@@ -237,7 +253,8 @@ pub fn collect_holding(root: &Path, usable: impl Fn(&str) -> bool, held: &BTreeS
     }
     let index = index(&g, &kinds, &passwords, &kb.site, &snap.files);
     let held: Vec<String> = dropped.iter().map(|&i| g.lessons[i].frontmatter.id.clone()).collect();
-    let mut site = Site { files: vec![], ids: vec![], protected: vec![], groups: BTreeMap::new(), secrets: vec![], left_out, held, index };
+    let mut site =
+        Site { files: vec![], ids: vec![], protected: vec![], groups: BTreeMap::new(), secrets: vec![], left_out, held, defaulted, index };
     for ((l, kind), group) in g.lessons.iter().zip(&kinds).zip(&passwords) {
         let Some(kind) = *kind else { continue };
         site.files.push((format!("{}/{}", folder(kind), l.path), snap.files[&l.path].clone()));

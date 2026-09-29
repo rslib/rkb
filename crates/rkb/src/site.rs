@@ -563,6 +563,11 @@ pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approv
         let what = if var == "SITE_PASSWORD" { "internal lessons" } else { "lessons" };
         notes.push(format!("{n} {what} were left out; set {var} ({MIN_PASSWORD}+ characters) to publish them encrypted"));
     }
+    for (folder, n) in &s.defaulted {
+        notes.push(format!(
+            "{n} lesson(s) in {folder} are internal by default: neither they nor a folder above them set sensitivity. If they should be public, run `rkb label {folder} sensitivity=public`"
+        ));
+    }
     notes.extend(held_note);
     // Under GitHub Actions the notes also show as warnings on the run.
     if std::env::var("GITHUB_ACTIONS").is_ok_and(|v| v == "true") {
