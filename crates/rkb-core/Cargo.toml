@@ -1,10 +1,15 @@
 [package]
 name = "rkb-core"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+
+# Released with the rkb binary; only rkb is tagged.
+[package.metadata.release]
+tag = false
 [dependencies]
 serde.workspace = true
 serde_norway.workspace = true

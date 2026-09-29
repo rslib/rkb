@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [trunk]
+  pull_request:
+    branches: [trunk]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep equal to RS_WEB_VERSION in crates/rkb/src/site.rs; the `pins` job checks it.
+  RS_WEB_VERSION: "0.4.3"
+
+jobs:
+  pins:
+    name: Pinned versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: rs-web version matches the source
+        run: |
+          src=$(sed -n 's/^pub const RS_WEB_VERSION: &str = "\(.*\)";/\1/p' crates/rkb/src/site.rs)
+          if [ "$src" != "$RS_WEB_VERSION" ]; then
+            echo "RS_WEB_VERSION is $RS_WEB_VERSION here but $src in crates/rkb/src/site.rs"
+            exit 1
+          fi
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install rs-web
+        if: runner.os == 'Linux'
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: rs-web
+          version: ${{ env.RS_WEB_VERSION }}
+          locked: true
+      - name: Test
+        run: |
+          if command -v rs-web >/dev/null; then
+            RKB_TEST_RS_WEB="$(command -v rs-web)"
+            export RKB_TEST_RS_WEB
+          fi
+          cargo test --all-targets
