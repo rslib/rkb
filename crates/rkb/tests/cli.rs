@@ -45,7 +45,10 @@ impl Env {
             .env_remove("GIT_AUTHOR_NAME")
             .env_remove("GIT_AUTHOR_EMAIL")
             .env_remove("GIT_COMMITTER_NAME")
-            .env_remove("GIT_COMMITTER_EMAIL");
+            .env_remove("GIT_COMMITTER_EMAIL")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("PI_SESSION_ID")
+            .env_remove("RKB_SESSION");
         c
     }
 
@@ -637,8 +640,13 @@ fn write_burst_asks_before_flooding() {
     env.write("kb.toml", &toml);
     add_ok(&env, "cmake", &lesson_with("First lesson of the burst"));
     let before = commit_count(&env);
-    let (v, code) = env.json(&["add", "--topic", "cmake"], &lesson_with("Second lesson of the burst"));
-    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "3 commits in the last hour > 2: {v}");
+    let add_as = |session: &str, title: &str| -> serde_json::Value {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.env("RKB_SESSION", session);
+        serde_json::from_slice(&rkb_with(c, &["add", "--topic", "cmake", "--format", "json"], &lesson_with(title)).stdout).unwrap()
+    };
+    let v = add_as("s1", "Second lesson of the burst");
+    assert_eq!(v["status"].as_str(), Some("needs_user"), "3 commits in the last hour > 2: {v}");
     assert!(v["question"].as_str().unwrap().contains("may be looping"), "{v}");
     assert_eq!(commit_count(&env), before, "nothing written");
     let (bad, _) = env.json(&["flag", "0000000000", "--reason", "x"], "");
@@ -648,6 +656,24 @@ fn write_burst_asks_before_flooding() {
     let o = rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", "continue", "--format", "json"], "");
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["status"], "written", "{v}");
+
+    assert_eq!(add_as("s2", "Other session in the burst")["status"], "needs_user", "the window is s1's");
+    for t in ["Grace window lesson one", "Grace window lesson two", "Grace window lesson three"] {
+        assert_eq!(add_as("s1", t)["status"], "written", "one continue covers s1's next writes");
+    }
+    assert_eq!(add_as("s1", "Grace window lesson four")["status"], "needs_user", "3 commits since the continue > 2: a loop");
+    let grace = env.dir.path().join("state/rkb/burst-grace.json");
+    assert_eq!(std::fs::read_to_string(&grace).unwrap(), "{}", "the window closed");
+
+    let head = stdout(&env.git(&["rev-parse", "HEAD"])).trim().to_string();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let window = |until: u64| serde_json::json!({ "s1": { "until": until, "head": head } }).to_string();
+    std::fs::write(&grace, window(now - 60)).unwrap();
+    assert_eq!(add_as("s1", "After the window ended")["status"], "needs_user", "an expired window asks");
+    std::fs::write(&grace, window(now + 300)).unwrap();
+    let (v, _) = env.json(&["doctor"], "");
+    let line = v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "burst grace").cloned().unwrap();
+    assert!(line["detail"].as_str().unwrap().starts_with("session s1 until "), "{line}");
 }
 
 #[test]

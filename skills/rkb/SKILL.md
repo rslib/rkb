@@ -47,7 +47,7 @@ Never write or change a lesson file with your own tools. rkb checks it, places i
 
 ## When rkb needs the user
 
-You may write, edit, merge, supersede and archive single lessons without asking: every write is checked, is one git commit, and `rkb changes` shows the user what agents did. Some decisions still belong to the user: a looser label (it can make a lesson public), a first publication to the web, running a script, archiving a whole folder, installing, breaking a lock, and continuing after many writes in one hour. When rkb says a new topic folder is close to an existing one, move the lesson there with `rkb move` if it belongs there. Then rkb writes nothing, exits with code 3 and prints `status: needs_user` with a `question`, `options` and a `next` command.
+You may write, edit, merge, supersede and archive single lessons without asking: every write is checked, is one git commit, and `rkb changes` shows the user what agents did. Some decisions still belong to the user: a looser label (it can make a lesson public), a first publication to the web, running a script, archiving a whole folder, installing, breaking a lock, and continuing after many writes in one hour (one `continue` covers that session's writes for about 10 minutes). When rkb says a new topic folder is close to an existing one, move the lesson there with `rkb move` if it belongs there. Then rkb writes nothing, exits with code 3 and prints `status: needs_user` with a `question`, `options` and a `next` command.
 
 1. Show the question and the options to the user. Do not choose for them.
 2. Wait for their answer.

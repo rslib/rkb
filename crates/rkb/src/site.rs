@@ -530,6 +530,7 @@ pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approv
                 Choice { text: "publish".into(), decision: Some(Decision::Publish) },
                 Choice { text: "cancel".into(), decision: None },
             ],
+            session: None,
         };
         request::save(&env.state.join("requests"), &req)?;
         return Ok(writes::needs_user_output(env, &req));

@@ -71,6 +71,7 @@ pub fn approve_request(ctx: &Ctx, id: &str, kind: Kind, then_verify: bool) -> Re
             Choice { text: format!("approve {id} {}", kind.name()), decision: Some(Decision::Approve) },
             Choice { text: "cancel".into(), decision: None },
         ],
+        session: None,
     };
     request::save(&ctx.state.join("requests"), &req)?;
     Ok(Some(req))
@@ -104,6 +105,7 @@ pub fn approve_fact_request(ctx: &Ctx, key: &str) -> Result<Option<Request>> {
             Choice { text: format!("approve facts.{key}"), decision: Some(Decision::Approve) },
             Choice { text: "cancel".into(), decision: None },
         ],
+        session: None,
     };
     request::save(&ctx.state.join("requests"), &req)?;
     Ok(Some(req))

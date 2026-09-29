@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use jiff::civil::Date;
+use serde::{Deserialize, Serialize};
 use serde_norway::{Mapping, Value};
 use sha2::{Digest, Sha256};
 
@@ -226,8 +227,15 @@ fn refused(msg: impl Into<String>) -> Error {
 
 fn ask(action: &Action, approved: &[Decision], question: String, mut choices: Vec<Choice>) -> Result<Outcome> {
     choices.push(Choice { text: "cancel".into(), decision: None });
-    let req =
-        Request { id: request::new_id(), created: request::now(), action: action.clone(), approved: approved.to_vec(), question, choices };
+    let req = Request {
+        id: request::new_id(),
+        created: request::now(),
+        action: action.clone(),
+        approved: approved.to_vec(),
+        question,
+        choices,
+        session: crate::usage::env_session(),
+    };
     Ok(Outcome::NeedsUser(req))
 }
 
@@ -250,7 +258,7 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
     let kb: KbConfig = std::fs::read_to_string(ctx.root.join("kb.toml")).ok().and_then(|t| config::parse(&t).ok()).unwrap_or_default();
     let _lock = kb_lock(ctx.root, &kb)?;
     if matches!(action, Action::Move { .. } | Action::Rename { .. })
-        && let Some(step) = burst(ctx.root, &kb, action, approved)?
+        && let Some(step) = burst(ctx, &kb, action, approved)?
     {
         return saved(ctx, step);
     }
@@ -282,7 +290,7 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
     if !blocking.is_empty() {
         return Err(Error::Invalid(blocking));
     }
-    if let Some(step) = burst(ctx.root, &kb, action, approved)? {
+    if let Some(step) = burst(ctx, &kb, action, approved)? {
         return saved(ctx, step);
     }
     finish(ctx, snap, p)
@@ -293,22 +301,84 @@ pub const DEFAULT_BURST: i64 = 30;
 
 /// Asks before a write when the knowledge base had more than `writes.burst` commits in the last hour,
 /// so an agent stuck in a loop cannot flood it. Agents write freely otherwise.
-fn burst(root: &Path, kb: &KbConfig, action: &Action, approved: &[Decision]) -> Result<Option<Outcome>> {
+fn burst(ctx: &Ctx, kb: &KbConfig, action: &Action, approved: &[Decision]) -> Result<Option<Outcome>> {
     if approved.contains(&Decision::Continue) {
         return Ok(None);
     }
-    let limit = kb.writes.as_ref().and_then(|t| t.get("burst")).and_then(|v| v.as_integer()).unwrap_or(DEFAULT_BURST);
-    let count: i64 = git::run(root, &["rev-list", "--count", "--since=1.hour", "HEAD"])
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o).trim().parse().ok())
-        .unwrap_or(0);
-    if count <= limit {
+    let limit = burst_limit(kb);
+    let count = commit_count(ctx.root, &["--since=1.hour", "HEAD"]);
+    if count <= limit || in_grace(ctx.state, ctx.root, limit, &grace_key(crate::usage::env_session())) {
         return Ok(None);
     }
     let question = format!(
         "The knowledge base had {count} commits in the last hour, more than writes.burst ({limit}). An agent may be looping. Write this change anyway?"
     );
     ask(action, approved, question, vec![Choice { text: "continue".into(), decision: Some(Decision::Continue) }]).map(Some)
+}
+
+fn burst_limit(kb: &KbConfig) -> i64 {
+    kb.writes.as_ref().and_then(|t| t.get("burst")).and_then(|v| v.as_integer()).unwrap_or(DEFAULT_BURST)
+}
+
+fn commit_count(root: &Path, range: &[&str]) -> i64 {
+    let args: Vec<&str> = ["rev-list", "--count"].into_iter().chain(range.iter().copied()).collect();
+    git::run(root, &args).ok().and_then(|o| String::from_utf8_lossy(&o).trim().parse().ok()).unwrap_or(0)
+}
+
+/// Minutes a `continue` on the burst question covers that session's writes (`writes.burst_grace_minutes`).
+pub const DEFAULT_BURST_GRACE_MINUTES: i64 = 10;
+const GRACE_FILE: &str = "burst-grace.json";
+
+/// A session's burst grace window: open until `until`, and only while the session made at most
+/// `writes.burst` commits after `head`, the commit at the user's `continue`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Grace {
+    pub until: u64,
+    pub head: String,
+}
+
+/// The grace key of a session; without a harness session it is this machine, so a person at a terminal gets one too.
+fn grace_key(session: Option<String>) -> String {
+    session.unwrap_or_else(|| "machine".into())
+}
+
+/// The open grace windows by session, without expired ones.
+pub fn graces(state: &Path) -> BTreeMap<String, Grace> {
+    let text = std::fs::read_to_string(state.join(GRACE_FILE)).unwrap_or_default();
+    let all: BTreeMap<String, Grace> = serde_json::from_str(&text).unwrap_or_default();
+    let now = request::now();
+    all.into_iter().filter(|(_, g)| g.until > now).collect()
+}
+
+fn save_graces(state: &Path, g: &BTreeMap<String, Grace>) -> Result<()> {
+    let path = state.join(GRACE_FILE);
+    std::fs::create_dir_all(state).map_err(io(state))?;
+    let tmp = state.join(format!(".{GRACE_FILE}.tmp"));
+    std::fs::write(&tmp, serde_json::to_string(g).expect("graces serialize")).map_err(io(&tmp))?;
+    std::fs::rename(&tmp, &path).map_err(io(&path))
+}
+
+/// Opens the grace window of `session` after the user answered `continue`.
+fn open_grace(ctx: &Ctx, kb: &KbConfig, session: Option<String>) -> Result<()> {
+    let minutes = kb.writes.as_ref().and_then(|t| t.get("burst_grace_minutes")).and_then(|v| v.as_integer());
+    let minutes = minutes.unwrap_or(DEFAULT_BURST_GRACE_MINUTES).max(0) as u64;
+    let head = git::run(ctx.root, &["rev-parse", "HEAD"]).map(|o| String::from_utf8_lossy(&o).trim().to_string())?;
+    let mut all = graces(ctx.state);
+    all.insert(grace_key(session), Grace { until: request::now() + minutes * 60, head });
+    save_graces(ctx.state, &all)
+}
+
+/// Whether `key` has an open window with at most `limit` commits since its `continue`. A window
+/// that used up its commits is closed, so a loop inside it is stopped.
+fn in_grace(state: &Path, root: &Path, limit: i64, key: &str) -> bool {
+    let mut all = graces(state);
+    let Some(g) = all.get(key) else { return false };
+    if commit_count(root, &[&format!("{}..HEAD", g.head)]) <= limit {
+        return true;
+    }
+    all.remove(key);
+    let _ = save_graces(state, &all);
+    false
 }
 
 /// Saves the request of a `NeedsUser` outcome, so `rkb confirm` can find it.
@@ -359,7 +429,12 @@ pub fn confirm(ctx: &Ctx, req: &Request, choice: &str) -> Result<Outcome> {
     }
     let mut approved = req.approved.clone();
     approved.push(decision.clone());
-    apply(ctx, &req.action, &approved)
+    let out = apply(ctx, &req.action, &approved)?;
+    if *decision == Decision::Continue {
+        let kb: KbConfig = std::fs::read_to_string(ctx.root.join("kb.toml")).ok().and_then(|t| config::parse(&t).ok()).unwrap_or_default();
+        open_grace(ctx, &kb, req.session.clone())?;
+    }
+    Ok(out)
 }
 
 fn find<'a>(lessons: &'a [Lesson], id: &str) -> Result<&'a Lesson> {
@@ -1116,6 +1191,28 @@ pub(crate) fn finish(ctx: &Ctx, mut snap: Snapshot, p: Prepared) -> Result<Outco
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grace_expires_and_has_a_commit_budget() {
+        let (repo, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let git =
+            |args: &[&str]| assert!(std::process::Command::new("git").args(args).current_dir(repo.path()).status().unwrap().success());
+        git(&["init", "-q"]);
+        let commit = |n: &str| git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", n]);
+        commit("a");
+        let head = String::from_utf8(git::run(repo.path(), &["rev-parse", "HEAD"]).unwrap()).unwrap().trim().to_string();
+        let now = request::now();
+        let g = |until: u64| Grace { until, head: head.clone() };
+        save_graces(state.path(), &[("s".to_string(), g(now + 600)), ("old".to_string(), g(now - 1))].into_iter().collect()).unwrap();
+        assert_eq!(graces(state.path()).keys().collect::<Vec<_>>(), ["s"], "expired windows are dropped");
+        assert!(!in_grace(state.path(), repo.path(), 2, "other"), "another session has no window");
+        commit("b");
+        commit("c");
+        assert!(in_grace(state.path(), repo.path(), 2, "s"), "2 commits since the continue");
+        commit("d");
+        assert!(!in_grace(state.path(), repo.path(), 2, "s"), "3 commits: a loop inside the window");
+        assert!(graces(state.path()).is_empty(), "and the window is closed");
+    }
 
     #[test]
     fn links_follow_a_move() {

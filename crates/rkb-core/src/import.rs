@@ -14,6 +14,7 @@ pub struct Invalid {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant, reason = "one per import")]
 pub enum Plan {
     /// Nothing was written and no request was made.
     Invalid(Vec<Invalid>),
@@ -164,8 +165,15 @@ pub fn plan(ctx: &Ctx, dir: &Path) -> Result<Plan> {
         choices.push(Choice { text: "import without duplicates".into(), decision: Some(Decision::SkipDuplicates) });
     }
     choices.push(Choice { text: "cancel".into(), decision: None });
-    let req =
-        Request { id: request::new_id(), created: request::now(), action: Action::Import { items }, approved: vec![], question, choices };
+    let req = Request {
+        id: request::new_id(),
+        created: request::now(),
+        action: Action::Import { items },
+        approved: vec![],
+        question,
+        choices,
+        session: None,
+    };
     request::save(&ctx.state.join("requests"), &req)?;
     Ok(Plan::Ready(req))
 }

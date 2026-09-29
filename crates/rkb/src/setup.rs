@@ -134,6 +134,7 @@ pub fn install(env: &Env, names: Vec<String>, list_only: bool, uninstall: bool) 
                 Choice { text: if uninstall { "uninstall".into() } else { "install".into() }, decision: Some(Decision::Install) },
                 Choice { text: "cancel".into(), decision: None },
             ],
+            session: None,
         };
         request::save(&env.state.join("requests"), &req)?;
         return Ok(needs_user_output(env, &req));

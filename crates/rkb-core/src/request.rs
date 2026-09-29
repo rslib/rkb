@@ -157,6 +157,9 @@ pub struct Request {
     pub approved: Vec<Decision>,
     pub question: String,
     pub choices: Vec<Choice>,
+    /// The harness session that asked, so a `continue` from another shell opens its burst grace window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 impl Request {
@@ -271,6 +274,7 @@ mod tests {
             approved: vec![Decision::AddAnyway],
             question: "q?".into(),
             choices: vec![Choice { text: "add anyway".into(), decision: Some(Decision::AddAnyway) }],
+            session: None,
         }
     }
 

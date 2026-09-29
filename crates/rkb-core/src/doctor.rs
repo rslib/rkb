@@ -94,6 +94,11 @@ pub fn run(root: &Path, place: &Place, state_dir: &Path, config_dir: &Path, env:
         kb_checks(root, place, state_dir, env, &mut out);
     }
     out.push(trust_check(config_dir));
+    for (session, g) in crate::write::graces(state_dir) {
+        let until =
+            jiff::Timestamp::from_second(g.until as i64).map(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string());
+        out.push(check("burst grace", Level::Ok, format!("session {session} until {}", until.unwrap_or_default()), None));
+    }
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
     out.extend(skill_checks(&home));
     out.extend(hook_checks(&home, state_dir));
@@ -402,6 +407,7 @@ pub fn break_lock_request(root: &Path, state_dir: &Path) -> Result<Option<Reques
             Choice { text: "break lock".into(), decision: Some(Decision::BreakLock) },
             Choice { text: "cancel".into(), decision: None },
         ],
+        session: None,
     };
     request::save(&state_dir.join("requests"), &req)?;
     Ok(Some(req))

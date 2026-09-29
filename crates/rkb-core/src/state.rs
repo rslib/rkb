@@ -74,6 +74,7 @@ mod tests {
             approved: vec![],
             question: "q".into(),
             choices: vec![],
+            session: None,
         };
         save(&state.path().join("requests"), &req(crate::request::now())).unwrap();
         save(&state.path().join("requests"), &req(0)).unwrap();
