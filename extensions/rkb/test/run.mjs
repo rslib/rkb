@@ -3,7 +3,7 @@
 // Env: XDG_STATE_HOME and RKB_HOME set up by the Rust test; RKB_KB is the knowledge base folder;
 // RKB_REQUEST and RKB_QUESTION name a stored request.
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 const [file, harness] = process.argv.slice(2);
@@ -96,6 +96,21 @@ assert.equal(inbox().length, before + 1, "nothing new at shutdown");
 const noFile = { ...ctx(), sessionManager: { getSessionId: () => session, getSessionFile: () => undefined } };
 await on("session_before_compact", {}, noFile);
 assert.equal(inbox().length, before + 1, "an ephemeral session is not forwarded");
+if (harness === "omp") {
+  // omp names the session file in its stop event; the hooks then find the transcript without the session manager.
+  await on("session_stop", { session_file: process.env.RKB_TRANSCRIPT, session_id: session, stop_hook_active: true });
+  await on("tool_result", { ...bash("ninja"), content: [{ type: "text", text: "boom\n\nCommand exited with code 1" }], isError: true });
+  await on("tool_result", { ...bash("ninja -j4"), content: [{ type: "text", text: "ok" }], isError: false });
+  const extracted = () => signals().filter((r) => r.kind === "extracted").length;
+  const marks = extracted();
+  await on("session_before_compact", {}, noFile);
+  assert.equal(extracted(), marks + 1, "the stop event's session file is read");
+  const other = { ...ctx(), sessionManager: { getSessionId: () => "someone-else", getSessionFile: () => undefined } };
+  await on("tool_result", { ...bash("ninja"), content: [{ type: "text", text: "boom\n\nCommand exited with code 1" }], isError: true }, other);
+  await on("tool_result", { ...bash("ninja -j4"), content: [{ type: "text", text: "ok" }], isError: false }, other);
+  await on("session_before_compact", {}, other);
+  assert.ok(!existsSync(`${process.env.XDG_STATE_HOME}/rkb/sessions/someone-else.jsonl`) || !readFileSync(`${process.env.XDG_STATE_HOME}/rkb/sessions/someone-else.jsonl`, "utf8").includes("extracted"), "another session never gets this session's file");
+}
 
 // The two commands send their prompts as user messages.
 assert.deepEqual(Object.keys(commands).sort(), ["rkb-distill", "rkb-retro"]);

@@ -52,6 +52,25 @@ pub fn note(env: &Env, words: Vec<String>, priority: Option<u8>) -> Result<Outpu
     Ok(Output { data: json!({ "id": item.id, "help": ["Run `rkb inbox` to list the inbox"] }), human, exit: 0, raw: false })
 }
 
+/// `rkb import --claude-memory [<dir>] [--file <f>]`: Claude Code memory as inbox notes, never lessons.
+/// `memory` is `None` without `--claude-memory`, `Some("")` for every memory folder, or one folder.
+pub fn import_claude(env: &Env, memory: Option<&str>, files: &[std::path::PathBuf]) -> Result<Output, CliError> {
+    let dirs = match memory {
+        None => vec![],
+        Some("") => distill::claude_memory_dirs(),
+        Some(d) => vec![std::path::PathBuf::from(d)],
+    };
+    let notes = distill::claude_notes(&dirs, files);
+    let (saved, skipped) = distill::import_notes(&env.state, &notes)?;
+    let human = format!("saved {saved} notes to the inbox; skipped {skipped} imported before. Distill turns them into lessons.");
+    Ok(Output {
+        data: json!({ "saved": saved, "skipped": skipped, "help": ["Run the distill command to turn the notes into lessons"] }),
+        human,
+        exit: 0,
+        raw: false,
+    })
+}
+
 pub fn list(env: &Env) -> Result<Output, CliError> {
     let now = request::now();
     let expired = distill::expire(&env.state, now);

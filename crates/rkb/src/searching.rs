@@ -120,10 +120,12 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options, only: Option<
         human.push_str(&format!("\n{}\n", paint(c, "2", &h)));
     }
 
+    let usage = rkb_core::usage::counts(&env.root);
     let rows: Vec<Value> = r
         .hits
         .iter()
         .map(|h| {
+            let u = usage.get(&h.id).cloned().unwrap_or_default();
             let mut row = json!({
                 "id": h.id,
                 "type": kind_name(h.kind),
@@ -131,6 +133,9 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options, only: Option<
                 "path": h.path,
                 "status": h.status.as_str(),
                 "applies": h.applies.as_str(),
+                "worked": u.worked,
+                "failed": u.failed,
+                "injected": u.injected,
             });
             if let Some(rel) = h.relevance {
                 row["relevance"] = json!(crate::output::score2(rel));

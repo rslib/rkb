@@ -22,6 +22,10 @@ fn fix(name: &str) -> String {
     format!("run `rkb tools --toon` to see the arguments of {name}")
 }
 
+fn strings(args: &Value, key: &str) -> Vec<String> {
+    args[key].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect()
+}
+
 fn text(args: &Value, key: &str) -> String {
     args[key].as_str().unwrap_or_default().to_string()
 }
@@ -42,7 +46,14 @@ fn run_tool(name: &str, args: &Value) -> Result<Output, CliError> {
         "rkb_note" => Cmd::Note { words: vec![text(args, "text")], priority: args["priority"].as_u64().map(|p| p.clamp(1, 3) as u8) },
         "rkb_add" => {
             let (topic, lesson) = tools::lesson(args).map_err(|m| CliError::new(ErrorCode::Usage, m, fix(name)))?;
-            Cmd::Add { topic: Some(topic), kind: None, template: false, text: Some(lesson), assets: vec![], from_inbox: None }
+            Cmd::Add {
+                topic: Some(topic),
+                kind: None,
+                template: false,
+                text: Some(lesson),
+                assets: strings(args, "assets"),
+                from_inbox: None,
+            }
         }
         "rkb_used" => Cmd::Used {
             id: text(args, "id"),
@@ -52,7 +63,12 @@ fn run_tool(name: &str, args: &Value) -> Result<Output, CliError> {
             session: None,
         },
         "rkb_flag" => Cmd::Flag { id: text(args, "id"), reason: text(args, "reason") },
-        "rkb_edit" => Cmd::Edit { id: text(args, "id"), base: Some(text(args, "base")), text: Some(text(args, "text")), assets: vec![] },
+        "rkb_edit" => Cmd::Edit {
+            id: text(args, "id"),
+            base: Some(text(args, "base")),
+            text: Some(text(args, "text")),
+            assets: strings(args, "assets"),
+        },
         other => return Err(CliError::new(ErrorCode::Usage, format!("unknown tool `{other}`"), fix(other))),
     };
     run(Some(cmd), Format::Toon, &rkb_core::matching::Hints::default(), &[])

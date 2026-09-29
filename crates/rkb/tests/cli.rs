@@ -569,6 +569,61 @@ fn writes_record_provenance() {
 }
 
 #[test]
+fn import_claude_memory_into_the_inbox() {
+    let env = kb_with_topics();
+    let mem = env.dir.path().join("claude-memory");
+    for (name, body) in [
+        ("MEMORY.md", "- [a](a.md)\n".to_string()),
+        (
+            "a.md",
+            "---\nname: prefer-ninja\ndescription: Builds use ninja\nmetadata:\n  type: feedback\n---\nUse `-G Ninja` for every build.\n"
+                .to_string(),
+        ),
+        ("b.md", "---\nname: hdf5-root\ntype: project\n---\nSet HDF5_ROOT before configuring.\n".to_string()),
+        ("c.md", "No frontmatter here, just a note.\n".to_string()),
+    ] {
+        env.write_abs(&mem.join(name), &body);
+    }
+    let claude = env.dir.path().join("CLAUDE.md");
+    env.write_abs(&claude, "# Project\nIntro line.\n\n## Build\nRun make.\n\n## Test\nRun make test.\n");
+    let before = commit_count(&env);
+    let (v, code) = env.json(&["import", "--claude-memory", mem.to_str().unwrap(), "--file", claude.to_str().unwrap()], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!((v["saved"].as_u64(), v["skipped"].as_u64()), (Some(6), Some(0)), "3 memory files, and 3 sections of CLAUDE.md: {v}");
+    let (v, _) = env.json(&["import", "--claude-memory", mem.to_str().unwrap(), "--file", claude.to_str().unwrap()], "");
+    assert_eq!((v["saved"].as_u64(), v["skipped"].as_u64()), (Some(0), Some(6)), "nothing twice: {v}");
+    assert_eq!(commit_count(&env), before, "nothing reaches the knowledge base directly");
+    let (v, _) = env.json(&["inbox"], "");
+    let items = v["items"].as_array().unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(items.len(), 6);
+    assert!(items.iter().all(|i| i["priority"] == 2), "{v}");
+    let all = items.iter().map(|i| i["preview"].as_str().unwrap_or("").to_string()).collect::<Vec<_>>().join("\n");
+    assert!(all.contains("From Claude Code memory (feedback): prefer-ninja") && all.contains("(project): hdf5-root"), "{all}");
+}
+
+#[test]
+fn tools_carry_images_and_search_shows_counts() {
+    let env = search_kb();
+    let img = env.dir.path().join("a.png");
+    std::fs::write(&img, png_with_gps()).unwrap();
+    let args = serde_json::json!({
+        "type": "fact", "title": "Tool images land next to the lesson", "topic": "git",
+        "statement": "It shows ![a](a.png).", "evidence": "Seen in the test.", "assets": [img.to_str().unwrap()],
+    });
+    let (out, code) = tool(&env, "rkb_add", &args);
+    assert_eq!(code, Some(0), "{out}");
+    let path = out.lines().find_map(|l| l.strip_prefix("path: ")).unwrap().trim_matches('"').to_string();
+    let stem = path.trim_end_matches(".md");
+    assert!(env.kb().join(format!("{stem}.assets/a.png")).is_file(), "{out}");
+
+    let (out, _) = tool(&env, "rkb_used", &serde_json::json!({ "id": "1a00000012", "result": "worked" }));
+    assert!(out.contains("recorded"), "{out}");
+    let (v, _) = env.json(&["search", "undefined reference to vtable"], "");
+    let row = v["results"].as_array().unwrap().iter().find(|r| r["id"] == "1a00000012").cloned().unwrap_or_else(|| panic!("{v}"));
+    assert_eq!((row["worked"].as_u64(), row["failed"].as_u64()), (Some(1), Some(0)), "{row}");
+}
+
+#[test]
 fn write_burst_asks_before_flooding() {
     let env = kb_with_topics();
     env.trust_claude();
@@ -1387,7 +1442,7 @@ fn search_outputs_and_hidden_results() {
     let (v, _) = env.json(&["find", "undefind vtable"], "");
     assert_eq!(v["results"][0]["id"], "1a00000012");
     let toon = stdout(&env.rkb(&["search", "git rebase", "--toon"]));
-    assert!(toon.contains("results[3]{id,type,title,path,status,applies,summary}:"), "{toon}");
+    assert!(toon.contains("results[3]{id,type,title,path,status,applies,worked,failed,injected,summary}:"), "{toon}");
     assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
 }
 

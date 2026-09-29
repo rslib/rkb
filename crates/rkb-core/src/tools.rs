@@ -42,6 +42,7 @@ pub fn definitions() -> Vec<Value> {
         "tags": { "type": "array", "items": { "type": "string" }, "description": "A few words to find it by" },
         "when": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Conditions under which it holds, such as {\"hdf5\": \"1.12:1.14.2\"}. Set {\"project\": \"<name>\"} when the claim holds only for one project (its code, decisions or conventions); leave it out for a general rule, and name the project only in evidence" },
         "verified_how": { "type": "string", "enum": ["ran", "read", "told"], "description": "ran: you ran it and saw it work; read: from docs or code; told: the user said so. Default: ran" },
+        "assets": { "type": "array", "items": { "type": "string" }, "description": "Image files (png, jpg, webp, svg) to store with the lesson, metadata removed; link each in a section by its file name, such as ![trace](trace.png)" },
     });
     for (f, types) in section_fields() {
         add_props[&f] = json!({ "type": "string", "description": format!("Section for {}", types.join(", ")) });
@@ -100,6 +101,7 @@ pub fn definitions() -> Vec<Value> {
                 "id": { "type": "string", "description": "The lesson id" },
                 "base": { "type": "string", "description": "The hash rkb_show printed" },
                 "text": { "type": "string", "description": "The full new lesson file" },
+                "assets": { "type": "array", "items": { "type": "string" }, "description": "Image files to add or replace in the lesson's folder; link each by its file name" },
             }, "required": ["id", "base", "text"], "additionalProperties": false },
         }),
     ]

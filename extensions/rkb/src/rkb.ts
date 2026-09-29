@@ -88,21 +88,26 @@ function additional(reply: string | undefined): string | undefined {
   return typeof text === "string" && text ? text : undefined;
 }
 
+// omp gives the session file and id in its stop event; kept for the compaction and shutdown hooks.
+let stopSession: { id?: string; file?: string } = {};
+
 function base(ctx: any): Record<string, unknown> {
   let session = "";
   try {
     session = String(ctx?.sessionManager?.getSessionId?.() ?? "");
   } catch {}
-  return { session_id: session, cwd: String(ctx?.cwd ?? process.cwd()) };
+  return { session_id: session || stopSession.id || "", cwd: String(ctx?.cwd ?? process.cwd()) };
 }
 
 function transcript(ctx: any): string | undefined {
+  let id = "";
   try {
     const file = ctx?.sessionManager?.getSessionFile?.();
-    return typeof file === "string" && file ? file : undefined;
-  } catch {
-    return undefined;
-  }
+    if (typeof file === "string" && file) return file;
+    id = String(ctx?.sessionManager?.getSessionId?.() ?? "");
+  } catch {}
+  // Only this session's own file: an ephemeral session must not pick up an earlier session's transcript.
+  return stopSession.file && (!id || id === stopSession.id) ? stopSession.file : undefined;
 }
 
 function prompt(text: string, args: string): string {
@@ -277,6 +282,8 @@ export default function rkb(pi: ExtensionAPI) {
       "session_stop",
       safe(async (event, ctx) => {
         if (event?.signal?.aborted) return undefined;
+        if (event?.session_file) stopSession.file = String(event.session_file);
+        if (event?.session_id) stopSession.id = String(event.session_id);
         const payload: Record<string, unknown> = { ...base(ctx), stop_hook_active: Boolean(event?.stop_hook_active) };
         if (event?.session_id) payload.session_id = String(event.session_id);
         const note = additional(await hook("stop", payload));

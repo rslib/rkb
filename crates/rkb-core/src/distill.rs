@@ -397,6 +397,97 @@ pub fn capture(state: &Path, harness: &str, session: &str, transcript: &Path, cw
     Ok(item)
 }
 
+/// Every Claude Code auto memory folder: `~/.claude/projects/*/memory/`.
+pub fn claude_memory_dirs() -> Vec<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+    let mut ds: Vec<_> = std::fs::read_dir(home.join(".claude/projects"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path().join("memory"))
+        .filter(|p| p.is_dir())
+        .collect();
+    ds.sort();
+    ds
+}
+
+/// Notes from Claude Code auto memory files (`<dir>/*.md` except the `MEMORY.md` index) and from files
+/// such as `CLAUDE.md` (one note per `## ` section), as `(source, text)`.
+pub fn claude_notes(dirs: &[std::path::PathBuf], files: &[std::path::PathBuf]) -> Vec<(String, String)> {
+    let mut out = vec![];
+    for d in dirs {
+        let mut paths: Vec<_> = std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for p in paths.into_iter().filter(|p| p.extension().is_some_and(|x| x == "md") && p.file_name().is_some_and(|n| n != "MEMORY.md")) {
+            let Ok(text) = std::fs::read_to_string(&p) else { continue };
+            let (fm, body) = crate::lesson::split(&text).map(|(f, b, _)| (f, b)).unwrap_or(("", &text));
+            let v: serde_norway::Value = serde_norway::from_str(fm).unwrap_or(serde_norway::Value::Null);
+            let get = |k: &str| v.get(k).and_then(serde_norway::Value::as_str).map(str::to_string);
+            let kind = get("type")
+                .or_else(|| v.get("metadata").and_then(|m| m.get("type")).and_then(serde_norway::Value::as_str).map(str::to_string));
+            let name = get("name").unwrap_or_else(|| p.file_stem().unwrap_or_default().to_string_lossy().into_owned());
+            let mut note = format!("From Claude Code memory ({}): {name}", kind.as_deref().unwrap_or("note"));
+            if let Some(d) = get("description") {
+                note.push_str(&format!("\n{d}"));
+            }
+            note.push_str(&format!("\n\n{}", body.trim()));
+            out.push((p.display().to_string(), note));
+        }
+    }
+    for f in files {
+        let Ok(text) = std::fs::read_to_string(f) else { continue };
+        let mut sections: Vec<String> = vec![String::new()];
+        for line in text.lines() {
+            if line.starts_with("## ") {
+                sections.push(String::new());
+            }
+            let cur = sections.last_mut().expect("never empty");
+            cur.push_str(line);
+            cur.push('\n');
+        }
+        for sec in sections.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            let heading = sec.lines().next().unwrap_or("").trim_start_matches('#').trim().to_string();
+            out.push((format!("{}#{heading}", f.display()), format!("From {}: {heading}\n\n{sec}", f.display())));
+        }
+    }
+    out
+}
+
+/// Saves each `(source, text)` as a priority-2 inbox note unless the same text was imported before.
+/// Returns how many were saved and how many skipped.
+pub fn import_notes(state: &Path, notes: &[(String, String)]) -> Result<(usize, usize)> {
+    use sha2::Digest;
+    let log = state.join("imported.jsonl");
+    let seen: std::collections::HashSet<String> = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v["hash"].as_str().map(String::from))
+        .collect();
+    let (mut saved, mut skipped) = (0, 0);
+    for (source, text) in notes {
+        let hash: String = sha2::Sha256::digest(text.as_bytes()).iter().take(12).map(|b| format!("{b:02x}")).collect();
+        if seen.contains(&hash) {
+            skipped += 1;
+            continue;
+        }
+        let meta = Meta {
+            kind: Kind::Note,
+            time: crate::request::now(),
+            harness: None,
+            session: None,
+            cwd: None,
+            signals: vec![],
+            priority: Some(2),
+            source: Some(source.clone()),
+        };
+        add(state, meta, text)?;
+        crate::lock::append_line(&log, &serde_json::json!({ "hash": hash, "source": source }).to_string())?;
+        saved += 1;
+    }
+    Ok((saved, skipped))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

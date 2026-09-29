@@ -328,7 +328,15 @@ enum Cmd {
     )]
     Import {
         /// The folder with the lesson files.
-        dir: std::path::PathBuf,
+        #[arg(required_unless_present_any = ["claude_memory", "files"])]
+        dir: Option<std::path::PathBuf>,
+        /// Instead, save Claude Code auto memory files as inbox notes for distill: this folder, or every
+        /// ~/.claude/projects/*/memory/ when no folder is given.
+        #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "DIR")]
+        claude_memory: Option<String>,
+        /// Also save each `## ` section of this file (such as a CLAUDE.md) as an inbox note. Repeatable.
+        #[arg(long = "file", value_name = "FILE")]
+        files: Vec<std::path::PathBuf>,
     },
     /// Serve the agent tools over MCP on stdin and stdout; Claude Code starts this through the rkb plugin.
     #[command(after_help = "Example:\n  rkb mcp")]
@@ -709,7 +717,8 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Log { id } => writes::log(&env, id),
         Cmd::Confirm { request, choice } => writes::confirm(&env, request, choice),
         Cmd::Hook { .. } => unreachable!("main runs hooks first"),
-        Cmd::Import { dir } => writes::import(&env, &dir),
+        Cmd::Import { dir: Some(dir), claude_memory: None, files } if files.is_empty() => writes::import(&env, &dir),
+        Cmd::Import { claude_memory, files, .. } => inbox::import_claude(&env, claude_memory.as_deref(), &files),
         Cmd::Note { words, priority } => inbox::note(&env, words, priority),
         Cmd::Tools => Ok(agent::list()),
         Cmd::Tool { .. } | Cmd::Mcp => unreachable!("main runs tools and the MCP server first"),
