@@ -575,10 +575,15 @@ return {
       end
       -- Security headers for Cloudflare Pages and Netlify. The site has no inline script; hash-wasm
       -- compiles WebAssembly for Argon2, and protected images are data: URLs.
+      -- `[site] analytics = "cloudflare"`: the Web Analytics beacon Cloudflare injects must load and report.
+      local cf = settings.analytics == "cloudflare"
       local headers = {
         "/*",
-        "  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:;"
-          .. " font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        "  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'"
+          .. (cf and " https://static.cloudflareinsights.com" or "")
+          .. "; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'"
+          .. (cf and " https://cloudflareinsights.com" or "")
+          .. "; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         "  X-Content-Type-Options: nosniff",
         "  X-Frame-Options: DENY",
         "  Referrer-Policy: strict-origin-when-cross-origin",

@@ -1,0 +1,59 @@
+# Written by `rkb site ci`. Every week, builds the site with rkb @VERSION@ and checks the links of its
+# published pages to other sites. Private lessons are not built, so their links never leave the repository.
+name: Links
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  links:
+    runs-on: ubuntu-latest
+    env:
+      RKB_VERSION: "@VERSION@"
+    steps:
+      # Actions are pinned to commits, since a tag can be moved; the comment names the release.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install rkb
+        run: |
+          archive="rkb-linux-x86_64-v$RKB_VERSION.tar.gz"
+          base="https://github.com/rslib/rkb/releases/download/v$RKB_VERSION"
+          curl -fsSLO "$base/$archive"
+          curl -fsSLO "$base/$archive.sha256"
+          sha256sum -c "$archive.sha256"
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$archive" -C "$HOME/.local/bin" rkb
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Cache rs-web
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/rkb/bin
+          key: rs-web-${{ runner.os }}-${{ env.RKB_VERSION }}
+      - name: Build
+        env:
+          RKB_HOME: ${{ github.workspace }}
+          # The runner's user name is `runner`, a common word; the leak check still uses leak.usernames.
+          USER: ""
+        run: rkb site build --no-ask --out dist
+      # Results are kept for a week, so a flaky site is not asked every time.
+      - name: Cache link results
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .lycheecache
+          key: lychee-${{ github.run_id }}
+          restore-keys: lychee-
+      # 403 and 429 come from sites that refuse robots, not from dead links. Results go to the job summary.
+      - name: Check links
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: >-
+            --no-progress --cache --max-cache-age 7d --max-concurrency 8
+            --accept '200..=204,403,429'
+            --root-dir "${{ github.workspace }}/dist"@EXCLUDE@
+            'dist/**/*.html'

@@ -1,6 +1,6 @@
 //! `rkb site`: build, preview and customize an rs-web site of the lessons the `web` sink allows.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -209,46 +209,6 @@ fn password_set(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| !v.is_empty())
 }
 
-/// The record of first publications, in the knowledge base so every machine and CI share it.
-const RECORD: &str = "site/published.json";
-
-/// Ids published in the clear, and ids published encrypted with their password group (`""` for the
-/// site password). An older file's `ids` are in the clear, and its `encrypted` list is the site password.
-#[derive(Default, PartialEq)]
-struct Published {
-    clear: BTreeSet<String>,
-    encrypted: BTreeMap<String, String>,
-}
-
-fn read_published(path: &Path) -> Published {
-    let v: Value = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-    let set = |k: &str| -> BTreeSet<String> {
-        v[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
-    };
-    let mut clear = set("clear");
-    clear.extend(set("ids"));
-    let mut encrypted: BTreeMap<String, String> = set("encrypted").into_iter().map(|i| (i, String::new())).collect();
-    if let Some(m) = v["encrypted"].as_object() {
-        encrypted.extend(m.iter().map(|(k, g)| (k.clone(), g.as_str().unwrap_or_default().to_string())));
-    }
-    Published { clear, encrypted }
-}
-
-/// The knowledge base's record, with the per-machine record of an earlier rkb merged in.
-fn published(env: &Env) -> Published {
-    let mut p = read_published(&env.root.join(RECORD));
-    let old = read_published(&env.state.join("site-published.json"));
-    p.clear.extend(old.clear);
-    for (i, g) in old.encrypted {
-        p.encrypted.entry(i).or_insert(g);
-    }
-    p
-}
-
-fn group_name(s: &site::Site, id: &str) -> String {
-    s.groups.get(id).cloned().flatten().unwrap_or_default()
-}
-
 fn kb_config(env: &Env) -> rkb_core::config::KbConfig {
     std::fs::read_to_string(env.root.join("kb.toml")).ok().and_then(|t| rkb_core::config::parse(&t).ok()).unwrap_or_default()
 }
@@ -257,9 +217,9 @@ fn kb_config(env: &Env) -> rkb_core::config::KbConfig {
 /// when it changed; a lesson now public no longer counts as encrypted only.
 fn record(env: &Env, clear: &[String], encrypted: &[(String, String)]) -> Result<(), CliError> {
     let _lock = rkb_core::write::kb_lock(&env.root, &kb_config(env))?;
-    let path = env.root.join(RECORD);
-    let on_disk = read_published(&path);
-    let mut p = published(env);
+    let path = env.root.join(site::RECORD);
+    let on_disk = site::read_published(&path);
+    let mut p = site::published(&env.root, &env.state);
     p.clear.extend(clear.iter().cloned());
     p.encrypted.extend(encrypted.iter().cloned());
     p.encrypted.retain(|i, _| !p.clear.contains(i) || encrypted.iter().any(|(e, _)| e == i));
@@ -274,40 +234,36 @@ fn record(env: &Env, clear: &[String], encrypted: &[(String, String)]) -> Result
     let tmp = env.root.join(format!("site/.published.json.{}", std::process::id()));
     std::fs::write(&tmp, text).map_err(|e| io_error(format!("{}: {e}", tmp.display()), fix))?;
     std::fs::rename(&tmp, &path).map_err(|e| io_error(format!("{}: {e}", path.display()), fix))?;
-    rkb_core::git::run(&env.root, &["add", "--", RECORD])?;
-    if !rkb_core::git::run(&env.root, &["status", "--porcelain", "--", RECORD])?.is_empty() {
-        rkb_core::git::commit_paths(&env.root, &format!("site: publish {added} lessons"), &[RECORD])?;
+    rkb_core::git::run(&env.root, &["add", "--", site::RECORD])?;
+    if !rkb_core::git::run(&env.root, &["status", "--porcelain", "--", site::RECORD])?.is_empty() {
+        rkb_core::git::commit_paths(&env.root, &format!("site: publish {added} lessons"), &[site::RECORD])?;
     }
     Ok(())
 }
 
-/// Writes the staging folder: the template, the allowed lessons and `site.json`.
-fn stage(env: &Env, s: &site::Site, dir: &Path) -> Result<(), CliError> {
-    let fix = "check the disk space and that the cache folder is writable";
-    let _ = std::fs::remove_dir_all(dir);
-    let put = |rel: &str, data: &[u8]| -> Result<(), CliError> {
-        let p = dir.join(rel);
-        std::fs::create_dir_all(p.parent().expect("staged files are in a folder")).map_err(|e| io_error(e, fix))?;
-        std::fs::write(&p, data).map_err(|e| io_error(format!("{}: {e}", p.display()), fix))
-    };
+/// Staged files by path in the staging folder.
+type Staged = BTreeMap<String, Vec<u8>>;
+
+/// The staging folder's files: the template, the allowed lessons and their images, and `site.json`.
+fn stage_files(env: &Env, s: &site::Site) -> Result<Staged, CliError> {
+    let fix = "check that the knowledge base is readable";
+    let mut files = Staged::new();
     let custom = env.root.join("site");
     if custom.join("config.lua").is_file() {
         for p in walk(&custom) {
             let rel = p.strip_prefix(&custom).expect("walk stays under the folder").to_string_lossy().into_owned();
-            put(&rel, &std::fs::read(&p).map_err(|e| io_error(e, fix))?)?;
+            files.insert(rel, std::fs::read(&p).map_err(|e| io_error(e, fix))?);
         }
     } else {
-        for (rel, data) in TEMPLATE {
-            put(rel, data)?;
-        }
+        files.extend(TEMPLATE.iter().map(|(rel, data)| (rel.to_string(), data.to_vec())));
     }
     for (path, data) in &s.files {
         let data = staged(path, data)?;
-        put(path, &data)?;
         // The Lua cannot read binary files, so a protected image also goes in as text to embed.
         if path.starts_with("protected/") && path.contains(".assets/") {
-            put(&format!("{path}.b64"), rkb_core::image::base64(&data).as_bytes())?;
+            files.insert(format!("{path}.b64"), rkb_core::image::base64(&data).into_bytes());
         }
+        files.insert(path.clone(), data);
     }
     let mut index = s.index.clone();
     // `[site] image`: staged next to the template's static files, its metadata removed.
@@ -318,22 +274,53 @@ fn stage(env: &Env, s: &site::Site, dir: &Path) -> Result<(), CliError> {
         let data = rkb_core::image::strip(&ext, &data)
             .map_err(|e| CliError::new(ErrorCode::Refused, format!("[site] image {img}: {e}; nothing was written"), fix))?;
         let name = format!("og-site.{ext}");
-        put(&format!("static/{name}"), &data)?;
+        files.insert(format!("static/{name}"), data);
         index["site"]["image"] = json!(name);
     }
-    // Stylesheets and scripts also go under a content hash, so they can be cached for good.
+    // Stylesheets and scripts also go under a content hash, so they can be cached for good. Vendored
+    // `.min.js` files keep their plain path: site.js loads the Argon2 build by name.
     let mut assets = serde_json::Map::new();
-    for e in std::fs::read_dir(dir.join("static")).into_iter().flatten().flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        // Vendored `.min.js` files keep their plain path: site.js loads the Argon2 build by name.
-        if e.path().is_file() && (name.ends_with(".css") || name.ends_with(".js")) && !name.ends_with(".min.js") {
-            let data = std::fs::read(e.path()).map_err(|e| io_error(e, fix))?;
-            let hash: String = Sha256::digest(&data).iter().take(6).map(|b| format!("{b:02x}")).collect();
+    for (rel, data) in &files {
+        let Some(name) = rel.strip_prefix("static/").filter(|n| !n.contains('/')) else { continue };
+        if (name.ends_with(".css") || name.ends_with(".js")) && !name.ends_with(".min.js") {
+            let hash: String = Sha256::digest(data).iter().take(6).map(|b| format!("{b:02x}")).collect();
             assets.insert(name.replace('.', "_"), json!(format!("/static/v/{hash}/{name}")));
         }
     }
     index["assets"] = Value::Object(assets);
-    put("site.json", serde_json::to_string_pretty(&index).expect("the index serializes").as_bytes())
+    files.insert("site.json".into(), serde_json::to_string_pretty(&index).expect("the index serializes").into_bytes());
+    Ok(files)
+}
+
+/// Writes the staging folder from scratch.
+fn stage(env: &Env, s: &site::Site, dir: &Path) -> Result<(), CliError> {
+    let files = stage_files(env, s)?;
+    let _ = std::fs::remove_dir_all(dir);
+    restage(dir, &files).map(|_| ())
+}
+
+/// Brings `dir` in line with `files`, writing only what differs and removing what is gone, and keeps
+/// rs-web's output folder. Returns whether anything changed.
+fn restage(dir: &Path, files: &Staged) -> Result<bool, CliError> {
+    let fix = "check the disk space and that the staging folder is writable";
+    let mut changed = false;
+    for (rel, data) in files {
+        let p = dir.join(rel);
+        if std::fs::read(&p).is_ok_and(|old| old == *data) {
+            continue;
+        }
+        std::fs::create_dir_all(p.parent().expect("staged files are in a folder")).map_err(|e| io_error(e, fix))?;
+        std::fs::write(&p, data).map_err(|e| io_error(format!("{}: {e}", p.display()), fix))?;
+        changed = true;
+    }
+    for p in walk(dir) {
+        let rel = p.strip_prefix(dir).expect("walk stays under the folder").to_string_lossy().into_owned();
+        if !rel.starts_with("dist/") && !files.contains_key(&rel) {
+            let _ = std::fs::remove_file(&p);
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 /// A staged file as it may be published: a PNG, JPEG or WebP image without its metadata.
@@ -480,16 +467,46 @@ fn listed(index: &Value, key: &str, ids: &[String]) -> Vec<String> {
 pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approved, no_ask: bool) -> Result<Output, CliError> {
     kb::open(&env.root)?;
     check_passwords()?;
-    let s = site::collect(&env.root, password_set)?;
-    let before = published(env);
-    let new_clear: Vec<String> = s.ids.iter().filter(|i| !before.clear.contains(*i) && !approved.clear.contains(i)).cloned().collect();
-    let new_enc: Vec<String> = s
-        .protected
-        .iter()
-        .filter(|i| before.encrypted.get(*i) != Some(&group_name(&s, i)) && !approved.encrypted.contains(i))
-        .cloned()
-        .collect();
-    if !new_clear.is_empty() || !new_enc.is_empty() {
+    let mut s = site::collect(&env.root, password_set)?;
+    let before = site::published(&env.root, &env.state);
+    let (mut new_clear, mut new_enc) = site::pending(&s, &before);
+    new_clear.retain(|i| !approved.clear.contains(i));
+    new_enc.retain(|i| !approved.encrypted.contains(i));
+    let mut held_note = None;
+    if no_ask && (!new_clear.is_empty() || !new_enc.is_empty()) {
+        let fix = "run `rkb site build` on your machine, answer `publish`, and push the knowledge base";
+        if !env.root.join(site::RECORD).is_file() {
+            return Err(CliError::new(
+                ErrorCode::Refused,
+                format!(
+                    "{} lessons wait for a first-publication yes, and the knowledge base has no {}",
+                    new_clear.len() + new_enc.len(),
+                    site::RECORD
+                ),
+                format!("{fix}; nothing was written"),
+            ));
+        }
+        let wait: std::collections::BTreeSet<String> = new_clear.iter().chain(&new_enc).cloned().collect();
+        let titles = s.index.clone();
+        s = site::collect_holding(&env.root, password_set, &wait)?;
+        let names: Vec<String> = s
+            .held
+            .iter()
+            .map(|i| {
+                let row = ["lessons", "protected"].iter().flat_map(|k| titles[*k].as_array().into_iter().flatten()).find(|l| l["id"] == *i);
+                let title = row.and_then(|l| l["title"].as_str()).unwrap_or_default();
+                if wait.contains(i) { format!("{i} {title}") } else { format!("{i} {title} (links to one)") }
+            })
+            .collect();
+        if s.ids.is_empty() && s.protected.is_empty() {
+            return Err(CliError::new(
+                ErrorCode::Refused,
+                format!("every lesson waits for a first-publication yes, so nothing would be published: {}", names.join("; ")),
+                format!("{fix}; nothing was written"),
+            ));
+        }
+        held_note = Some(format!("{} lessons were left out until the user says yes: {}; {fix}", names.len(), names.join("; ")));
+    } else if !new_clear.is_empty() || !new_enc.is_empty() {
         let n = new_clear.len() + new_enc.len();
         let mut list = String::new();
         if !new_clear.is_empty() {
@@ -501,13 +518,6 @@ pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approv
         }
         for (var, ids) in &by_env {
             list.push_str(&format!("\nEncrypted with {var}:\n{}", listed(&s.index, "protected", ids).join("\n")));
-        }
-        if no_ask {
-            return Err(CliError::new(
-                ErrorCode::Refused,
-                format!("{n} lessons would be published for the first time, which needs the user's yes:{list}"),
-                "run `rkb site build` on your machine, answer `publish`, and push the knowledge base; nothing was written",
-            ));
         }
         let question = format!("Publish {n} lessons for the first time?{list}");
         let req = Request {
@@ -532,13 +542,13 @@ pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approv
             before
                 .encrypted
                 .iter()
-                .filter(|(i, g)| !s.ids.contains(i) && (!s.protected.contains(i) || **g != group_name(&s, i)))
+                .filter(|(i, g)| !s.ids.contains(i) && (!s.protected.contains(i) || **g != site::group_name(&s, i)))
                 .map(|(i, _)| i),
         )
         .cloned()
         .collect();
     let (bin, note) = rs_web()?;
-    let dir = site_dir().join("stage");
+    let dir = if serve.is_some() { serve_dir(&env.root) } else { site_dir().join("stage") };
     stage(env, &s, &dir)?;
     let mut notes: Vec<String> = note.into_iter().collect();
     if !gone.is_empty() {
@@ -552,19 +562,29 @@ pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approv
         let what = if var == "SITE_PASSWORD" { "internal lessons" } else { "lessons" };
         notes.push(format!("{n} {what} were left out; set {var} ({MIN_PASSWORD}+ characters) to publish them encrypted"));
     }
+    notes.extend(held_note);
+    // Under GitHub Actions the notes also show as warnings on the run.
+    if std::env::var("GITHUB_ACTIONS").is_ok_and(|v| v == "true") {
+        for n in &notes {
+            eprintln!("::warning title=rkb site::{}", n.replace('%', "%25").replace('\r', "%0D").replace('\n', "%0A"));
+        }
+    }
     let count = s.ids.len() + s.protected.len();
     if let Some(port) = serve {
-        let enc: Vec<(String, String)> = approved.encrypted.iter().map(|i| (i.clone(), group_name(&s, i))).collect();
+        let enc: Vec<(String, String)> = approved.encrypted.iter().map(|i| (i.clone(), site::group_name(&s, i))).collect();
         record(env, &approved.clear, &enc)?;
         for n in &notes {
             eprintln!("note: {n}");
         }
-        eprintln!("serving {count} lessons ({} protected) from {} on port {port}; stop with Ctrl-C", s.protected.len(), dir.display());
-        let status = Command::new(&bin)
-            .args(["serve", "--port", &port.to_string()])
-            .current_dir(&dir)
-            .status()
-            .map_err(|e| io_error(format!("{}: {e}", bin.display()), "check that rs-web runs"))?;
+        if dir.canonicalize().unwrap_or_else(|_| dir.clone()).components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')) {
+            eprintln!("note: {} is under a hidden folder, which rs-web does not watch; pages will not reload", dir.display());
+        }
+        eprintln!(
+            "serving {count} lessons ({} protected) from {} on port {port}; edits in the knowledge base reload the page; stop with Ctrl-C",
+            s.protected.len(),
+            dir.display()
+        );
+        let status = serve_loop(env, &bin, &dir, port)?;
         return Ok(Output {
             data: json!({ "status": "stopped", "lessons": count }),
             human: String::new(),
@@ -598,7 +618,7 @@ pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approv
     let out = out.map(PathBuf::from).unwrap_or_else(|| site_dir().join("dist"));
     replace(&dist, &out).map_err(|e| io_error(format!("{}: {e}", out.display()), "check that the output folder is writable"))?;
     if !no_ask {
-        let enc: Vec<(String, String)> = s.protected.iter().map(|i| (i.clone(), group_name(&s, i))).collect();
+        let enc: Vec<(String, String)> = s.protected.iter().map(|i| (i.clone(), site::group_name(&s, i))).collect();
         record(env, &s.ids, &enc)?;
     }
     let mut human = format!("{} {count} lessons ({} protected) to {}", paint(env.colored, "32", "built"), s.protected.len(), out.display());
@@ -615,6 +635,80 @@ pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approv
         "help": [format!("Open {}/index.html, or run `rkb site serve` for a live preview", out.display())],
     });
     Ok(Output { data, human, exit: 0, raw: false })
+}
+
+/// The preview's staging folder. rs-web ignores changes under any hidden folder, such as `~/.cache`,
+/// so it lives in the temp folder, one per knowledge base.
+fn serve_dir(root: &Path) -> PathBuf {
+    let hash: String = Sha256::digest(root.to_string_lossy().as_bytes()).iter().take(4).map(|b| format!("{b:02x}")).collect();
+    std::env::temp_dir().join(format!("rkb-site-{hash}"))
+}
+
+/// Path, size and change time of every file the site is built from.
+fn fingerprint(root: &Path) -> Vec<(String, u64, Option<std::time::SystemTime>)> {
+    let mut paths: Vec<PathBuf> = kb::paths(root).unwrap_or_default().into_iter().map(|p| root.join(p)).collect();
+    paths.push(root.join("kb.toml"));
+    paths.extend(walk(&root.join("site")));
+    paths
+        .into_iter()
+        .map(|p| {
+            let m = std::fs::metadata(&p).ok();
+            (p.display().to_string(), m.as_ref().map_or(0, |m| m.len()), m.and_then(|m| m.modified().ok()))
+        })
+        .collect()
+}
+
+/// The staged files for the preview now: lessons that would need a first-publication answer, and the
+/// lessons that link to them, wait until the user answers.
+fn preview_files(env: &Env) -> Result<(Staged, Vec<String>), CliError> {
+    check_passwords()?;
+    let s = site::collect(&env.root, password_set)?;
+    let (clear, enc) = site::pending(&s, &site::published(&env.root, &env.state));
+    let wait: std::collections::BTreeSet<String> = clear.into_iter().chain(enc).collect();
+    let s = if wait.is_empty() { s } else { site::collect_holding(&env.root, password_set, &wait)? };
+    Ok((stage_files(env, &s)?, s.held))
+}
+
+/// Runs `rs-web serve --watch` on `dir` and restages it when the knowledge base changes, until rs-web
+/// stops. A change that does not build (a new link to a private lesson, say) leaves the last good stage.
+fn serve_loop(env: &Env, bin: &Path, dir: &Path, port: u16) -> Result<std::process::ExitStatus, CliError> {
+    let fix = "check that rs-web runs";
+    let mut child = Command::new(bin)
+        .args(["serve", "--watch", "--port", &port.to_string()])
+        .current_dir(dir)
+        .spawn()
+        .map_err(|e| io_error(format!("{}: {e}", bin.display()), fix))?;
+    let mut seen = fingerprint(&env.root);
+    let mut waiting: Vec<String> = vec![];
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| io_error(e, fix))? {
+            return Ok(status);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let now = fingerprint(&env.root);
+        if now == seen {
+            continue;
+        }
+        seen = now;
+        let result = preview_files(env).and_then(|(files, held)| Ok((restage(dir, &files)?, held)));
+        match result {
+            Ok((changed, held)) => {
+                if changed {
+                    // rs-web rebuilds only what it tracked; a rewritten config.lua makes it rebuild everything.
+                    let cfg = dir.join("config.lua");
+                    if let Ok(text) = std::fs::read(&cfg) {
+                        let _ = std::fs::write(&cfg, text);
+                    }
+                    eprintln!("restaged");
+                }
+                if held != waiting && !held.is_empty() {
+                    eprintln!("note: {} lessons wait for `rkb site build` to ask about them: {}", held.len(), held.join(", "));
+                }
+                waiting = held;
+            }
+            Err(e) => eprintln!("note: not restaged: {}", e.message),
+        }
+    }
 }
 
 /// `rkb site init`: the built-in template into `$RKB_HOME/site/`, keeping files that exist.
@@ -669,49 +763,90 @@ pub fn ci(env: &Env) -> Result<Output, CliError> {
     let kbc = kb_config(env);
     let _lock = rkb_core::write::kb_lock(&env.root, &kbc)?;
     const PATH: &str = ".github/workflows/site.yml";
+    const LINKS: &str = ".github/workflows/links.yml";
     let branch = String::from_utf8_lossy(&rkb_core::git::run(&env.root, &["rev-parse", "--abbrev-ref", "HEAD"])?).trim().to_string();
     let mut secrets = vec!["SITE_PASSWORD".to_string()];
     secrets.extend(kbc.labels.get("password").into_iter().flatten().map(|g| site::password_env(Some(g))));
     secrets.extend(["CLOUDFLARE_API_TOKEN".into(), "CLOUDFLARE_ACCOUNT_ID".into()]);
     let variables = ["CLOUDFLARE_PROJECT_NAME"];
-    let p = env.root.join(PATH);
-    let written = !p.exists();
-    if written {
-        let env_lines: Vec<String> =
-            secrets.iter().filter(|s| s.starts_with("SITE_PASSWORD")).map(|s| format!("          {s}: ${{{{ secrets.{s} }}}}")).collect();
-        let text = include_str!("../site/ci.yml")
-            .replace("@BRANCH@", &branch)
-            .replace("@VERSION@", env!("CARGO_PKG_VERSION"))
-            .replace("@PASSWORDS@", &env_lines.join("\n"));
-        let fix = "check that the knowledge base is writable";
+    let base_url = kbc.site.base_url.as_deref().unwrap_or_default().trim_end_matches('/').to_string();
+    let env_lines: Vec<String> =
+        secrets.iter().filter(|s| s.starts_with("SITE_PASSWORD")).map(|s| format!("          {s}: ${{{{ secrets.{s} }}}}")).collect();
+    // The site's own pages are checked by the build; only links to other sites go to lychee.
+    let exclude = if base_url.is_empty() {
+        String::new()
+    } else {
+        let escaped: String = base_url.chars().flat_map(|c| if ".+*?()[]{}|^$\\".contains(c) { vec!['\\', c] } else { vec![c] }).collect();
+        format!("\n            --exclude '^{escaped}'")
+    };
+    let files = [
+        (
+            PATH,
+            include_str!("../site/ci.yml")
+                .replace("@BRANCH@", &branch)
+                .replace("@VERSION@", env!("CARGO_PKG_VERSION"))
+                .replace("@PASSWORDS@", &env_lines.join("\n")),
+        ),
+        (LINKS, include_str!("../site/links.yml").replace("@VERSION@", env!("CARGO_PKG_VERSION")).replace("@EXCLUDE@", &exclude)),
+    ];
+    let fix = "check that the knowledge base is writable";
+    let mut written: Vec<&str> = vec![];
+    for (path, text) in &files {
+        let p = env.root.join(path);
+        if p.exists() {
+            continue;
+        }
         std::fs::create_dir_all(p.parent().expect("the workflow is in a folder")).map_err(|e| io_error(e, fix))?;
         let mut f = std::fs::File::create_new(&p).map_err(|e| io_error(format!("{}: {e}", p.display()), fix))?;
         f.write_all(text.as_bytes()).map_err(|e| io_error(e, fix))?;
-        rkb_core::git::run(&env.root, &["add", "--", PATH])?;
-        if !rkb_core::git::run(&env.root, &["status", "--porcelain", "--", PATH])?.is_empty() {
-            rkb_core::git::commit_paths(&env.root, "site: add the CI workflow", &[PATH])?;
+        written.push(path);
+    }
+    if !written.is_empty() {
+        let mut add = vec!["add", "--"];
+        add.extend(&written);
+        rkb_core::git::run(&env.root, &add)?;
+        let mut status = vec!["status", "--porcelain", "--"];
+        status.extend(&written);
+        if !rkb_core::git::run(&env.root, &status)?.is_empty() {
+            let message = if written.len() == 2 {
+                "site: add the CI workflows"
+            } else if written[0] == PATH {
+                "site: add the CI workflow"
+            } else {
+                "site: add the link check workflow"
+            };
+            rkb_core::git::commit_paths(&env.root, message, &written)?;
         }
     }
     let mut notes = vec![];
-    if kbc.site.base_url.as_deref().unwrap_or_default().is_empty() {
+    if base_url.is_empty() {
         notes.push(
             "[site] base_url in kb.toml is empty; set it to the site's address for absolute links, the sitemap and link previews"
                 .to_string(),
         );
     }
-    let mut human = if written {
-        format!("{} {PATH} (rkb {}, branch {branch})", paint(env.colored, "32", "wrote  "), env!("CARGO_PKG_VERSION"))
-    } else {
-        format!("{} {PATH} (exists)", paint(env.colored, "2", "kept   "))
-    };
-    human.push_str(&format!("\nset these repository secrets: {}", secrets.join(", ")));
+    let state = |path: &str| if written.contains(&path) { "written" } else { "kept" };
+    let mut human = String::new();
+    for (path, _) in &files {
+        if written.contains(path) {
+            human.push_str(&format!(
+                "{} {path} (rkb {}, branch {branch})\n",
+                paint(env.colored, "32", "wrote  "),
+                env!("CARGO_PKG_VERSION")
+            ));
+        } else {
+            human.push_str(&format!("{} {path} (exists)\n", paint(env.colored, "2", "kept   ")));
+        }
+    }
+    human.push_str(&format!("set these repository secrets: {}", secrets.join(", ")));
     human.push_str(&format!("\nset this repository variable: {}", variables.join(", ")));
     for n in &notes {
         human.push_str(&format!("\n{} {n}", paint(env.colored, "33", "note:")));
     }
     let data = json!({
-        "status": if written { "written" } else { "kept" },
+        "status": state(PATH),
         "path": PATH,
+        "links": { "path": LINKS, "status": state(LINKS) },
         "branch": branch,
         "rkb": env!("CARGO_PKG_VERSION"),
         "secrets": secrets,

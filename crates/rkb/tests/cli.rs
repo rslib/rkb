@@ -427,12 +427,39 @@ fn add_stores_images_without_metadata() {
     assert!(files.contains(".assets/layout.png") && files.contains(".md"), "{files}");
     assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
 
+    let id = v["id"].as_str().unwrap().to_string();
+    let trace = env.dir.path().join("shots/trace.png");
+    std::fs::write(&trace, png_with_gps()).unwrap();
+    let (text, hash) = current(&env, &id);
+    let (v, code) = env
+        .json(&["edit", &id, "--base", &hash, "--asset", trace.to_str().unwrap()], &format!("{}\n![trace](trace.png)\n", text.trim_end()));
+    assert_eq!((v["status"].as_str(), code), (Some("written"), Some(0)), "{v}");
+    assert!(front(&env, path).contains(&format!("![trace]({name}.assets/trace.png)")));
+    let t = std::fs::read(env.kb().join(format!("{stem}.assets/trace.png"))).unwrap();
+    assert!(!String::from_utf8_lossy(&t).contains("GPS"), "the edit strips the metadata");
+    let files = stdout(&env.git(&["show", "--name-only", "--format=", "HEAD"]));
+    assert!(files.contains(".assets/trace.png") && files.contains(".md"), "one commit: {files}");
+
+    let (text, hash) = current(&env, &id);
+    let (v, _) = env.json(&["edit", &id, "--base", &hash, "--asset", trace.to_str().unwrap()], &text);
+    assert_eq!(v["status"], "unchanged", "the same text and the same image write nothing: {v}");
+    let replacement = env.dir.path().join("new/layout.png");
+    env.write_abs(&replacement, "");
+    let mut png = png_with_gps();
+    png.splice(16..20, [0, 0, 0, 2]);
+    std::fs::write(&replacement, png).unwrap();
+    let old = std::fs::read(&stored).unwrap();
+    let (v, code) = env.json(&["edit", &id, "--base", &hash, "--asset", replacement.to_str().unwrap()], &text);
+    assert_eq!((v["status"].as_str(), code), (Some("written"), Some(0)), "same text, a replaced image: {v}");
+    assert_ne!(std::fs::read(&stored).unwrap(), old, "the image was replaced");
+    let before = commit_count(&env);
+
     let txt = env.dir.path().join("notes.txt");
     env.write_abs(&txt, "hi");
     let (v, code) = env.json(&["add", "--topic", "cmake", "--asset", txt.to_str().unwrap()], &lesson_with("Another lesson"));
     assert_eq!(code, Some(1), "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("notes.txt is not an image"), "{v}");
-    assert_eq!(commit_count(&env), before + 1, "nothing written");
+    assert_eq!(commit_count(&env), before, "nothing written");
 }
 
 fn head_subject(env: &Env) -> String {
@@ -2821,6 +2848,10 @@ fn probes_decide_applies_in_search() {
 const FAKE_RS_WEB: &str = r#"#!/bin/sh
 case "$1" in
 --version) echo "rs-web ${FAKE_RS_WEB_VERSION:-0.4.3}" ;;
+serve)
+  echo "$*" > serve-args
+  while [ ! -f stop ]; do sleep 0.1; done
+  ;;
 build)
   if [ -n "$FAKE_RS_WEB_FAIL" ]; then
     echo "boom: template error" >&2
@@ -3067,7 +3098,7 @@ fn site_record_travels_with_the_knowledge_base() {
     let (v, code) = site(&env, &["site", "build", "--no-ask", "--out", out_s], &[]);
     assert_eq!(code, Some(1), "{v}");
     let m = v["error"]["message"].as_str().unwrap();
-    assert!(m.contains("1a00000003 Rebase with local edits using autostash") && m.contains("1a00000005"), "{m}");
+    assert!(m.contains("2 lessons wait") && m.contains("has no site/published.json"), "{m}");
     assert!(v["error"]["fix"].as_str().unwrap().contains("rkb site build` on your machine"), "{v}");
     assert!(!out.exists(), "no site is written");
     assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "", "the knowledge base is unchanged");
@@ -3100,9 +3131,134 @@ fn lint_checks_the_site_image() {
     let (v, code) = env.json(&["lint"], "");
     assert_eq!(code, Some(1), "{v}");
     assert!(v.to_string().contains("config/site-image") && v.to_string().contains("must be a png or jpg"), "{v}");
+    std::fs::write(&toml, format!("{base}\n[site]\nanalytics = \"plausible\"\n")).unwrap();
+    let (v, code) = env.json(&["lint"], "");
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v.to_string().contains("config/site-analytics"), "{v}");
     std::fs::write(&toml, format!("{base}\n[site]\nimage = \"site/og.png\"\n")).unwrap();
     let (v, _) = env.json(&["lint"], "");
     assert!(!v.to_string().contains("config/site-image"), "{v}");
+}
+
+#[test]
+fn site_no_ask_holds_lessons_that_wait() {
+    let env = site_kb();
+    let out = env.dir.path().join("out");
+    let out_s = out.to_str().unwrap();
+    site_built(&env, out_s);
+    let (v, _) = env.json(&["doctor"], "");
+    let c = v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "site approvals").cloned().unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(c["status"], "ok", "{c}");
+    let new = env.kb().join("general/git/shallow-clones-break-git-describe.md");
+    std::fs::write(&new, std::fs::read_to_string(&new).unwrap().replacen("\n---\n", "\nlabels:\n  sensitivity: public\n---\n", 1)).unwrap();
+    let linker = env.kb().join("general/git/squash-fixups-with-autosquash.md");
+    let text = std::fs::read_to_string(&linker).unwrap();
+    std::fs::write(&linker, text.replacen("\n## ", "\nSee [describe](shallow-clones-break-git-describe.md).\n\n## ", 1)).unwrap();
+    let status = stdout(&env.git(&["status", "--porcelain"]));
+
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_RS_WEB", env.dir.path().join("fake/rs-web"))
+        .env("CLAUDECODE", "1")
+        .env_remove("SITE_PASSWORD")
+        .env("GITHUB_ACTIONS", "true");
+    let o = rkb_with(c, &["site", "build", "--no-ask", "--out", out_s, "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!((v["status"].as_str(), o.status.code()), (Some("built"), Some(0)), "{v}");
+    assert_eq!(v["lessons"], 1, "only the lesson that neither waits nor links to one: {v}");
+    let notes = v["notes"].to_string();
+    assert!(
+        notes.contains("1a00000004 Shallow clones break git describe") && notes.contains("1a00000005") && notes.contains("links to one"),
+        "{v}"
+    );
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("::warning title=rkb site::2 lessons were left out"), "{err}");
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), status, "--no-ask never writes the knowledge base");
+
+    let (v, _) = env.json(&["doctor"], "");
+    let c = v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "site approvals").cloned().unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(c["status"], "warn", "{c}");
+    assert!(c["detail"].as_str().unwrap().contains("1a00000004 Shallow clones break git describe"), "{c}");
+    assert!(c["fix"].as_str().unwrap().contains("rkb site build"), "{c}");
+
+    std::fs::write(env.kb().join("site/published.json"), "{\"clear\": [], \"encrypted\": {}}\n").unwrap();
+    std::fs::remove_file(env.dir.path().join("state/rkb/site-published.json")).ok();
+    let (v, code) = site(&env, &["site", "build", "--no-ask", "--out", out_s], &[]);
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("nothing would be published"), "{v}");
+}
+
+#[test]
+fn site_serve_restages_when_the_knowledge_base_changes() {
+    let env = site_kb();
+    site_built(&env, env.dir.path().join("out").to_str().unwrap());
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_RS_WEB", env.dir.path().join("fake/rs-web")).env("CLAUDECODE", "1").env_remove("SITE_PASSWORD");
+    let mut child = c.args(["site", "serve", "--port", "4999"]).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    /// Stops the fake rs-web and rkb however the test ends, so no server outlives it.
+    struct Stop(u32, std::rc::Rc<std::cell::RefCell<Option<PathBuf>>>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            if let Some(d) = self.1.borrow().as_ref() {
+                let _ = std::fs::write(d.join("stop"), "");
+            }
+            let _ = std::process::Command::new("kill").arg(self.0.to_string()).status();
+        }
+    }
+    let stage = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let _stop = Stop(child.id(), stage.clone());
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = lines.clone();
+    let err = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for l in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+            sink.lock().unwrap().push(l);
+        }
+    });
+    let wait_for = |what: &dyn Fn() -> bool, why: &str| {
+        for _ in 0..100 {
+            if what() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("{why}: {:?}", lines.lock().unwrap());
+    };
+    let dir = std::cell::RefCell::new(PathBuf::new());
+    wait_for(
+        &|| {
+            let found = lines
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|l| l.split(" from ").nth(1).and_then(|r| r.split(" on port").next()).map(PathBuf::from));
+            found.map(|d| *dir.borrow_mut() = d).is_some()
+        },
+        "serve starts",
+    );
+    let dir = dir.into_inner();
+    *stage.borrow_mut() = Some(dir.clone());
+    assert!(!dir.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')), "no hidden folder: {}", dir.display());
+    wait_for(&|| dir.join("serve-args").is_file(), "rs-web runs");
+    assert!(std::fs::read_to_string(dir.join("serve-args")).unwrap().contains("--watch"), "rs-web watches");
+
+    let staged = dir.join("lessons/general/git/rebase-with-local-edits-using-autostash.md");
+    let lesson = env.kb().join("general/git/rebase-with-local-edits-using-autostash.md");
+    std::fs::write(&lesson, format!("{}\nLIVE EDIT\n", std::fs::read_to_string(&lesson).unwrap())).unwrap();
+    wait_for(&|| std::fs::read_to_string(&staged).is_ok_and(|t| t.contains("LIVE EDIT")), "the edit is staged");
+
+    let new = env.kb().join("general/git/shallow-clones-break-git-describe.md");
+    std::fs::write(&new, std::fs::read_to_string(&new).unwrap().replacen("\n---\n", "\nlabels:\n  sensitivity: public\n---\n", 1)).unwrap();
+    wait_for(
+        &|| lines.lock().unwrap().iter().any(|l| l.contains("wait for `rkb site build`") && l.contains("1a00000004")),
+        "a new lesson waits",
+    );
+    assert!(!dir.join("lessons/general/git/shallow-clones-break-git-describe.md").exists(), "not staged before the user says yes");
+
+    std::fs::write(dir.join("stop"), "").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{:?}", lines.lock().unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -3123,7 +3279,33 @@ fn site_ci_writes_the_workflow_once() {
     );
     assert_eq!(v["variables"], serde_json::json!(["CLOUDFLARE_PROJECT_NAME"]));
     assert!(v["notes"].to_string().contains("base_url"), "{v}");
-    assert_eq!(head_subject(&env), "site: add the CI workflow");
+    assert_eq!(v["links"]["status"], "written", "{v}");
+    assert_eq!(head_subject(&env), "site: add the CI workflows");
+    let links = std::fs::read_to_string(env.kb().join(".github/workflows/links.yml")).unwrap();
+    assert!(!links.contains("--exclude"), "no base_url, nothing to exclude: {links}");
+
+    std::fs::remove_file(env.kb().join(".github/workflows/links.yml")).unwrap();
+    std::fs::write(&toml, format!("{}\n[site]\nbase_url = \"https://kb.example.org/\"\n", std::fs::read_to_string(&toml).unwrap()))
+        .unwrap();
+    assert!(env.git(&["-c", "user.name=T", "-c", "user.email=t@example.org", "commit", "-qam", "site"]).status.success());
+    let (v, _) = site(&env, &["site", "ci"], &[]);
+    assert_eq!((v["status"].as_str(), v["links"]["status"].as_str()), (Some("kept"), Some("written")), "{v}");
+    assert_eq!(head_subject(&env), "site: add the link check workflow");
+    let links = std::fs::read_to_string(env.kb().join(".github/workflows/links.yml")).unwrap();
+    let l: serde_norway::Value = serde_norway::from_str(&links).unwrap();
+    assert!(l["on"]["schedule"][0]["cron"].as_str().is_some() && l["on"].get("workflow_dispatch").is_some(), "{links}");
+    assert_eq!(l["permissions"]["contents"].as_str(), Some("read"));
+    let lsteps = l["jobs"]["links"]["steps"].as_sequence().unwrap();
+    for u in lsteps.iter().filter_map(|s| s["uses"].as_str()) {
+        let sha = u.split_once('@').map(|(_, v)| v).unwrap_or_default();
+        assert!(sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()), "`{u}` is not pinned to a commit");
+    }
+    let check = lsteps.iter().find(|s| s["name"].as_str() == Some("Check links")).unwrap();
+    assert!(check["uses"].as_str().unwrap().starts_with("lycheeverse/lychee-action@"));
+    let args = check["with"]["args"].as_str().unwrap();
+    assert!(args.contains("--exclude '^https://kb\\.example\\.org'") && args.ends_with("'dist/**/*.html'"), "{args}");
+    let build = lsteps.iter().find(|s| s["name"].as_str() == Some("Build")).unwrap();
+    assert!(build["env"].get("SITE_PASSWORD").is_none(), "protected pages are not checked: {links}");
     assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
 
     let text = std::fs::read_to_string(env.kb().join(".github/workflows/site.yml")).unwrap();
@@ -3389,6 +3571,7 @@ fn site_builds_with_real_rs_web() {
     assert!(desc.starts_with("\"When you want to pull or rebase") && !desc.contains("When to use") && !desc.contains("git pull"), "{desc}");
     let headers = std::fs::read_to_string(out.join("_headers")).unwrap();
     assert!(headers.contains("Content-Security-Policy: default-src 'self'") && !headers.contains("unsafe-inline"), "{headers}");
+    assert!(!headers.contains("cloudflareinsights"), "no analytics unless asked: {headers}");
     assert!(headers.contains("/protected/*\n  X-Robots-Tag: noindex"), "{headers}");
     assert!(headers.contains("/static/v/*\n  Cache-Control: public, max-age=31536000, immutable"), "{headers}");
     assert!(lesson.contains("og:image") && lesson.contains("https://kb.example.org/static/og.png"), "{lesson}");
@@ -3535,7 +3718,10 @@ fn site_images_tree_code_and_404_with_real_rs_web() {
     let toml = env.kb().join("kb.toml");
     std::fs::write(
         &toml,
-        format!("{}\n[site]\nbase_url = \"https://kb.example.org\"\nimage = \"site/og.png\"\n", std::fs::read_to_string(&toml).unwrap()),
+        format!(
+            "{}\n[site]\nbase_url = \"https://kb.example.org\"\nimage = \"site/og.png\"\nanalytics = \"cloudflare\"\n",
+            std::fs::read_to_string(&toml).unwrap()
+        ),
     )
     .unwrap();
     let (v, code) = real(&["site", "build", "--out", out.to_str().unwrap()]);
@@ -3543,6 +3729,12 @@ fn site_images_tree_code_and_404_with_real_rs_web() {
     let page = std::fs::read_to_string(dir.join("index.html")).unwrap();
     assert_ne!(hashed_css(&page), first, "a changed stylesheet gets a new address");
     assert!(page.contains("https://kb.example.org/static/og-site.png") && !page.contains("og:image:width"), "{page}");
+    let headers = std::fs::read_to_string(out.join("_headers")).unwrap();
+    assert!(
+        headers.contains("script-src 'self' 'wasm-unsafe-eval' https://static.cloudflareinsights.com;")
+            && headers.contains("connect-src 'self' https://cloudflareinsights.com;"),
+        "{headers}"
+    );
     let custom = std::fs::read(out.join("static/og-site.png")).unwrap();
     assert!(!String::from_utf8_lossy(&custom).contains("GPS"), "the custom preview image loses its metadata");
     let missing = std::fs::read_to_string(out.join("404.html")).unwrap();

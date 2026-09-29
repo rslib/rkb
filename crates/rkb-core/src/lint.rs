@@ -146,6 +146,11 @@ pub fn lint(snap: &Snapshot, env: &LintEnv, focus: Option<&BTreeSet<String>>) ->
             out.error("kb.toml", None, "config/site-image", format!("[site] image `{img}` must be a png or jpg file"));
         }
     }
+    if let Some(a) = kb.as_ref().and_then(|k| k.site.analytics.as_deref())
+        && a != "cloudflare"
+    {
+        out.error("kb.toml", None, "config/site-analytics", format!("[site] analytics `{a}` is not known; the only value is `cloudflare`"));
+    }
     let leak = kb.as_ref().map(|k| &k.leak).cloned().unwrap_or_default();
     let scanner = LeakScanner::new(&leak, env.user.as_deref(), env.home.as_deref());
 

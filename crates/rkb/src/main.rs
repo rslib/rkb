@@ -215,6 +215,9 @@ enum Cmd {
         /// The hash `rkb show` printed; the edit fails if the lesson changed since.
         #[arg(long)]
         base: Option<String>,
+        /// An image (png, jpg, webp or svg) to store with the lesson, metadata removed; replaces one of the same name. Repeatable.
+        #[arg(long = "asset", value_name = "FILE")]
+        assets: Vec<String>,
     },
     /// Mark a lesson stale because it looks wrong.
     #[command(after_help = "Example:\n  rkb flag 7f3a9c2b41 --reason \"fix failed with HDF5 1.14.3\"")]
@@ -640,7 +643,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             Ok(list::render(&listing, &root, colored))
         }
         Cmd::Add { topic, kind, template, text, assets } => writes::add(&env, topic, kind, template, text, assets),
-        Cmd::Edit { id, base } => writes::edit(&env, id, base),
+        Cmd::Edit { id, base, assets } => writes::edit(&env, id, base, assets),
         Cmd::Flag { id, reason } => writes::flag(&env, id, reason),
         Cmd::Review { folder } => {
             kb::open(&root)?;

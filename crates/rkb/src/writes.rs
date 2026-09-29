@@ -214,17 +214,21 @@ pub fn add(
     } else {
         read_stdin()?
     };
-    let assets = assets.iter().map(|a| std::path::absolute(a).map(|p| p.display().to_string()).unwrap_or_else(|_| a.clone())).collect();
-    let o = write::apply(&env.ctx(), &Action::Add { text, topic, assets }, &[])?;
+    let o = write::apply(&env.ctx(), &Action::Add { text, topic, assets: absolute(assets) }, &[])?;
     Ok(outcome(env, o))
 }
 
-pub fn edit(env: &Env, id: String, base: Option<String>) -> Result<Output, CliError> {
+/// `--asset` paths made absolute, so a confirm from another folder finds them.
+fn absolute(assets: Vec<String>) -> Vec<String> {
+    assets.into_iter().map(|a| std::path::absolute(&a).map(|p| p.display().to_string()).unwrap_or(a)).collect()
+}
+
+pub fn edit(env: &Env, id: String, base: Option<String>, assets: Vec<String>) -> Result<Output, CliError> {
     kb::open(&env.root)?;
     let (text, base) = if stdin_is_terminal() {
         let (_, current) = kb::find(&env.root, &id)?;
         let text = editor(&current)?;
-        if text == current {
+        if text == current && assets.is_empty() {
             return Ok(nothing("The lesson was not changed; nothing was written"));
         }
         (text, content_hash(current.as_bytes()))
@@ -234,7 +238,7 @@ pub fn edit(env: &Env, id: String, base: Option<String>) -> Result<Output, CliEr
         })?;
         (read_stdin()?, base)
     };
-    let o = write::apply(&env.ctx(), &Action::Edit { id, text, base }, &[])?;
+    let o = write::apply(&env.ctx(), &Action::Edit { id, text, base, assets: absolute(assets) }, &[])?;
     Ok(outcome(env, o))
 }
 

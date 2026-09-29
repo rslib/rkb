@@ -46,7 +46,58 @@ pub struct Site {
     pub secrets: Vec<Secret>,
     /// Lessons left out because the password they need is not set, by its variable.
     pub left_out: BTreeMap<String, usize>,
+    /// Lessons held back: the held ids given to `collect_holding` and the lessons that link to them.
+    pub held: Vec<String>,
     pub index: Value,
+}
+
+/// The record of first publications, in the knowledge base so every machine and CI share it.
+pub const RECORD: &str = "site/published.json";
+
+/// Ids published in the clear, and ids published encrypted with their password group (`""` for the
+/// site password). An older file's `ids` are in the clear, and its `encrypted` list is the site password.
+#[derive(Default, PartialEq)]
+pub struct Published {
+    pub clear: BTreeSet<String>,
+    pub encrypted: BTreeMap<String, String>,
+}
+
+pub fn read_published(path: &Path) -> Published {
+    let v: Value = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let set = |k: &str| -> BTreeSet<String> {
+        v[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
+    };
+    let mut clear = set("clear");
+    clear.extend(set("ids"));
+    let mut encrypted: BTreeMap<String, String> = set("encrypted").into_iter().map(|i| (i, String::new())).collect();
+    if let Some(m) = v["encrypted"].as_object() {
+        encrypted.extend(m.iter().map(|(k, g)| (k.clone(), g.as_str().unwrap_or_default().to_string())));
+    }
+    Published { clear, encrypted }
+}
+
+/// The knowledge base's record, with the per-machine record of an earlier rkb merged in.
+pub fn published(root: &Path, state: &Path) -> Published {
+    let mut p = read_published(&root.join(RECORD));
+    let old = read_published(&state.join("site-published.json"));
+    p.clear.extend(old.clear);
+    for (i, g) in old.encrypted {
+        p.encrypted.entry(i).or_insert(g);
+    }
+    p
+}
+
+/// The password group of a protected lesson; `""` for the site password.
+pub fn group_name(s: &Site, id: &str) -> String {
+    s.groups.get(id).cloned().flatten().unwrap_or_default()
+}
+
+/// Lessons `s` would publish that the record `p` has not seen in that form: new in the clear, and
+/// new encrypted or encrypted with another password.
+pub fn pending(s: &Site, p: &Published) -> (Vec<String>, Vec<String>) {
+    let clear = s.ids.iter().filter(|i| !p.clear.contains(*i)).cloned().collect();
+    let enc = s.protected.iter().filter(|i| p.encrypted.get(*i) != Some(&group_name(s, i))).cloned().collect();
+    (clear, enc)
 }
 
 /// The label that names a lesson's password group.
@@ -106,6 +157,12 @@ fn folder(kind: Kind) -> &'static str {
 /// `usable` says whether the password in an environment variable is set; a lesson whose password
 /// is not set is left out. A `password` label protects a lesson that either sink allows.
 pub fn collect(root: &Path, usable: impl Fn(&str) -> bool) -> Result<Site> {
+    collect_holding(root, usable, &BTreeSet::new())
+}
+
+/// `collect` without the lessons in `held`, nor any staged lesson that links to one of them, so a
+/// lesson waiting for the user's yes and its referrers wait together instead of failing the build.
+pub fn collect_holding(root: &Path, usable: impl Fn(&str) -> bool, held: &BTreeSet<String>) -> Result<Site> {
     let snap = Snapshot::from_dir(root)?;
     let kb: KbConfig = snap
         .files
@@ -126,7 +183,7 @@ pub fn collect(root: &Path, usable: impl Fn(&str) -> bool) -> Result<Site> {
     lessons.sort_by(|a, b| a.path.cmp(&b.path));
     let mut left_out: BTreeMap<String, usize> = BTreeMap::new();
     let mut passwords: Vec<Option<String>> = vec![];
-    let kinds: Vec<Option<Kind>> = lessons
+    let mut kinds: Vec<Option<Kind>> = lessons
         .iter()
         .map(|l| {
             let labels = crate::write::effective(&snap, &l.path, &l.frontmatter.labels);
@@ -152,6 +209,18 @@ pub fn collect(root: &Path, usable: impl Fn(&str) -> bool) -> Result<Site> {
         })
         .collect();
     let g = Graph::new(lessons);
+    let mut dropped: BTreeSet<usize> =
+        (0..g.lessons.len()).filter(|&i| kinds[i].is_some() && held.contains(&g.lessons[i].frontmatter.id)).collect();
+    loop {
+        for &i in &dropped {
+            kinds[i] = None;
+        }
+        let more: BTreeSet<usize> = g.links.iter().filter(|&&(a, b)| kinds[a].is_some() && dropped.contains(&b)).map(|&(a, _)| a).collect();
+        if more.is_empty() {
+            break;
+        }
+        dropped.extend(more);
+    }
     let leaks: Vec<String> = g
         .links
         .iter()
@@ -167,7 +236,8 @@ pub fn collect(root: &Path, usable: impl Fn(&str) -> bool) -> Result<Site> {
         });
     }
     let index = index(&g, &kinds, &passwords, &kb.site, &snap.files);
-    let mut site = Site { files: vec![], ids: vec![], protected: vec![], groups: BTreeMap::new(), secrets: vec![], left_out, index };
+    let held: Vec<String> = dropped.iter().map(|&i| g.lessons[i].frontmatter.id.clone()).collect();
+    let mut site = Site { files: vec![], ids: vec![], protected: vec![], groups: BTreeMap::new(), secrets: vec![], left_out, held, index };
     for ((l, kind), group) in g.lessons.iter().zip(&kinds).zip(&passwords) {
         let Some(kind) = *kind else { continue };
         site.files.push((format!("{}/{}", folder(kind), l.path), snap.files[&l.path].clone()));
@@ -293,6 +363,7 @@ fn index(g: &Graph, kinds: &[Option<Kind>], passwords: &[Option<String>], site: 
             "description": setting(&site.description, ""),
             "base_url": setting(&site.base_url, ""),
             "author": setting(&site.author, ""),
+            "analytics": setting(&site.analytics, ""),
         },
         "lessons": public,
         "protected": protected,
@@ -383,6 +454,22 @@ mod tests {
         assert!(a.get("stale_reason").is_none());
         assert_eq!(s.index["lessons"][1]["stale_reason"], "newer cmake changed this");
         assert_eq!(s.index["protected"][0]["images"], json!({ "c.assets/s.svg": "protected/general/git/c.assets/s.svg" }));
+    }
+
+    #[test]
+    fn held_lessons_take_their_referrers_along() {
+        let dir = kb(&[
+            ("general/git/a.md", lesson("0000000001", "Links to b", "public", "See [b](b.md).")),
+            ("general/git/b.md", lesson("0000000002", "Links to c", "public", "See [c](c.md).")),
+            ("general/git/c.md", lesson("0000000003", "New one", "public", "Plain.")),
+            ("general/git/d.md", lesson("0000000004", "Unrelated", "public", "Plain.")),
+        ]);
+        let held: BTreeSet<String> = ["0000000003".to_string()].into();
+        let s = collect_holding(dir.path(), |_: &str| false, &held).unwrap();
+        assert_eq!(s.ids, ["0000000004"]);
+        assert_eq!(s.held, ["0000000001", "0000000002", "0000000003"]);
+        assert!(!s.index.to_string().contains("New one") && !s.index.to_string().contains("Links to b"));
+        assert!(collect(dir.path(), |_: &str| false).unwrap().held.is_empty());
     }
 
     #[test]

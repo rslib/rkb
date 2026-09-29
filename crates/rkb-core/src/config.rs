@@ -36,6 +36,8 @@ pub struct SiteConfig {
     pub author: Option<String>,
     /// A PNG or JPEG in the knowledge base for link previews, such as `site/og.png`.
     pub image: Option<String>,
+    /// `cloudflare`: allow Cloudflare Web Analytics' beacon in the Content-Security-Policy.
+    pub analytics: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

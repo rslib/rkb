@@ -233,6 +233,9 @@ fn kb_checks(root: &Path, place: &Place, state_dir: &Path, env: &LintEnv, out: &
     if let Some(c) = site_workflow(root) {
         out.push(c);
     }
+    if let Some(c) = site_approvals(root, state_dir) {
+        out.push(c);
+    }
 
     let changes = git::run(root, &["status", "--porcelain"]).map(|o| String::from_utf8_lossy(&o).lines().count()).unwrap_or(0);
     out.push(if changes == 0 {
@@ -282,6 +285,32 @@ fn kb_checks(root: &Path, place: &Place, state_dir: &Path, env: &LintEnv, out: &
     if let Some(c) = root_commit_missing(root, place) {
         out.push(c);
     }
+}
+
+/// Lessons the site would publish but the publish record has not seen, with this shell's passwords.
+/// No check without `[sinks.web]`; a knowledge base the site cannot build is `rkb site build`'s to report.
+fn site_approvals(root: &Path, state_dir: &Path) -> Option<Check> {
+    let s = crate::site::collect(root, |v| std::env::var(v).is_ok_and(|x| !x.is_empty())).ok()?;
+    let (clear, enc) = crate::site::pending(&s, &crate::site::published(root, state_dir));
+    if clear.is_empty() && enc.is_empty() {
+        return Some(check("site approvals", Level::Ok, "every lesson the site publishes is recorded", None));
+    }
+    let title = |id: &str| {
+        ["lessons", "protected"]
+            .iter()
+            .flat_map(|k| s.index[*k].as_array().into_iter().flatten())
+            .find(|l| l["id"] == id)
+            .and_then(|l| l["title"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let names: Vec<String> = clear.iter().chain(&enc).map(|i| format!("{i} {}", title(i))).collect();
+    Some(check(
+        "site approvals",
+        Level::Warn,
+        format!("{} lessons wait for a first-publication yes, so CI leaves them out: {}", names.len(), names.join("; ")),
+        Some("run `rkb site build`, answer `publish`, and push the knowledge base".into()),
+    ))
 }
 
 /// The rkb version `.github/workflows/site.yml` downloads, against the running one.

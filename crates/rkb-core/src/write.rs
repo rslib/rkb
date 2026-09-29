@@ -246,7 +246,7 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
     let snap = Snapshot::from_dir(ctx.root)?;
     let prepared = match action {
         Action::Add { text, topic, assets } => add(ctx, &kb, &snap, action, approved, text, topic, assets)?,
-        Action::Edit { id, text, base } => edit(&kb, &snap, action, approved, id, text, base)?,
+        Action::Edit { id, text, base, assets } => edit(&kb, &snap, action, approved, id, text, base, assets)?,
         Action::Flag { id, reason } => flag(&snap, id, reason)?,
         Action::Supersede { id, by, reason } => supersede(&snap, action, approved, id, by, reason)?,
         Action::Archive { target, reason } => archive(ctx, &snap, action, approved, target, reason)?,
@@ -596,7 +596,18 @@ fn check_labels(
     }
 }
 
-fn edit(kb: &KbConfig, snap: &Snapshot, action: &Action, approved: &[Decision], id: &str, text: &str, base: &str) -> Result<Step> {
+#[allow(clippy::too_many_arguments)]
+fn edit(
+    kb: &KbConfig,
+    snap: &Snapshot,
+    action: &Action,
+    approved: &[Decision],
+    id: &str,
+    text: &str,
+    base: &str,
+    assets: &[String],
+) -> Result<Step> {
+    let images = read_assets(assets)?;
     let (lessons, _) = snap.lessons();
     let old = find(&lessons, id)?;
     let current = content_hash(&snap.files[&old.path]);
@@ -626,24 +637,21 @@ fn edit(kb: &KbConfig, snap: &Snapshot, action: &Action, approved: &[Decision], 
             "`rkb edit` does not change `status`, `superseded_by` or `stale_reason`; use `rkb flag` (or change `Evidence` to revive a stale lesson)",
         ));
     }
+    let (folder, file) = old.path.rsplit_once('/').unwrap_or(("", &old.path));
+    let stem = file.trim_end_matches(".md");
+    let names: Vec<&str> = images.iter().map(|(n, _)| n.as_str()).collect();
+    new.body = link_assets(&new.body, &names, stem);
     let out = lesson::write(&new.frontmatter, &new.body);
-    if out.as_bytes() == snap.files[&old.path].as_slice() {
+    let extra: Vec<(String, Vec<u8>)> = images.into_iter().map(|(n, d)| (format!("{folder}/{stem}.assets/{n}"), d)).collect();
+    let same_images = extra.iter().all(|(p, d)| snap.files.get(p) == Some(d));
+    if out.as_bytes() == snap.files[&old.path].as_slice() && same_images {
         return Ok(Err(Outcome::Unchanged { id: id.to_string(), path: old.path.clone() }));
     }
     if let Some(step) = check_labels(kb, snap, action, approved, &old.path, &o.labels, &new.frontmatter.labels)? {
         return Ok(Err(step));
     }
     let title = title_of(&new.body).unwrap_or_default();
-    Ok(Ok(Prepared {
-        kind: "edit",
-        id: id.to_string(),
-        path: old.path.clone(),
-        title,
-        text: out,
-        extra: vec![],
-        notes: vec![],
-        message: None,
-    }))
+    Ok(Ok(Prepared { kind: "edit", id: id.to_string(), path: old.path.clone(), title, text: out, extra, notes: vec![], message: None }))
 }
 
 fn flag(snap: &Snapshot, id: &str, reason: &str) -> Result<Step> {
