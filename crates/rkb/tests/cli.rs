@@ -3093,6 +3093,7 @@ fn site_ci_writes_the_workflow_once() {
     assert!(install.contains("rkb-linux-x86_64-v$RKB_VERSION.tar.gz") && install.contains("sha256sum -c"), "{install}");
     let build = &steps[2];
     assert_eq!(build["run"].as_str(), Some("rkb site build --no-ask --out dist"));
+    assert_eq!(build["env"]["USER"].as_str(), Some(""), "the runner's user name is not a leak");
     assert_eq!(build["env"]["SITE_PASSWORD"].as_str(), Some("${{ secrets.SITE_PASSWORD }}"));
     assert_eq!(build["env"]["SITE_PASSWORD_TEAM_A"].as_str(), Some("${{ secrets.SITE_PASSWORD_TEAM_A }}"));
     let deploy = &steps[3];

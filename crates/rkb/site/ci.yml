@@ -34,6 +34,8 @@ jobs:
       - name: Build
         env:
           RKB_HOME: ${{ github.workspace }}
+          # The runner's user name is `runner`, a common word; the leak check still uses leak.usernames.
+          USER: ""
 @PASSWORDS@
         run: rkb site build --no-ask --out dist
       - name: Deploy
