@@ -211,14 +211,15 @@ pub fn find(env: &Env, query: &str, limit: usize) -> Result<Output, CliError> {
 }
 
 /// `hooks.recall_min_relevance` and `hooks.recall_min_margin` from kb.toml, else the defaults.
-fn recall_thresholds(root: &std::path::Path) -> (f64, f64) {
+fn recall_thresholds(root: &std::path::Path, backend: &str) -> (f64, f64) {
     let hooks = std::fs::read_to_string(root.join("kb.toml"))
         .ok()
         .and_then(|t| rkb_core::config::parse::<rkb_core::config::KbConfig>(&t).ok())
         .and_then(|c| c.hooks)
         .unwrap_or_default();
     let get = |k: &str, d: f64| hooks.get(k).and_then(|v| v.as_float()).unwrap_or(d);
-    (get("recall_min_relevance", rkb_core::hooks::RECALL_MIN_RELEVANCE), get("recall_min_margin", rkb_core::hooks::RECALL_MIN_MARGIN))
+    let (min, margin) = rkb_core::hooks::recall_defaults(backend);
+    (get("recall_min_relevance", min), get("recall_min_margin", margin))
 }
 
 pub fn eval(
@@ -272,7 +273,7 @@ pub fn eval(
         Ok(())
     })?;
     let pass = min_recall.is_none_or(|m| report.recall_at_5 + 1e-9 >= m);
-    let (min, margin) = recall_thresholds(&env.root);
+    let (min, margin) = recall_thresholds(&env.root, backend);
     let c = env.colored;
     let mut human = String::new();
     let scores = |r: &eval::Row| -> String {
@@ -399,7 +400,6 @@ pub fn replay(env: &Env, days: u64, min_recall: Option<f64>, backend: Option<&st
 
     let settings = Settings::load(&env.root);
     let cfg = crate::hook::hooks_config(&env.root);
-    let strength = hooks::Strength::from_config(&cfg);
     let hook_ms = cfg.get("hook_timeout_ms").and_then(toml::Value::as_integer).map_or(hooks::DEFAULT_HOOK_TIMEOUT_MS, |v| v.max(0) as u64);
     let timeout = std::time::Duration::from_millis(if backend.is_some() { 120_000 } else { hook_ms });
     let mut ranked_by = BM25.to_string();
@@ -421,7 +421,7 @@ pub fn replay(env: &Env, days: u64, min_recall: Option<f64>, backend: Option<&st
             found.insert(r.session.clone());
         }
         let text_of = |id: &str| rkb_core::kb::find(&env.root, id).map(|(_, t)| t).unwrap_or_default();
-        match hooks::would_inject(&res.hits, text_of, &r.query, &strength) {
+        match hooks::would_inject(&res.hits, text_of, &r.query, &hooks::Strength::from_config(&cfg, &ranked.backend)) {
             Some(h) => {
                 would += 1;
                 would_irrelevant += usize::from(irrelevant.contains(&(r.session.clone(), h.id.clone())));

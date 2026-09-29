@@ -215,12 +215,14 @@ pub struct Strength {
 }
 
 impl Strength {
-    /// From `[hooks]` in `kb.toml`; a missing key keeps its default.
-    pub fn from_config(cfg: &toml::Table) -> Self {
+    /// From `[hooks]` in `kb.toml` for the backend that ranked; a missing key keeps that backend's default.
+    pub fn from_config(cfg: &toml::Table, backend: &str) -> Self {
         let get = |k: &str, default: f64| cfg.get(k).and_then(toml::Value::as_float).unwrap_or(default);
+        let (min, margin) =
+            if backend == "jev" { (JEV_MIN_RELEVANCE, JEV_MIN_MARGIN) } else { (DEFAULT_MIN_RELEVANCE, DEFAULT_MIN_MARGIN) };
         Strength {
-            min_relevance: get("min_relevance", DEFAULT_MIN_RELEVANCE),
-            min_margin: get("min_margin", DEFAULT_MIN_MARGIN),
+            min_relevance: get("min_relevance", min),
+            min_margin: get("min_margin", margin),
             min_coverage: get("min_coverage", DEFAULT_MIN_COVERAGE),
         }
     }
@@ -295,6 +297,18 @@ pub const RECALL_MIN_RELEVANCE: f64 = 0.85;
 /// ...and at least this much above the next lesson: Laya rates general lessons high for many questions,
 /// so a lone clear winner is the signal, not a high score alone.
 pub const RECALL_MIN_MARGIN: f64 = 0.10;
+
+/// Jev's scores separate right from wrong lower down than Laya's. On the harder eval set (124
+/// queries, 2026-09-29) Jev recalled 83 right and 0 wrong at 0.75 with a 0.05 lead (the first wrong
+/// one at 0.70 with no lead), against 67 and 0 at Laya's 0.85 and 0.10; Laya at 0.75 gave 38 and 13.
+/// Both hooks use these when Jev ranked, unless `kb.toml` sets its own.
+pub const JEV_MIN_RELEVANCE: f64 = 0.75;
+pub const JEV_MIN_MARGIN: f64 = 0.05;
+
+/// Prompt recall's default `(min_relevance, margin)` for the backend that ranked.
+pub fn recall_defaults(backend: &str) -> (f64, f64) {
+    if backend == "jev" { (JEV_MIN_RELEVANCE, JEV_MIN_MARGIN) } else { (RECALL_MIN_RELEVANCE, RECALL_MIN_MARGIN) }
+}
 
 /// Whether recall adds the top lesson: rated at least `min`, and at least `margin` above the next one.
 pub fn clear_winner(top: f64, next: f64, min: f64, margin: f64) -> bool {
@@ -619,6 +633,11 @@ mod tests {
     #[test]
     fn model_relevance_overrides_coverage() {
         let t = Strength { min_relevance: 0.8, min_margin: 0.1, min_coverage: 0.6 };
+        let jev = Strength::from_config(&toml::Table::new(), "jev");
+        assert_eq!((jev.min_relevance, jev.min_margin), (JEV_MIN_RELEVANCE, JEV_MIN_MARGIN));
+        let set: toml::Table = toml::from_str("min_relevance = 0.9").unwrap();
+        assert_eq!(Strength::from_config(&set, "jev").min_relevance, 0.9, "kb.toml wins");
+        assert_eq!(recall_defaults("laya (gpu)"), (RECALL_MIN_RELEVANCE, RECALL_MIN_MARGIN));
         assert!(!strong_enough(Some(0.62), 0.0, || 1.0, &t));
         assert!(strong_enough(Some(0.91), 0.0, || 0.0, &t));
         assert!(!strong_enough(Some(0.86), 0.81, || 1.0, &t), "no clear winner");

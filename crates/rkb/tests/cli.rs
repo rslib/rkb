@@ -4568,3 +4568,30 @@ fn jev_config_lint_default_and_doctor() {
     let warn = v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "jev" && c["status"] == "warn").cloned().unwrap_or_default();
     assert!(warn["detail"].as_str().unwrap_or("").contains("internal"), "{v}");
 }
+
+#[test]
+fn recall_uses_jev_thresholds_when_jev_ranked() {
+    let env = search_kb();
+    set_chain(&env, "chain = [\"jev\", \"bm25\"]\n\n[hooks]\nhook_timeout_ms = 5000");
+    jev_config(&env, "[jev]\napi_key = \"k\"\n", 0o600);
+    let (url, _log) = fake_jev(|body| {
+        let answers: serde_json::Map<String, serde_json::Value> = body["questions"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| (k.clone(), serde_json::json!({ "type": "noul", "noul": if k == "lesson_0" { 0.80 } else { 0.20 } })))
+            .collect();
+        (200, serde_json::json!({ "answers": answers }).to_string())
+    });
+    let run = |session: &str| {
+        let payload = serde_json::json!({ "session_id": session, "cwd": env.dir.path(), "prompt": "the linker says undefined reference to vtable for Widget" });
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.args(["hook", "prompt"]).env("RKB_JEV_URL", &url);
+        stdout(&rkb_with(c, &[], &payload.to_string()))
+    };
+    assert!(run("j1").contains("additionalContext"), "0.80 with a 0.60 lead passes Jev's 0.75 and 0.05");
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write("kb.toml", &toml.replace("hook_timeout_ms = 5000", "hook_timeout_ms = 5000\nrecall_min_relevance = 0.85"));
+    assert_eq!(run("j2"), "", "a kb.toml value wins over Jev's default");
+    assert_eq!(std::fs::read_to_string(env.dir.path().join("state/rkb/hook-errors.log")).unwrap_or_default(), "", "no hook error");
+}

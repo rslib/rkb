@@ -2,7 +2,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rkb_core::conditions::{Facts, Verdict};
-use rkb_core::hooks::{self, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_RECORD_SCORE, MAX_NUDGES, RECALL_MIN_MARGIN, RECALL_MIN_RELEVANCE};
+use rkb_core::hooks::{self, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_RECORD_SCORE, MAX_NUDGES};
 use rkb_core::matching::{Hints, Place};
 use rkb_core::search::{Mode, Options};
 use rkb_core::{config, kb, lock, paths, request, rerank, search, state, usage};
@@ -211,7 +211,7 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
         &hits,
         |id| kb::find(&root, id).map(|(_, t)| t).unwrap_or_default(),
         error,
-        &hooks::Strength::from_config(&cfg),
+        &hooks::Strength::from_config(&cfg, &ranked.backend),
     );
     let seen = chosen.is_some_and(|h| hooks::read(state, session).iter().any(|r| r["kind"] == "injected" && r["id"] == h.id.as_str()));
     let hit = chosen.filter(|_| !seen).cloned();
@@ -292,9 +292,10 @@ fn recall(p: &Value, state: &Path, session: &str, text: &str) -> Result<Option<S
     if cfg.get("recall").and_then(toml::Value::as_bool) == Some(false) {
         return Ok(None);
     }
-    let min = cfg.get("recall_min_relevance").and_then(toml::Value::as_float).unwrap_or(RECALL_MIN_RELEVANCE);
-    let margin = cfg.get("recall_min_margin").and_then(toml::Value::as_float).unwrap_or(RECALL_MIN_MARGIN);
     let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, text)?;
+    let (min_default, margin_default) = hooks::recall_defaults(&ranked.backend);
+    let min = cfg.get("recall_min_relevance").and_then(toml::Value::as_float).unwrap_or(min_default);
+    let margin = cfg.get("recall_min_margin").and_then(toml::Value::as_float).unwrap_or(margin_default);
     // A BM25 score means different things for different queries, so without a model there is no threshold.
     if ranked.scores.is_none() {
         return Ok(None);
