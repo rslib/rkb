@@ -3096,9 +3096,17 @@ fn site_ci_writes_the_workflow_once() {
     assert_eq!(build["env"]["USER"].as_str(), Some(""), "the runner's user name is not a leak");
     assert_eq!(build["env"]["SITE_PASSWORD"].as_str(), Some("${{ secrets.SITE_PASSWORD }}"));
     assert_eq!(build["env"]["SITE_PASSWORD_TEAM_A"].as_str(), Some("${{ secrets.SITE_PASSWORD_TEAM_A }}"));
-    let deploy = &steps[3];
+    let create = steps[3]["run"].as_str().unwrap();
+    assert!(create.contains("pages project create") && create.contains(&format!("--production-branch={branch}")), "{create}");
+    let deploy = &steps[4];
     assert_eq!(deploy["uses"].as_str(), Some("cloudflare/wrangler-action@v3"));
-    assert_eq!(deploy["with"]["command"].as_str(), Some("pages deploy dist --project-name=${{ vars.CLOUDFLARE_PROJECT_NAME }}"));
+    assert_eq!(
+        deploy["with"]["command"].as_str(),
+        Some(
+            format!("pages deploy dist --project-name=${{{{ vars.CLOUDFLARE_PROJECT_NAME }}}} --branch={branch} --commit-dirty=true")
+                .as_str()
+        )
+    );
     assert_eq!(deploy["with"]["apiToken"].as_str(), Some("${{ secrets.CLOUDFLARE_API_TOKEN }}"));
 
     let doctor = |env: &Env| {
