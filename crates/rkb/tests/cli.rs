@@ -641,6 +641,8 @@ fn write_burst_asks_before_flooding() {
     assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "3 commits in the last hour > 2: {v}");
     assert!(v["question"].as_str().unwrap().contains("may be looping"), "{v}");
     assert_eq!(commit_count(&env), before, "nothing written");
+    let (bad, _) = env.json(&["flag", "0000000000", "--reason", "x"], "");
+    assert_eq!(bad["error"]["code"], "not_found", "a write that would fail does not ask: {bad}");
     let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
     c.env("CLAUDECODE", "1");
     let o = rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", "continue", "--format", "json"], "");

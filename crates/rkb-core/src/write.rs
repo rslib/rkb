@@ -249,10 +249,12 @@ pub(crate) struct Prepared {
 pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcome> {
     let kb: KbConfig = std::fs::read_to_string(ctx.root.join("kb.toml")).ok().and_then(|t| config::parse(&t).ok()).unwrap_or_default();
     let _lock = kb_lock(ctx.root, &kb)?;
-    if let Some(step) = burst(ctx.root, &kb, action, approved)? {
+    if matches!(action, Action::Move { .. } | Action::Rename { .. })
+        && let Some(step) = burst(ctx.root, &kb, action, approved)?
+    {
         return saved(ctx, step);
     }
-    let snap = Snapshot::from_dir(ctx.root)?;
+    let mut snap = Snapshot::from_dir(ctx.root)?;
     let prepared = match action {
         Action::Add { text, topic, assets, inbox } => add(ctx, &kb, &snap, action, approved, text, topic, assets, inbox.as_deref())?,
         Action::Edit { id, text, base, assets } => edit(&kb, &snap, action, approved, id, text, base, assets)?,
@@ -271,10 +273,19 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
             unreachable!("confirm handles these itself")
         }
     };
-    match prepared {
-        Ok(p) => finish(ctx, snap, p),
-        Err(outcome) => saved(ctx, outcome),
+    let p = match prepared {
+        Ok(p) => p,
+        Err(outcome) => return saved(ctx, outcome),
+    };
+    // A write that would fail anyway never asks about a burst.
+    let blocking = stage(&mut snap, ctx.env, &p);
+    if !blocking.is_empty() {
+        return Err(Error::Invalid(blocking));
     }
+    if let Some(step) = burst(ctx.root, &kb, action, approved)? {
+        return saved(ctx, step);
+    }
+    finish(ctx, snap, p)
 }
 
 /// Commits a looping agent may make in an hour before rkb asks the user.

@@ -88,7 +88,9 @@ pub fn program(command: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-static ERROR_LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)error|fatal|failed|not found|undefined|cannot|no such").unwrap());
+static ERROR_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)error|fatal|failed|not found|undefined|cannot|no such|invalid|unknown|unrecognized|unexpected|illegal|denied|refused|panicked|no matches").unwrap()
+});
 
 /// The lines of an error that name the problem, or its last 3 lines when none do.
 pub fn key_lines(error: &str) -> Vec<&str> {
@@ -125,9 +127,12 @@ pub fn coverage(error: &str, text: &str) -> f64 {
     key_lines(error).into_iter().map(|l| line_coverage(l, &t)).fold(0.0, f64::max)
 }
 
+const MIN_LINE_TERMS: usize = 4;
+
 fn line_coverage(line: &str, text: &HashSet<String>) -> f64 {
     let q: HashSet<String> = tokens(line).into_iter().filter(|w| !w.starts_with("0x") && !w.chars().all(|c| c.is_ascii_digit())).collect();
-    if q.is_empty() {
+    // A line of a few common words, such as `invalid command code`, matches too many lessons to mean anything.
+    if q.len() < MIN_LINE_TERMS {
         return 0.0;
     }
     q.iter().filter(|w| text.contains(*w)).count() as f64 / q.len() as f64
@@ -436,8 +441,9 @@ mod tests {
         let c = coverage(error, lesson);
         // Terms of the best line: main.cpp main cpp text undefined reference vtable widget.
         assert!((c - 5.0 / 8.0).abs() < 1e-9, "{c}");
-        assert!((coverage("error: undefined zzz", "undefined error") - 2.0 / 3.0).abs() < 1e-9);
+        assert!((coverage("error: undefined zzz yyy", "undefined error") - 2.0 / 4.0).abs() < 1e-9);
         assert_eq!(coverage("", "x"), 0.0);
+        assert_eq!(coverage("sed: 1: \",+40p\n\": invalid command code ,", "an invalid command code"), 0.0, "3 words say nothing");
     }
 
     #[test]
