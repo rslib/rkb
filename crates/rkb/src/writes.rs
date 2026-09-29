@@ -183,7 +183,14 @@ fn needs_user(env: &Env, req: &Request) -> Output {
     Output { data, human, exit: 3, raw: false }
 }
 
-pub fn add(env: &Env, topic: Option<String>, kind: Option<String>, template: bool, given: Option<String>) -> Result<Output, CliError> {
+pub fn add(
+    env: &Env,
+    topic: Option<String>,
+    kind: Option<String>,
+    template: bool,
+    given: Option<String>,
+    assets: Vec<String>,
+) -> Result<Output, CliError> {
     let kind: Option<LessonType> = kind.map(|k| LessonType::from_name(&k).expect("clap checks the type"));
     if template {
         let kind =
@@ -207,7 +214,8 @@ pub fn add(env: &Env, topic: Option<String>, kind: Option<String>, template: boo
     } else {
         read_stdin()?
     };
-    let o = write::apply(&env.ctx(), &Action::Add { text, topic }, &[])?;
+    let assets = assets.iter().map(|a| std::path::absolute(a).map(|p| p.display().to_string()).unwrap_or_else(|_| a.clone())).collect();
+    let o = write::apply(&env.ctx(), &Action::Add { text, topic, assets }, &[])?;
     Ok(outcome(env, o))
 }
 

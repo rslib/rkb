@@ -405,6 +405,36 @@ fn add_ok(env: &Env, topic: &str, text: &str) -> serde_json::Value {
     v
 }
 
+#[test]
+fn add_stores_images_without_metadata() {
+    let env = kb_with_topics();
+    let img = env.dir.path().join("shots/layout.png");
+    env.write_abs(&img, "");
+    std::fs::write(&img, png_with_gps()).unwrap();
+    let text = format!("{}\n![layout](layout.png)\n", lesson_with("Image lesson").trim_end());
+    let before = commit_count(&env);
+    let (v, code) = env.json(&["add", "--topic", "cmake", "--asset", img.to_str().unwrap()], &text);
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(commit_count(&env), before + 1, "one commit");
+    let path = v["path"].as_str().unwrap();
+    let stem = path.trim_end_matches(".md");
+    let stored = env.kb().join(format!("{stem}.assets/layout.png"));
+    let png = std::fs::read(&stored).unwrap();
+    assert!(png.starts_with(b"\x89PNG") && !String::from_utf8_lossy(&png).contains("GPS"), "the stored image holds no EXIF");
+    let name = stem.rsplit('/').next().unwrap();
+    assert!(front(&env, path).contains(&format!("![layout]({name}.assets/layout.png)")), "{}", front(&env, path));
+    let files = stdout(&env.git(&["show", "--name-only", "--format=", "HEAD"]));
+    assert!(files.contains(".assets/layout.png") && files.contains(".md"), "{files}");
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
+
+    let txt = env.dir.path().join("notes.txt");
+    env.write_abs(&txt, "hi");
+    let (v, code) = env.json(&["add", "--topic", "cmake", "--asset", txt.to_str().unwrap()], &lesson_with("Another lesson"));
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("notes.txt is not an image"), "{v}");
+    assert_eq!(commit_count(&env), before + 1, "nothing written");
+}
+
 fn head_subject(env: &Env) -> String {
     stdout(&env.git(&["log", "-1", "--format=%s"])).trim().to_string()
 }

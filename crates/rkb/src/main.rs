@@ -204,6 +204,9 @@ enum Cmd {
         /// Lesson text from the rkb_add tool instead of stdin.
         #[arg(skip)]
         text: Option<String>,
+        /// An image (png, jpg, webp or svg) to store with the lesson, metadata removed. Repeatable. Link it by file name.
+        #[arg(long = "asset", value_name = "FILE")]
+        assets: Vec<String>,
     },
     /// Replace a lesson with the file read from stdin, or edit it in $EDITOR.
     #[command(after_help = "Example:\n  rkb edit 7f3a9c2b41 --base 3f9a1c0d2e4b < lesson.md")]
@@ -636,7 +639,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             let listing = rkb_core::list::list(&root, folder.as_deref())?;
             Ok(list::render(&listing, &root, colored))
         }
-        Cmd::Add { topic, kind, template, text } => writes::add(&env, topic, kind, template, text),
+        Cmd::Add { topic, kind, template, text, assets } => writes::add(&env, topic, kind, template, text, assets),
         Cmd::Edit { id, base } => writes::edit(&env, id, base),
         Cmd::Flag { id, reason } => writes::flag(&env, id, reason),
         Cmd::Review { folder } => {

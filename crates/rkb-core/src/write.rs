@@ -231,8 +231,8 @@ pub(crate) struct Prepared {
     pub(crate) path: String,
     pub(crate) title: String,
     text: String,
-    /// Other new files committed with the lesson, such as a created folder note.
-    extra: Vec<(String, String)>,
+    /// Other new files committed with the lesson, such as a created folder note or an image.
+    extra: Vec<(String, Vec<u8>)>,
     pub(crate) notes: Vec<Note>,
     /// A commit message other than `<kind>(<folder>): <title> [<id>]`, as for a folder archive.
     message: Option<String>,
@@ -245,7 +245,7 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
     let _lock = kb_lock(ctx.root, &kb)?;
     let snap = Snapshot::from_dir(ctx.root)?;
     let prepared = match action {
-        Action::Add { text, topic } => add(ctx, &kb, &snap, action, approved, text, topic)?,
+        Action::Add { text, topic, assets } => add(ctx, &kb, &snap, action, approved, text, topic, assets)?,
         Action::Edit { id, text, base } => edit(&kb, &snap, action, approved, id, text, base)?,
         Action::Flag { id, reason } => flag(&snap, id, reason)?,
         Action::Supersede { id, by, reason } => supersede(&snap, action, approved, id, by, reason)?,
@@ -325,6 +325,7 @@ fn find<'a>(lessons: &'a [Lesson], id: &str) -> Result<&'a Lesson> {
 
 pub(crate) type Step = std::result::Result<Prepared, Outcome>;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn add(
     ctx: &Ctx,
     kb: &KbConfig,
@@ -333,7 +334,9 @@ pub(crate) fn add(
     approved: &[Decision],
     text: &str,
     topic: &str,
+    assets: &[String],
 ) -> Result<Step> {
+    let images = read_assets(assets)?;
     let (fm_text, body_text, _) = lesson::split(text).map_err(|e| refused(e.message))?;
     let mut map: Mapping = if fm_text.trim().is_empty() {
         Mapping::new()
@@ -460,11 +463,69 @@ pub(crate) fn add(
     if let Some((remotes, root_commit)) = project_note {
         let note = format!("{scope}/README.md");
         if !ctx.root.join(&note).exists() {
-            extra.push((note.clone(), project_note_text(&scope, &remotes, root_commit.as_deref())));
+            extra.push((note.clone(), project_note_text(&scope, &remotes, root_commit.as_deref()).into_bytes()));
             notes.push(Note::ProjectNote { path: note, remote: remotes.first().cloned().unwrap_or_default() });
         }
     }
-    Ok(Ok(Prepared { kind: "add", id, path, title, text: lesson::write(&fm, body_text), extra, notes, message: None }))
+    let stem = path.rsplit('/').next().unwrap_or(&path).trim_end_matches(".md").to_string();
+    let names: Vec<&str> = images.iter().map(|(n, _)| n.as_str()).collect();
+    let body_text = link_assets(body_text, &names, &stem);
+    for (name, data) in images {
+        extra.push((format!("{folder}/{stem}.assets/{name}"), data));
+    }
+    Ok(Ok(Prepared { kind: "add", id, path, title, text: lesson::write(&fm, &body_text), extra, notes, message: None }))
+}
+
+/// Each `--asset` file as `(file name, bytes)`: an image, with its metadata removed when it is a
+/// PNG, JPEG or WebP.
+fn read_assets(paths: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut out: Vec<(String, Vec<u8>)> = vec![];
+    for p in paths {
+        let name = Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+        if !["png", "jpg", "jpeg", "webp", "svg"].contains(&ext.as_str()) {
+            return Err(refused(format!("{p} is not an image; --asset takes png, jpg, jpeg, webp or svg files")));
+        }
+        if out.iter().any(|(n, _)| *n == name) {
+            return Err(refused(format!("two --asset files are named {name}; rename one")));
+        }
+        let data = std::fs::read(p).map_err(|e| refused(format!("{p}: {e}")))?;
+        let data = if ext == "svg" { data } else { crate::image::strip(&ext, &data).map_err(|e| refused(format!("{p}: {e}")))? };
+        out.push((name, data));
+    }
+    Ok(out)
+}
+
+/// Points links to an added image at `<stem>.assets/<name>`: a link to the bare file name, to
+/// `./<name>`, or to `<name>` in any `.assets` folder. Links inside code stay as they are.
+fn link_assets(body: &str, names: &[&str], stem: &str) -> String {
+    if names.is_empty() {
+        return body.to_string();
+    }
+    let b = body::scan(body);
+    let mut lines: Vec<String> = body.split_inclusive('\n').map(String::from).collect();
+    for link in &b.links {
+        let target = link.target.split(['#', '?']).next().unwrap_or_default();
+        let Some(name) = names.iter().find(|n| {
+            target == **n || target.strip_prefix("./") == Some(**n) || target.rsplit_once(".assets/").is_some_and(|(_, f)| f == **n)
+        }) else {
+            continue;
+        };
+        let tail = &link.target[target.len()..];
+        let new = format!("{stem}.assets/{name}{tail}");
+        let Some(line) = lines.get_mut(link.line - 1) else { continue };
+        for (a, b) in [
+            (format!("]({})", link.target), format!("]({new})")),
+            (format!("](<{}>", link.target), format!("](<{new}>")),
+            (format!("]({} ", link.target), format!("]({new} ")),
+        ] {
+            if line.contains(&a) {
+                *line = line.replacen(&a, &b, 1);
+                break;
+            }
+        }
+    }
+    lines.concat()
 }
 
 /// The current repository, when a new project folder is being made from inside an unmatched checkout.
@@ -734,7 +795,7 @@ fn archive(ctx: &Ctx, snap: &Snapshot, action: &Action, approved: &[Decision], t
         path: texts[0].0.clone(),
         title: title_of(&first.body).unwrap_or_default(),
         text: texts[0].1.clone(),
-        extra: texts[1..].to_vec(),
+        extra: texts[1..].iter().map(|(p, t)| (p.clone(), t.clone().into_bytes())).collect(),
         notes: if single { vec![] } else { chosen.iter().map(|l| Note::Archived(l.path.clone())).collect() },
         message: (!single).then(|| format!("archive({folder}): {} lessons", chosen.len())),
     }))
@@ -951,8 +1012,8 @@ pub(crate) fn apply_check(
 /// Puts the prepared files into `snap` and returns the lint errors that concern them.
 pub(crate) fn stage(snap: &mut Snapshot, env: &LintEnv, p: &Prepared) -> Vec<lint::Finding> {
     snap.files.insert(p.path.clone(), p.text.clone().into_bytes());
-    for (path, text) in &p.extra {
-        snap.files.insert(path.clone(), text.clone().into_bytes());
+    for (path, data) in &p.extra {
+        snap.files.insert(path.clone(), data.clone());
     }
     let written: Vec<&String> = std::iter::once(&p.path).chain(p.extra.iter().map(|(path, _)| path)).collect();
     let focus: BTreeSet<String> = written.iter().map(|s| s.to_string()).collect();
@@ -969,7 +1030,7 @@ pub(crate) fn finish(ctx: &Ctx, mut snap: Snapshot, p: Prepared) -> Result<Outco
     }
     let written: Vec<&String> = std::iter::once(&p.path).chain(p.extra.iter().map(|(path, _)| path)).collect();
 
-    for (path, text) in p.extra.iter().chain(std::iter::once(&(p.path.clone(), p.text.clone()))) {
+    for (path, text) in p.extra.iter().chain(std::iter::once(&(p.path.clone(), p.text.clone().into_bytes()))) {
         let abs = ctx.root.join(path);
         let dir = abs.parent().unwrap();
         std::fs::create_dir_all(dir).map_err(io(dir))?;
@@ -1020,6 +1081,16 @@ mod tests {
                 .collect();
         assert_eq!(rewrite_links("![p](a.assets/p.svg)\n", "general/cpp/a.md", "general/cpp/c.md", &renamed), "![p](c.assets/p.svg)\n");
         assert_eq!(rewrite_links("[untouched](other.md)\n", "general/git/b.md", "general/git/b.md", &moved), "[untouched](other.md)\n");
+    }
+
+    #[test]
+    fn added_images_get_the_lesson_folder() {
+        let body = "\n# T\n\n![a](a.png) ![b](./b.png \"t\") ![c](old.assets/c.svg#x)\n`![a](a.png)`\n[other](a.png.md) ![d](d.png)\n";
+        assert_eq!(
+            link_assets(body, &["a.png", "b.png", "c.svg"], "my-lesson"),
+            "\n# T\n\n![a](my-lesson.assets/a.png) ![b](my-lesson.assets/b.png \"t\") ![c](my-lesson.assets/c.svg#x)\n`![a](a.png)`\n[other](a.png.md) ![d](d.png)\n"
+        );
+        assert_eq!(link_assets(body, &[], "x"), body);
     }
 
     #[test]

@@ -42,7 +42,7 @@ fn run_tool(name: &str, args: &Value) -> Result<Output, CliError> {
         "rkb_note" => Cmd::Note { words: vec![text(args, "text")] },
         "rkb_add" => {
             let (topic, lesson) = tools::lesson(args).map_err(|m| CliError::new(ErrorCode::Usage, m, fix(name)))?;
-            Cmd::Add { topic: Some(topic), kind: None, template: false, text: Some(lesson) }
+            Cmd::Add { topic: Some(topic), kind: None, template: false, text: Some(lesson), assets: vec![] }
         }
         other => return Err(CliError::new(ErrorCode::Usage, format!("unknown tool `{other}`"), fix(other))),
     };
