@@ -69,6 +69,11 @@ local function date(iso)
   return tonumber(d) .. " " .. MONTHS[tonumber(m)] .. " " .. y
 end
 
+-- A title for tabs, previews and the feed: Markdown backticks removed.
+local function plain_title(s)
+  return (tostring(s):gsub("`", ""))
+end
+
 -- Titles in backticks show as code, as in the lesson's own heading.
 local function title_html(s)
   return (esc(s):gsub("`([^`]+)`", "<code>%1</code>"))
@@ -372,11 +377,28 @@ local global = {
   base_url = base_url,
 }
 
--- Paths of the public pages, for the sitemap.
+-- Paths of the public pages, for the sitemap, and the verified date of each lesson page.
 local indexed = {}
+local lastmod = {}
+
+local KIND_URL = { Topic = "/general/", Project = "/projects/", System = "/systems/", Tag = "/tags/", Type = "/types/" }
+
+local function lessons_count(n)
+  return n .. (n == 1 and " lesson" or " lessons")
+end
+
+-- A lesson's link-preview text: its prose, after its stale reason when it is stale.
+local function lesson_summary(l)
+  local text = prose(l)
+  if l.status == "stale" then
+    text = "Stale: " .. (l.stale_reason or "this lesson may no longer hold") .. ". " .. text
+  end
+  return summary(text)
+end
 
 -- `summary` describes the page in link previews; `noindex` keeps it out of search engines and the sitemap.
 local function page(path, template, page_title, data, summary_text, noindex)
+  page_title = plain_title(page_title)
   data.tree_lessons = groups[data.open or ""] and groups[data.open].lessons or {}
   data.meta = {
     title = page_title,
@@ -391,12 +413,16 @@ local function page(path, template, page_title, data, summary_text, noindex)
   return { path = path, template = template, title = page_title, data = data }
 end
 
-local function list_page(path, heading, kind, list, open)
-  return page(path, "list.html", heading, { heading = heading, kind = kind, lessons = list, open = open })
+-- A list of lessons. `kind` (Topic, Project, System, Tag or Type) titles the page `<kind>: <name>`
+-- and links to the kind's index; `about` finishes the description after the lesson count.
+local function list_page(path, heading, kind, list, open, about)
+  local data = { heading = heading, kind = kind, kind_url = KIND_URL[kind], lessons = list, open = open }
+  return page(path, "list.html", kind and (kind .. ": " .. heading) or heading, data, lessons_count(#list) .. " " .. about .. ".")
 end
 
-local function index_page(path, heading, list)
-  return page(path, "groups.html", heading, { heading = heading, groups = list, open = "" })
+-- An index of groups; `more` holds groups shown after the main ones in a compact list.
+local function index_page(path, heading, list, desc, more)
+  return page(path, "groups.html", heading, { heading = heading, groups = list, more = more or {}, open = "" }, desc)
 end
 
 return {
@@ -417,6 +443,7 @@ return {
 
   pages = function()
     indexed = {}
+    lastmod = {}
     local recent = {}
     for _, l in ipairs(site.lessons) do
       table.insert(recent, card(l))
@@ -452,12 +479,14 @@ return {
       }),
     }
     for _, l in ipairs(site.lessons) do
-      table.insert(pages, page(l.url, "lesson.html", l.title, { main = lesson_html(l, false), open = place(l), current = l.id }, summary(prose(l))))
+      lastmod[l.url] = l.verified
+      table.insert(pages, page(l.url, "lesson.html", l.title, { main = lesson_html(l, false), open = place(l), current = l.id }, lesson_summary(l)))
       table.insert(pages, page("/lessons/" .. l.id .. "/", "redirect.html", l.title, { to = l.url }, nil, true))
     end
+    local ABOUT = { general = "about ", projects = "in the project ", systems = "on the system " }
     for _, g in pairs(groups) do
       local label = g.scope == "general" and "Topic" or (g.scope == "projects" and "Project" or "System")
-      table.insert(pages, list_page(g.url, g.name, label, g.lessons, g.key))
+      table.insert(pages, list_page(g.url, g.name, label, g.lessons, g.key, ABOUT[g.scope] .. g.name))
     end
     for scope, heading in pairs(SCOPES) do
       if #tree[scope] > 0 then
@@ -465,18 +494,38 @@ return {
         for _, g in ipairs(tree[scope]) do
           table.insert(list, { name = g.name, url = g.url, count = g.count })
         end
-        table.insert(pages, index_page("/" .. scope .. "/", heading, list))
+        local noun = scope == "general" and "topics" or scope
+        table.insert(pages, index_page("/" .. scope .. "/", heading, list, #list .. " " .. noun .. " of " .. title .. "."))
       end
     end
-    local tag_list = {}
+    local tag_list, single = {}, {}
     for name, ids in pairs(site.tags or {}) do
-      table.insert(pages, list_page("/tags/" .. slug(name) .. "/", name, "Tag", cards(ids, true), ""))
-      table.insert(tag_list, { name = name, url = "/tags/" .. slug(name) .. "/", count = #ids })
+      table.insert(pages, list_page("/tags/" .. slug(name) .. "/", name, "Tag", cards(ids, true), "", "tagged " .. name))
+      table.insert(#ids > 1 and tag_list or single, { name = name, url = "/tags/" .. slug(name) .. "/", count = #ids })
     end
-    table.sort(tag_list, function(a, b)
+    local by_name = function(a, b)
       return a.name < b.name
-    end)
-    table.insert(pages, index_page("/tags/", "Tags", tag_list))
+    end
+    table.sort(tag_list, by_name)
+    table.sort(single, by_name)
+    table.insert(pages, index_page("/tags/", "Tags", tag_list, (#tag_list + #single) .. " tags of " .. title .. ".", single))
+    local type_list = {}
+    for _, name in ipairs(TYPE_ORDER) do
+      local list = {}
+      for _, l in ipairs(site.lessons) do
+        if l.type == name then
+          table.insert(list, card(l))
+        end
+      end
+      if #list > 0 then
+        table.sort(list, by_title)
+        local url = "/types/" .. name .. "/"
+        table.insert(pages, list_page(url, TYPES[name].name, "Type", list, "", "of the type " .. TYPES[name].name:lower()))
+        table.insert(type_list, { name = TYPES[name].name, url = url, count = #list })
+      end
+    end
+    table.insert(pages, index_page("/types/", "Types", type_list, "Lessons of " .. title .. " by type."))
+    table.insert(pages, list_page("/all/", "All lessons", nil, recent, "", "in " .. title .. ", newest first"))
     table.insert(pages, page("/404.html", "404.html", "Page not found", { open = "" }, nil, true))
     if #protected > 0 then
       for _, l in ipairs(protected) do
@@ -515,17 +564,26 @@ return {
       end
       -- Security headers for Cloudflare Pages and Netlify. The site has no inline script; hash-wasm
       -- compiles WebAssembly for Argon2, and protected images are data: URLs.
-      rs.fs.write(out .. "/_headers", table.concat({
+      local headers = {
         "/*",
         "  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:;"
           .. " font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         "  X-Content-Type-Options: nosniff",
         "  X-Frame-Options: DENY",
         "  Referrer-Policy: strict-origin-when-cross-origin",
+        "  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+        "  Cross-Origin-Opener-Policy: same-origin",
+        "  Cross-Origin-Resource-Policy: same-origin",
         "/protected/*",
         "  X-Robots-Tag: noindex",
-        "",
-      }, "\n"))
+      }
+      -- With a custom domain, the project's pages.dev addresses stay out of search engines.
+      if base_url ~= "" and not base_url:find("%.pages%.dev$") then
+        table.insert(headers, "https://:project.pages.dev/*")
+        table.insert(headers, "  X-Robots-Tag: noindex")
+      end
+      table.insert(headers, "")
+      rs.fs.write(out .. "/_headers", table.concat(headers, "\n"))
       local tree_json = {}
       for key, g in pairs(groups) do
         tree_json[key] = {}
@@ -561,24 +619,34 @@ return {
       for _, l in ipairs(site.lessons) do
         table.insert(all, card(l))
       end
+      local rfc = function(d)
+        return rs.date.rss_format(rs.date.parse(d))
+      end
       for _, c in ipairs(newest(all)) do
+        local l = by_id[c.id]
         table.insert(
           items,
-          "<item><title>" .. esc(c.title) .. "</title><link>" .. base .. c.url .. "</link><guid>" .. base .. "/lessons/" .. c.id
-            .. "/</guid><pubDate>" .. rs.date.rss_format(rs.date.parse(c.verified)) .. "</pubDate></item>"
+          "<item><title>" .. esc((c.stale and "[Stale] " or "") .. plain_title(c.title)) .. "</title><link>" .. base .. c.url
+            .. "</link><description>" .. esc(lesson_summary(l)) .. '</description><guid isPermaLink="false">' .. base .. "/lessons/"
+            .. c.id .. "/</guid><pubDate>" .. rfc(c.verified) .. "</pubDate></item>"
         )
       end
+      local self_link = base ~= ""
+          and ('<atom:link href="' .. esc(base .. "/feed.xml") .. '" rel="self" type="application/rss+xml"/>')
+        or ""
+      local built = #all > 0 and ("<lastBuildDate>" .. rfc(all[1].verified) .. "</lastBuildDate>") or ""
       rs.fs.write(
         out .. "/feed.xml",
-        '<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0"><channel><title>' .. esc(title) .. "</title><link>" .. base
-          .. "/</link><description>" .. esc(description) .. "</description>"
-          .. table.concat(items) .. "</channel></rss>\n"
+        '<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom"><channel><title>'
+          .. esc(title) .. "</title><link>" .. base .. "/</link><description>" .. esc(description) .. "</description>"
+          .. self_link .. built .. table.concat(items) .. "</channel></rss>\n"
       )
       if base ~= "" then
         table.sort(indexed)
         local urls = {}
         for _, path in ipairs(indexed) do
-          table.insert(urls, "<url><loc>" .. esc(base .. path) .. "</loc></url>")
+          local mod = lastmod[path] and ("<lastmod>" .. lastmod[path] .. "</lastmod>") or ""
+          table.insert(urls, "<url><loc>" .. esc(base .. path) .. "</loc>" .. mod .. "</url>")
         end
         rs.fs.write(
           out .. "/sitemap.xml",

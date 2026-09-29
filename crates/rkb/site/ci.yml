@@ -10,9 +10,10 @@ on:
 permissions:
   contents: read
 
+# Only the newest push matters, so a newer run cancels an older one.
 concurrency:
   group: site
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   deploy:
@@ -20,7 +21,10 @@ jobs:
     env:
       RKB_VERSION: "@VERSION@"
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to commits, since a tag can be moved; the comment names the release.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install rkb
         run: |
           archive="rkb-linux-x86_64-v$RKB_VERSION.tar.gz"
@@ -42,11 +46,20 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx --yes wrangler@4 pages project create "${{ vars.CLOUDFLARE_PROJECT_NAME }}" --production-branch=@BRANCH@ || true
+          PROJECT: ${{ vars.CLOUDFLARE_PROJECT_NAME }}
+        run: |
+          if out=$(npx --yes wrangler@4.143.0 pages project create "$PROJECT" --production-branch=@BRANCH@ 2>&1); then
+            echo "$out"
+          elif echo "$out" | grep -qiE "already exists|8000002"; then
+            echo "Pages project $PROJECT exists"
+          else
+            echo "$out"
+            exit 1
+          fi
       - name: Deploy
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          wranglerVersion: "4"
+          wranglerVersion: "4.143.0"
           command: pages deploy dist --project-name=${{ vars.CLOUDFLARE_PROJECT_NAME }} --branch=@BRANCH@ --commit-dirty=true

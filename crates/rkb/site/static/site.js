@@ -248,7 +248,7 @@
       : shown + (shown === 1 ? " lesson matches “" : " lessons match “") + input.value.trim() + "”";
     const list = $("#results");
     list.replaceChildren(...hits.map((e, i) =>
-      el("a", { class: "result t-" + e.type, href: e.url, id: "r" + i },
+      el("a", { class: "result t-" + e.type, href: e.url, id: "r" + i, role: "option", "aria-selected": "false" },
         el("span", { class: "result-meta" }, el("span", { class: "dot" }), TYPES[e.type] || e.type,
           el("span", { "aria-hidden": "true" }, "·"), el("span", { class: "mono" }, e.place),
           e.locked ? el("span", null, "· protected") : null),
@@ -256,12 +256,17 @@
         el("span", { class: "result-snip" }, snippet(e.text, e.marks)))
     ));
     selected = -1;
+    input.removeAttribute("aria-activedescendant");
+    input.setAttribute("aria-expanded", "true");
+    $("#search-status").textContent = $("#results-head").textContent;
     panel.hidden = false;
     $("#search-hint").textContent = shown + (shown === 1 ? " result" : " results");
   }
 
   function close() {
     panel.hidden = true;
+    input.setAttribute("aria-expanded", "false");
+    input.removeAttribute("aria-activedescendant");
     $("#search-hint").textContent = "/";
     last = [];
   }
@@ -269,7 +274,11 @@
   function select(i) {
     if (!hits.length) return;
     selected = (i + hits.length) % hits.length;
-    $$(".result").forEach((r, j) => r.classList.toggle("selected", j === selected));
+    $$(".result").forEach((r, j) => {
+      r.classList.toggle("selected", j === selected);
+      r.setAttribute("aria-selected", String(j === selected));
+    });
+    input.setAttribute("aria-activedescendant", "r" + selected);
     $("#r" + selected).scrollIntoView({ block: "nearest" });
   }
 

@@ -9,8 +9,14 @@
     <a class="card" href="{{ g.url }}"><span class="card-head"><span class="mono">{{ g.name }}</span><span class="muted">{{ g.count }} lesson{% if g.count != 1 %}s{% endif %}</span></span></a>
     {% endfor %}
   </div>
-  {% else %}
+  {% elif page.data.more | length == 0 %}
   <p class="muted">No published lessons yet.</p>
+  {% endif %}
+  {% if page.data.more | length > 0 %}
+  <section>
+    <h2 class="label">One lesson each</h2>
+    <p class="more-links">{% for g in page.data.more %}<a href="{{ g.url }}">{{ g.name }}</a>{% endfor %}</p>
+  </section>
   {% endif %}
 </div>
 {% endblock %}

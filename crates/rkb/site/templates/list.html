@@ -2,7 +2,7 @@
 
 {% block content %}
 <div class="page">
-  <p class="muted kind">{{ page.data.kind }}</p>
+  {% if page.data.kind %}<p class="muted kind">{% if page.data.kind_url %}<a href="{{ page.data.kind_url }}">{{ page.data.kind }}</a>{% else %}{{ page.data.kind }}{% endif %}</p>{% endif %}
   <h1>{{ page.data.heading }}</h1>
   {% if page.data.lessons | length > 0 %}
   <div class="rows">

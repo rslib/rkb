@@ -8,7 +8,7 @@
     <h1>{{ global.title }}</h1>
     {% if page.data.description %}<p class="lead">{{ page.data.description }}</p>{% else %}<p class="lead">Pitfalls with their fixes, recipes, facts and decisions from real work. Each lesson says what was checked, how and when, and where it holds.</p>{% endif %}
     <div class="pills">
-      {% for t in global.types %}<span class="pill t-{{ t.type }}"><span class="dot"></span>{{ t.name }} {{ t.count }}</span>{% endfor %}
+      {% for t in global.types %}<a class="pill t-{{ t.type }}" href="/types/{{ t.type }}/"><span class="dot"></span>{{ t.name }} {{ t.count }}</a>{% endfor %}
       {% if global.protected_count > 0 %}<a class="pill" href="/protected/"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>Protected {{ global.protected_count }}</a>{% endif %}
     </div>
   </section>
@@ -26,7 +26,7 @@
   </section>
   {% endif %}
   <section>
-    <div class="section-head"><h2>Recently verified</h2><a href="/feed.xml">RSS</a></div>
+    <div class="section-head"><h2>Recently verified</h2><span class="links"><a href="/all/">All {{ global.count }} lessons</a><a href="/feed.xml">RSS</a></span></div>
     {% if page.data.recent | length > 0 %}
     <div class="rows">
       {% for r in page.data.recent %}

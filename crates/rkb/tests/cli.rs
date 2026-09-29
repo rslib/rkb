@@ -3098,8 +3098,20 @@ fn site_ci_writes_the_workflow_once() {
     assert_eq!(build["env"]["SITE_PASSWORD_TEAM_A"].as_str(), Some("${{ secrets.SITE_PASSWORD_TEAM_A }}"));
     let create = steps[3]["run"].as_str().unwrap();
     assert!(create.contains("pages project create") && create.contains(&format!("--production-branch={branch}")), "{create}");
+    assert!(
+        create.contains("already exists") && create.contains("exit 1") && !create.contains("|| true"),
+        "only exists is ignored: {create}"
+    );
+    assert_eq!(steps[3]["env"]["PROJECT"].as_str(), Some("${{ vars.CLOUDFLARE_PROJECT_NAME }}"));
+    assert_eq!(y["concurrency"]["cancel-in-progress"].as_bool(), Some(true));
+    assert_eq!(steps[0]["with"]["persist-credentials"].as_bool(), Some(false));
+    for s in steps.iter().filter_map(|s| s["uses"].as_str()) {
+        let sha = s.split_once('@').map(|(_, v)| v).unwrap_or_default();
+        assert!(sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()), "`{s}` is not pinned to a commit");
+    }
     let deploy = &steps[4];
-    assert_eq!(deploy["uses"].as_str(), Some("cloudflare/wrangler-action@v3"));
+    assert!(deploy["uses"].as_str().unwrap().starts_with("cloudflare/wrangler-action@"));
+    assert!(deploy["with"]["wranglerVersion"].as_str().unwrap().split('.').count() == 3, "wrangler is pinned exactly");
     assert_eq!(
         deploy["with"]["command"].as_str(),
         Some(
@@ -3303,6 +3315,7 @@ fn site_builds_with_real_rs_web() {
             && !out.join("static/protected.json").exists()
     );
     assert!(!out.join("sitemap.xml").exists() && !out.join("robots.txt").exists(), "no base_url, no sitemap");
+    assert!(!std::fs::read_to_string(out.join("_headers")).unwrap().contains("pages.dev"), "no custom domain, no pages.dev rule");
     assert!(!page.contains("og:url") && !page.contains("canonical"), "no base_url, no absolute URLs: {page}");
     assert!(!std::fs::read_to_string(out.join("feed.xml")).unwrap().contains("localhost"));
 
@@ -3328,6 +3341,10 @@ fn site_builds_with_real_rs_web() {
     let headers = std::fs::read_to_string(out.join("_headers")).unwrap();
     assert!(headers.contains("Content-Security-Policy: default-src 'self'") && !headers.contains("unsafe-inline"), "{headers}");
     assert!(headers.contains("/protected/*\n  X-Robots-Tag: noindex"), "{headers}");
+    for h in ["Permissions-Policy: camera=()", "Cross-Origin-Opener-Policy: same-origin", "Cross-Origin-Resource-Policy: same-origin"] {
+        assert!(headers.contains(h), "{h}: {headers}");
+    }
+    assert!(headers.contains("https://:project.pages.dev/*\n  X-Robots-Tag: noindex"), "a custom domain hides pages.dev: {headers}");
     let mut todo = vec![out.clone()];
     while let Some(d) = todo.pop() {
         for e in std::fs::read_dir(&d).unwrap().flatten() {
@@ -3345,6 +3362,30 @@ fn site_builds_with_real_rs_web() {
     assert!(!sitemap.contains("/protected/") && !sitemap.contains("/lessons/"), "{sitemap}");
     assert!(std::fs::read_to_string(out.join("robots.txt")).unwrap().contains("Sitemap: https://kb.example.org/sitemap.xml"));
     assert!(std::fs::read_to_string(out.join("feed.xml")).unwrap().contains(&format!("<link>{url}</link>")));
+    let feed = std::fs::read_to_string(out.join("feed.xml")).unwrap();
+    assert!(feed.contains("<description>When you want to pull or rebase") && feed.contains("<guid isPermaLink=\"false\">"), "{feed}");
+    assert!(
+        feed.contains("<atom:link href=\"https://kb.example.org/feed.xml\" rel=\"self\"") && feed.contains("<lastBuildDate>"),
+        "{feed}"
+    );
+    let sitemap = std::fs::read_to_string(out.join("sitemap.xml")).unwrap();
+    assert!(sitemap.contains(&format!("<loc>{url}</loc><lastmod>2026-09-25</lastmod>")), "{sitemap}");
+    let title = |rel: &str| {
+        let html = std::fs::read_to_string(out.join(rel).join("index.html")).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        html.split("<title>").nth(1).unwrap().split("</title>").next().unwrap().to_string()
+    };
+    assert_eq!(title("general/git"), "Topic: git | Lessons learned");
+    assert_eq!(title("tags/rebase"), "Tag: rebase | Lessons learned");
+    assert_eq!(title("types/recipe"), "Type: Recipe | Lessons learned");
+    assert_eq!(title("all"), "All lessons | Lessons learned");
+    let recipes = std::fs::read_to_string(out.join("types/recipe/index.html")).unwrap();
+    assert!(recipes.contains("/general/git/rebase-with-local-edits-using-autostash/") && !recipes.contains("shallow-clones"), "{recipes}");
+    let tag = std::fs::read_to_string(out.join("tags/rebase/index.html")).unwrap();
+    assert!(tag.contains("href=/tags/>Tag</a>") || tag.contains("href=\"/tags/\">Tag</a>"), "the kind links up: {tag}");
+    let home = std::fs::read_to_string(out.join("index.html")).unwrap();
+    assert!(home.contains("/types/recipe/") && home.contains("/all/"), "{home}");
+    let all = std::fs::read_to_string(out.join("all/index.html")).unwrap();
+    assert!(all.contains("rebase-with-local-edits-using-autostash/") && all.contains("squash-fixups-with-autosquash/"), "{all}");
     let list: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("static/protected.json")).unwrap()).unwrap();
     assert_eq!(list.as_array().map(Vec::len), Some(1), "one password, one list: {list}");
     assert!(list[0]["ciphertext"].is_string() && list[0]["salt"].is_string() && list[0]["nonce"].is_string(), "{list}");
@@ -3419,6 +3460,10 @@ fn site_images_tree_code_and_404_with_real_rs_web() {
     assert_eq!(page.matches("class=leaf").count(), 2, "a lesson page holds its own group's lessons: {page}");
     let stale = std::fs::read_to_string(out.join("general/git/squash-fixups-with-autosquash/index.html")).unwrap();
     assert!(stale.contains("Stale") && stale.contains("newer git changed this"), "{stale}");
+    assert!(stale.contains("content=\"Stale: newer git changed this."), "the preview says it is stale: {stale}");
+    let feed = std::fs::read_to_string(out.join("feed.xml")).unwrap();
+    assert!(feed.contains("<title>[Stale] Squash fixups with autosquash</title>"), "{feed}");
+    assert!(!feed.contains("atom:link href"), "no base_url, no self link: {feed}");
     let missing = std::fs::read_to_string(out.join("404.html")).unwrap();
     assert!(missing.contains("Page not found") && missing.contains("noindex") && missing.contains("/static/site.js"), "{missing}");
 }
