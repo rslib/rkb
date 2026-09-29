@@ -193,13 +193,13 @@ impl Weights {
             safetensors::Dtype::F16 => {
                 let mut out = vec![0f32; data.len() / 2];
                 out.par_chunks_mut(8192).zip(data.par_chunks(16384)).for_each(|(o, b)| {
-                    for (o, b) in o.iter_mut().zip(b.chunks_exact(2)) {
-                        *o = half::f16::from_le_bytes([b[0], b[1]]).to_f32();
+                    for (o, b) in o.iter_mut().zip(b.as_chunks::<2>().0) {
+                        *o = half::f16::from_le_bytes(*b).to_f32();
                     }
                 });
                 out
             }
-            safetensors::Dtype::F32 => data.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
+            safetensors::Dtype::F32 => data.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect(),
             other => anyhow::bail!("{name}: unsupported dtype {other:?}"),
         })
     }
