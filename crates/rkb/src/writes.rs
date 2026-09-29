@@ -257,10 +257,11 @@ pub fn lifecycle(env: &Env, action: Action) -> Result<Output, CliError> {
     Ok(outcome(env, write::apply(&env.ctx(), &action, &[])?))
 }
 
-pub fn used(env: &Env, id: String, failed: bool, reason: Option<String>, session: Option<String>) -> Result<Output, CliError> {
+/// `result` is `worked`, `failed` (also flags) or `irrelevant`.
+pub fn used(env: &Env, id: String, result: &str, reason: Option<String>, session: Option<String>) -> Result<Output, CliError> {
     kb::open(&env.root)?;
     kb::find(&env.root, &id)?;
-    let result = if failed { "failed" } else { "worked" };
+    let failed = result == "failed";
     if failed && reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
         return Err(usage_error("a failed use needs a reason", &format!("used {id} --failed --reason \"what went wrong\"")));
     }

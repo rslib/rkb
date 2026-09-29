@@ -765,6 +765,13 @@ fn flag_revive_used_and_log() {
     assert_eq!(v["status"], "recorded");
     assert!(show(&env, &id)["last_worked"].is_string());
     assert!(show(&env, &id)["last_failed"].is_null());
+    let (v, _) = env.json(&["used", &id, "--irrelevant", "--reason", "about pi events, not sed"], "");
+    assert_eq!((v["status"].as_str(), v.get("flag")), (Some("recorded"), None), "{v}");
+    assert!(current(&env, &id).0.contains("status: active"), "irrelevant never flags");
+    assert_eq!(show(&env, &id)["usage"]["irrelevant"], 1);
+    let irrelevant: Vec<_> = usage_records(&env).into_iter().filter(|r| r["event"] == "irrelevant").collect();
+    assert_eq!((irrelevant.len(), irrelevant[0]["reason"].as_str()), (1, Some("about pi events, not sed")));
+    assert_eq!(env.rkb(&["used", &id, "--worked", "--irrelevant"]).status.code(), Some(2), "one result only");
     let commits = stdout(&env.git(&["rev-list", "--count", "HEAD"]));
     let (v, _) = env.json(&["used", &id, "--failed", "--reason", "still fails"], "");
     assert_eq!(v["flag"]["status"], "written");
@@ -853,6 +860,16 @@ fn review_reads_use_records() {
         text += &line("1a00000003", "injected");
     }
     text += &line("1a00000005", "injected");
+    for _ in 0..4 {
+        text += &line("1a00000006", "irrelevant");
+    }
+    text += &line("1a00000006", "worked");
+    for _ in 0..3 {
+        text += &line("1a00000007", "irrelevant");
+    }
+    for _ in 0..5 {
+        text += &line("1a00000007", "worked");
+    }
     std::fs::write(dir.join("other-0001.jsonl"), text).unwrap();
     let (v, code) = env.json(&["review"], "");
     assert_eq!(code, Some(0), "{v}");
@@ -867,6 +884,10 @@ fn review_reads_use_records() {
     };
     assert_eq!(reasons("1a00000012"), ["failed_repeatedly"], "{v}");
     assert_eq!(reasons("1a00000003"), ["never_helped"], "{v}");
+    assert_eq!(reasons("1a00000006"), ["often_irrelevant"], "{v}");
+    let detail = v["candidates"].as_array().unwrap().iter().find(|c| c["id"] == "1a00000006").unwrap()["reasons"][0]["detail"].clone();
+    assert_eq!(detail, "irrelevant 4, helped 1");
+    assert!(reasons("1a00000007").is_empty(), "it mostly helps: {v}");
     assert!(reasons("1a00000005").is_empty(), "one injection is not enough, and a recent record counts as use: {v}");
 
     std::fs::write(dir.join("other-0001.jsonl"), "").unwrap();
@@ -1497,7 +1518,7 @@ fn search_outputs_and_hidden_results() {
     let (v, _) = env.json(&["find", "undefind vtable"], "");
     assert_eq!(v["results"][0]["id"], "1a00000012");
     let toon = stdout(&env.rkb(&["search", "git rebase", "--toon"]));
-    assert!(toon.contains("results[3]{id,type,title,path,status,applies,worked,failed,injected,summary}:"), "{toon}");
+    assert!(toon.contains("results[3]{id,type,title,path,status,applies,worked,failed,injected,irrelevant,summary}:"), "{toon}");
     assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
 }
 
@@ -1843,6 +1864,10 @@ fn agent_tools_match_the_commands() {
     assert_eq!(usage_records(&env).iter().filter(|r| r["id"] == "1a00000012" && r["event"] == "worked").count(), 1);
     let (out, code) = tool(&env, "rkb_used", &serde_json::json!({ "id": "1a00000012", "result": "failed" }));
     assert_eq!(code, Some(2), "a failure needs a reason: {out}");
+    let (out, code) = tool(&env, "rkb_used", &serde_json::json!({ "id": "1a00000012", "result": "irrelevant" }));
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(usage_records(&env).iter().filter(|r| r["id"] == "1a00000012" && r["event"] == "irrelevant").count(), 1);
+    assert!(!std::fs::read_to_string(env.kb().join(show(&env, "1a00000012")["path"].as_str().unwrap())).unwrap().contains("status: stale"));
     let (out, code) = tool(&env, "rkb_used", &serde_json::json!({ "id": "1a00000012", "result": "maybe" }));
     assert_eq!(code, Some(2), "{out}");
 
@@ -2125,6 +2150,30 @@ fn recall_adds_a_strong_lesson_once() {
     assert_eq!(run("/rkb:retro"), "");
 }
 
+/// Runs only with `RKB_TEST_LAYA_DIR` set to fetched model files.
+#[test]
+fn failure_hook_needs_a_clear_winner() {
+    let Ok(model) = std::env::var("RKB_TEST_LAYA_DIR") else { return };
+    let env = search_kb();
+    set_chain(&env, "chain = [\"laya\", \"bm25\"]\n\n[hooks]\nhook_timeout_ms = 60000");
+    let data = env.dir.path().join("data/rkb/models");
+    std::fs::create_dir_all(&data).unwrap();
+    std::os::unix::fs::symlink(&model, data.join("laya")).unwrap();
+    let lesson = "general/cpp/undefined-vtable-means-missing-virtual.md";
+    let twin = std::fs::read_to_string(env.kb().join(lesson)).unwrap().replace("id: 1a00000012", "id: 1a000000ff");
+    env.write("general/cpp/undefined-vtable-twin.md", &twin);
+    let run = |session: &str| {
+        let mut failed = bash(session, &env.kb(), "g++ main.o -o app");
+        failed["error"] = "Exit code 1\n/usr/bin/ld: main.o: in function `main':\nmain.cpp:(.text+0x1f): undefined reference to `vtable for Widget'\ncollect2: error: ld returned 1 exit status\n".into();
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.args(["hook", "tool-failed"]).env("XDG_DATA_HOME", env.dir.path().join("data")).env("RKB_LAYA_DEVICE", "cpu");
+        stdout(&rkb_with(c, &[], &failed.to_string()))
+    };
+    assert_eq!(run("twins"), "", "two lessons rated alike: no clear winner");
+    std::fs::remove_file(env.kb().join("general/cpp/undefined-vtable-twin.md")).unwrap();
+    assert!(run("single").contains("1a00000012"), "alone, the lesson is a clear winner");
+}
+
 #[test]
 fn capture_of_a_large_transcript_is_fast() {
     let env = search_kb();
@@ -2237,6 +2286,12 @@ fn hook_full_session() {
     let (v, code) = env.json(&["review", "--signals"], "");
     assert_eq!(code, Some(0), "{v}");
     assert_eq!((v["signals"]["injected"].as_u64(), v["signals"]["injected_then_helped"].as_u64()), (Some(1), Some(1)), "{v}");
+    assert_eq!(env.json(&["used", "1a00000012", "--irrelevant", "--session", "s1"], "").0["status"], "recorded");
+    let (v, _) = env.json(&["review", "--signals"], "");
+    let path = &v["signals"]["paths"]["tool-failed"];
+    assert_eq!((path["injected"].as_u64(), path["helped"].as_u64(), path["irrelevant"].as_u64()), (Some(1), Some(1), Some(1)), "{v}");
+    assert_eq!(v["signals"]["paths"]["recall"]["injected"], 0, "{v}");
+    assert!(stdout(&env.rkb(&["review", "--signals"])).contains("tool-failed: 1 injected, 1 then helped (100%), 1 marked irrelevant"));
 
     let mut weak = bash("s1", &cwd, "make");
     weak["error"] = "Exit code 2\nerror: the build did not work today\n".into();

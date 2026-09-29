@@ -59,6 +59,7 @@ fn run_tool(name: &str, args: &Value) -> Result<Output, CliError> {
             id: text(args, "id"),
             worked: args["result"] == "worked",
             failed: args["result"] == "failed",
+            irrelevant: args["result"] == "irrelevant",
             reason: args["reason"].as_str().map(String::from),
             session: None,
         },

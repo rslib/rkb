@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use rkb_core::conditions::{Facts, Verdict};
 use rkb_core::hooks::{
-    self, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_MIN_COVERAGE, DEFAULT_MIN_RELEVANCE, DEFAULT_RECORD_SCORE, MAX_NUDGES, RECALL_MIN_MARGIN,
-    RECALL_MIN_RELEVANCE,
+    self, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_MIN_COVERAGE, DEFAULT_MIN_MARGIN, DEFAULT_MIN_RELEVANCE, DEFAULT_RECORD_SCORE, MAX_NUDGES,
+    RECALL_MIN_MARGIN, RECALL_MIN_RELEVANCE,
 };
 use rkb_core::matching::{Hints, Place};
 use rkb_core::search::{Mode, Options};
@@ -210,6 +210,7 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
     let query = hooks::error_query(command, error);
     let cfg = hooks_config(&root);
     let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, &query)?;
+    let next = hits.get(1).and_then(|h| h.relevance).map_or(0.0, f64::from);
     let Some(hit) = hits.into_iter().next() else {
         once("nohit")?;
         return Ok(None);
@@ -221,10 +222,14 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
     if hooks::read(state, session).iter().any(|r| r["kind"] == "injected" && r["id"] == hit.id.as_str()) {
         return Ok(None);
     }
-    let min_coverage = cfg.get("min_coverage").and_then(toml::Value::as_float).unwrap_or(DEFAULT_MIN_COVERAGE);
-    let min_relevance = cfg.get("min_relevance").and_then(toml::Value::as_float).unwrap_or(DEFAULT_MIN_RELEVANCE);
+    let get = |k: &str, default: f64| cfg.get(k).and_then(toml::Value::as_float).unwrap_or(default);
+    let t = hooks::Strength {
+        min_relevance: get("min_relevance", DEFAULT_MIN_RELEVANCE),
+        min_margin: get("min_margin", DEFAULT_MIN_MARGIN),
+        min_coverage: get("min_coverage", DEFAULT_MIN_COVERAGE),
+    };
     let (_, text) = kb::find(&root, &hit.id)?;
-    if !hooks::strong_enough(hit.relevance, || hooks::coverage(error, &text), min_relevance, min_coverage) {
+    if !hooks::strong_enough(hit.relevance, next, || hooks::coverage(error, &text), &t) {
         once("nohit")?;
         return Ok(None);
     }

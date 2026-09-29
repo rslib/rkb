@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -25,6 +25,7 @@ pub enum ReasonKind {
     FailedRepeatedly,
     NeverHelped,
     Unused,
+    OftenIrrelevant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -111,14 +112,36 @@ pub struct Signals {
     pub repeated: usize,
     /// Of those, how many had a lesson injected in the session that repeated it.
     pub repeated_with_lesson: usize,
+    /// Per injection path (`tool-failed`, `recall`, `other`), from the use records of these sessions.
+    pub paths: BTreeMap<String, PathSignals>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PathSignals {
+    pub injected: usize,
+    pub helped: usize,
+    pub irrelevant: usize,
 }
 
 /// Reads this machine's session logs and use records. Changes nothing.
 pub fn signals(root: &Path, state: &Path) -> Signals {
     let records = usage::records(root);
     let mut out = Signals::default();
+    for path in ["tool-failed", "recall"] {
+        out.paths.insert(path.into(), PathSignals::default());
+    }
     for e in std::fs::read_dir(state.join("sessions")).into_iter().flatten().flatten() {
         let Some(session) = e.path().file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
+        let in_session: Vec<&usage::Record> = records.iter().filter(|u| u.session.as_deref() == Some(session.as_str())).collect();
+        for r in in_session.iter().filter(|u| u.event == "injected") {
+            let prefix = r.reason.as_deref().and_then(|x| x.split(',').next()).unwrap_or_default();
+            let path = if matches!(prefix, "tool-failed" | "recall") { prefix } else { "other" };
+            let followed = |event: &str| in_session.iter().any(|u| u.id == r.id && u.event == event);
+            let p = out.paths.entry(path.into()).or_default();
+            p.injected += 1;
+            p.helped += usize::from(followed("worked") || followed("inferred"));
+            p.irrelevant += usize::from(followed("irrelevant"));
+        }
         let text = std::fs::read_to_string(e.path()).unwrap_or_default();
         let lines: Vec<serde_json::Value> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
         let has = |k: &str| lines.iter().any(|r| r["kind"] == k);
@@ -227,6 +250,12 @@ pub fn review(root: &Path, state: &Path, folder: Option<&str>) -> Result<Vec<Can
         if c.injected >= 5 && c.worked == 0 && c.inferred == 0 {
             reasons
                 .push(Reason { kind: ReasonKind::NeverHelped, detail: format!("injected {} times, never reported to help", c.injected) });
+        }
+        if c.irrelevant >= 3 && c.irrelevant >= c.worked + c.inferred {
+            reasons.push(Reason {
+                kind: ReasonKind::OftenIrrelevant,
+                detail: format!("irrelevant {}, helped {}", c.irrelevant, c.worked + c.inferred),
+            });
         }
         if l.frontmatter.verified < unused_cutoff
             && !records.iter().any(|r| r.id == l.frontmatter.id && r.time.as_str() >= unused_since.as_str())

@@ -169,7 +169,7 @@ fn doctor_human(c: bool, checks: &[Check], failed: usize, warned: usize) -> Stri
 /// `rkb review`: one block per candidate with every reason and the use dates.
 pub fn signals(s: &rkb_core::review::Signals, c: bool) -> Output {
     let share = |n: usize, of: usize| (n * 100).checked_div(of).map_or_else(|| "-".to_string(), |p| format!("{p}%"));
-    let human = format!(
+    let mut human = format!(
         "{}\n  {} sessions: {} with a failed command, {} with a fix, {} with a correction, {} with \"remember\"\n  {} lessons injected, {} then helped ({})\n  {} extracts saved to the inbox\n  {} mistakes repeated in a later session, {} of them with a lesson injected",
         paint(c, "1", "Signals on this machine"),
         s.sessions,
@@ -184,6 +184,16 @@ pub fn signals(s: &rkb_core::review::Signals, c: bool) -> Output {
         s.repeated,
         s.repeated_with_lesson
     );
+    for (path, p) in &s.paths {
+        human.push_str(&format!(
+            "\n  {path}: {} injected, {} then helped ({}), {} marked irrelevant ({})",
+            p.injected,
+            p.helped,
+            share(p.helped, p.injected),
+            p.irrelevant,
+            share(p.irrelevant, p.injected)
+        ));
+    }
     Output { data: json!({ "signals": s }), human, exit: 0, raw: false }
 }
 

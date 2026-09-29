@@ -79,11 +79,11 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rkb_used",
-            "description": "Report whether a lesson you applied worked. Call it every time you act on a lesson from rkb_search, rkb_show or an rkb hook: `worked` when the task then succeeded, `failed` with the reason when it did not (that also flags the lesson). This is how the knowledge base learns which lessons help.",
+            "description": "Report whether a lesson you applied worked. Call it every time you act on a lesson from rkb_search, rkb_show or an rkb hook: `worked` when the task then succeeded, `failed` with the reason when it did not (that also flags the lesson). Use `irrelevant` when a lesson from a search or a hook does not fit the problem; it does not flag the lesson. This is how the knowledge base learns which lessons help.",
             "inputSchema": { "type": "object", "properties": {
                 "id": { "type": "string", "description": "The lesson id" },
-                "result": { "type": "string", "enum": ["worked", "failed"], "description": "worked or failed" },
-                "reason": { "type": "string", "description": "Why it failed, or what it helped with" },
+                "result": { "type": "string", "enum": ["worked", "failed", "irrelevant"], "description": "worked, failed, or irrelevant when the lesson does not fit the problem" },
+                "reason": { "type": "string", "description": "Why it failed or did not fit, or what it helped with" },
             }, "required": ["id", "result"], "additionalProperties": false },
         }),
         json!({

@@ -17,7 +17,7 @@ pub const DIR: &str = ".rkb/usage";
 pub struct Record {
     pub time: String,
     pub id: String,
-    /// `worked`, `failed`, `injected` or `inferred`. Records written before the knowledge-base store
+    /// `worked`, `failed`, `irrelevant`, `injected` or `inferred`. Records written before the knowledge-base store
     /// called it `result`.
     #[serde(alias = "result")]
     pub event: String,
@@ -34,6 +34,8 @@ pub struct Counts {
     pub failed: u32,
     pub injected: u32,
     pub inferred: u32,
+    /// Offered for a problem it did not fit. Never part of the ranking factor: fit depends on the query.
+    pub irrelevant: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_worked: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -163,6 +165,7 @@ pub fn counts(root: &Path) -> BTreeMap<String, Counts> {
                 c.last_injected = max(c.last_injected.take(), &date);
             }
             "inferred" => c.inferred += 1,
+            "irrelevant" => c.irrelevant += 1,
             _ => continue,
         }
         c.last_any = max(c.last_any.take(), &date);
@@ -225,11 +228,14 @@ mod tests {
         .unwrap();
         record(kb.path(), cfg.path(), state.path(), &now("a", "injected", Some("s1".into()), None)).unwrap();
         record(kb.path(), cfg.path(), state.path(), &now("a", "failed", None, Some("broke".into()))).unwrap();
+        record(kb.path(), cfg.path(), state.path(), &now("b", "irrelevant", None, Some("about pi".into()))).unwrap();
         let other = kb.path().join(DIR).join("other-0000.jsonl");
         std::fs::write(&other, format!("{}\nnot json\n", serde_json::to_string(&now("a", "worked", None, None)).unwrap())).unwrap();
 
         let c = &counts(kb.path())["a"];
         assert_eq!((c.worked, c.failed, c.injected, c.inferred), (2, 1, 2, 0), "old state files moved in, other machines summed");
+        let b = &counts(kb.path())["b"];
+        assert_eq!((b.irrelevant, b.worked, b.last_any.is_some()), (1, 0, true));
         assert!(state.path().join("usage.jsonl.migrated").exists() && !state.path().join("usage.jsonl").exists());
         assert_eq!(std::fs::read_to_string(kb.path().join(".rkb/.gitignore")).unwrap(), "*.lock\n");
         assert_eq!(recent_injection(kb.path(), cfg.path(), "a").as_deref(), Some("s1"));
@@ -245,5 +251,7 @@ mod tests {
         assert!(Counts { worked: 3, ..Default::default() }.factor() > 1.0);
         assert!((Counts { worked: 10_000, ..Default::default() }.factor() - 1.1).abs() < 1e-9);
         assert!((Counts { failed: 9, ..Default::default() }.factor() - 0.9).abs() < 1e-9);
+        let worked = Counts { worked: 2, ..Default::default() };
+        assert_eq!(Counts { irrelevant: 7, ..worked.clone() }.factor(), worked.factor());
     }
 }

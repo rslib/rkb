@@ -307,14 +307,20 @@ enum Cmd {
     #[command(after_help = "Example:\n  rkb unarchive 7f3a9c2b41")]
     Unarchive { id: String },
     /// Record that you applied a lesson and whether it worked.
-    #[command(after_help = "Example:\n  rkb used 7f3a9c2b41 --worked\n  rkb used 7f3a9c2b41 --failed --reason \"still fails on 1.14.3\"")]
+    #[command(
+        after_help = "Example:\n  rkb used 7f3a9c2b41 --worked\n  rkb used 7f3a9c2b41 --failed --reason \"still fails on 1.14.3\"\n  rkb used 7f3a9c2b41 --irrelevant --reason \"about pi events, not sed\"",
+        group = clap::ArgGroup::new("result").required(true)
+    )]
     Used {
         id: String,
-        #[arg(long, conflicts_with = "failed", required_unless_present = "failed")]
+        #[arg(long, group = "result")]
         worked: bool,
         /// Also flags the lesson with --reason.
-        #[arg(long, requires = "reason")]
+        #[arg(long, group = "result", requires = "reason")]
         failed: bool,
+        /// The lesson did not fit the problem it was offered for. Never flags it.
+        #[arg(long, group = "result")]
+        irrelevant: bool,
         #[arg(long)]
         reason: Option<String>,
         /// The session the lesson was used in. Default: the harness's session, else the session that injected it.
@@ -727,7 +733,16 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             Ok(writes::outcome(&env, o))
         }
         Cmd::Unarchive { id } => writes::lifecycle(&env, rkb_core::request::Action::Unarchive { id }),
-        Cmd::Used { id, failed, reason, session, .. } => writes::used(&env, id, failed, reason, session),
+        Cmd::Used { id, failed, irrelevant, reason, session, .. } => {
+            let result = if failed {
+                "failed"
+            } else if irrelevant {
+                "irrelevant"
+            } else {
+                "worked"
+            };
+            writes::used(&env, id, result, reason, session)
+        }
         Cmd::Log { id } => writes::log(&env, id),
         Cmd::Confirm { request, choice } => writes::confirm(&env, request, choice),
         Cmd::Hook { .. } => unreachable!("main runs hooks first"),
@@ -806,12 +821,13 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             let counts = usage::counts(&root).remove(&fm.id).unwrap_or_default();
             let (worked, failed) = (counts.last_worked.clone(), counts.last_failed.clone());
             let uses = format!(
-                "hash {hash}  worked {} (last {})  failed {} (last {})  injected {}",
+                "hash {hash}  worked {} (last {})  failed {} (last {})  injected {}  irrelevant {}",
                 counts.worked,
                 worked.as_deref().unwrap_or("never"),
                 counts.failed,
                 failed.as_deref().unwrap_or("never"),
-                counts.injected
+                counts.injected,
+                counts.irrelevant
             );
             let place = env.place.clone().unwrap_or_default();
             rkb_core::facts::refresh(&root, &place);

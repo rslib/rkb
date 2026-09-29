@@ -136,6 +136,7 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options, only: Option<
                 "worked": u.worked,
                 "failed": u.failed,
                 "injected": u.injected,
+                "irrelevant": u.irrelevant,
             });
             if let Some(rel) = h.relevance {
                 row["relevance"] = json!(crate::output::score2(rel));
