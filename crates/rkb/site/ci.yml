@@ -1,0 +1,44 @@
+# Written by `rkb site ci`. Builds the site with rkb @VERSION@ on every push and deploys it to
+# Cloudflare Pages. A lesson published for the first time needs `rkb site build` on your machine first.
+name: Site
+
+on:
+  push:
+    branches: [@BRANCH@]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: site
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      RKB_VERSION: "@VERSION@"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rkb
+        run: |
+          archive="rkb-linux-x86_64-v$RKB_VERSION.tar.gz"
+          base="https://github.com/rslib/rkb/releases/download/v$RKB_VERSION"
+          curl -fsSLO "$base/$archive"
+          curl -fsSLO "$base/$archive.sha256"
+          sha256sum -c "$archive.sha256"
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$archive" -C "$HOME/.local/bin" rkb
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build
+        env:
+          RKB_HOME: ${{ github.workspace }}
+@PASSWORDS@
+        run: rkb site build --no-ask --out dist
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy dist --project-name=${{ vars.CLOUDFLARE_PROJECT_NAME }}

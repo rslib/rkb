@@ -4,7 +4,21 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{% block title %}{{ page.title }} | {{ global.title }}{% endblock %}</title>
-  <meta name="description" content="{{ site.description }}">
+  {% set meta = page.data.meta %}
+  <meta name="description" content="{{ meta.description }}">
+  {% if meta.noindex %}
+  <meta name="robots" content="noindex">
+  {% elif meta.url != "" %}
+  <link rel="canonical" href="{{ meta.url }}">
+  <meta property="og:type" content="{{ meta.kind }}">
+  <meta property="og:site_name" content="{{ global.title }}">
+  <meta property="og:title" content="{{ meta.title }}">
+  <meta property="og:description" content="{{ meta.description }}">
+  <meta property="og:url" content="{{ meta.url }}">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="{{ meta.title }}">
+  <meta name="twitter:description" content="{{ meta.description }}">
+  {% endif %}
   <script>try{document.documentElement.dataset.theme=localStorage.getItem("rkb-theme")||"system"}catch(e){}</script>
   <link rel="preload" href="/static/fonts/Geist-Variable.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/static/site.css">

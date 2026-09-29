@@ -205,20 +205,19 @@ fn password_set(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| !v.is_empty())
 }
 
-fn published_file(env: &Env) -> PathBuf {
-    env.state.join("site-published.json")
-}
+/// The record of first publications, in the knowledge base so every machine and CI share it.
+const RECORD: &str = "site/published.json";
 
 /// Ids published in the clear, and ids published encrypted with their password group (`""` for the
 /// site password). An older file's `ids` are in the clear, and its `encrypted` list is the site password.
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 struct Published {
     clear: BTreeSet<String>,
     encrypted: BTreeMap<String, String>,
 }
 
-fn published(env: &Env) -> Published {
-    let v: Value = std::fs::read_to_string(published_file(env)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+fn read_published(path: &Path) -> Published {
+    let v: Value = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     let set = |k: &str| -> BTreeSet<String> {
         v[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default()
     };
@@ -231,20 +230,51 @@ fn published(env: &Env) -> Published {
     Published { clear, encrypted }
 }
 
+/// The knowledge base's record, with the per-machine record of an earlier rkb merged in.
+fn published(env: &Env) -> Published {
+    let mut p = read_published(&env.root.join(RECORD));
+    let old = read_published(&env.state.join("site-published.json"));
+    p.clear.extend(old.clear);
+    for (i, g) in old.encrypted {
+        p.encrypted.entry(i).or_insert(g);
+    }
+    p
+}
+
 fn group_name(s: &site::Site, id: &str) -> String {
     s.groups.get(id).cloned().flatten().unwrap_or_default()
 }
 
-/// Adds `clear` ids and `encrypted` ids with their groups; a lesson now public no longer counts as
-/// encrypted only.
+fn kb_config(env: &Env) -> rkb_core::config::KbConfig {
+    std::fs::read_to_string(env.root.join("kb.toml")).ok().and_then(|t| rkb_core::config::parse(&t).ok()).unwrap_or_default()
+}
+
+/// Adds `clear` ids and `encrypted` ids with their groups to `site/published.json` and commits it
+/// when it changed; a lesson now public no longer counts as encrypted only.
 fn record(env: &Env, clear: &[String], encrypted: &[(String, String)]) -> Result<(), CliError> {
+    let _lock = rkb_core::write::kb_lock(&env.root, &kb_config(env))?;
+    let path = env.root.join(RECORD);
+    let on_disk = read_published(&path);
     let mut p = published(env);
     p.clear.extend(clear.iter().cloned());
     p.encrypted.extend(encrypted.iter().cloned());
     p.encrypted.retain(|i, _| !p.clear.contains(i) || encrypted.iter().any(|(e, _)| e == i));
-    let fix = "check that the state folder is writable";
-    std::fs::create_dir_all(&env.state).map_err(|e| io_error(e, fix))?;
-    std::fs::write(published_file(env), json!({ "clear": p.clear, "encrypted": p.encrypted }).to_string()).map_err(|e| io_error(e, fix))
+    if p == on_disk {
+        return Ok(());
+    }
+    let added =
+        p.clear.difference(&on_disk.clear).count() + p.encrypted.iter().filter(|(i, g)| on_disk.encrypted.get(*i) != Some(*g)).count();
+    let fix = "check that the knowledge base is writable";
+    let text = serde_json::to_string_pretty(&json!({ "clear": p.clear, "encrypted": p.encrypted })).expect("the record serializes") + "\n";
+    std::fs::create_dir_all(env.root.join("site")).map_err(|e| io_error(e, fix))?;
+    let tmp = env.root.join(format!("site/.published.json.{}", std::process::id()));
+    std::fs::write(&tmp, text).map_err(|e| io_error(format!("{}: {e}", tmp.display()), fix))?;
+    std::fs::rename(&tmp, &path).map_err(|e| io_error(format!("{}: {e}", path.display()), fix))?;
+    rkb_core::git::run(&env.root, &["add", "--", RECORD])?;
+    if !rkb_core::git::run(&env.root, &["status", "--porcelain", "--", RECORD])?.is_empty() {
+        rkb_core::git::commit_paths(&env.root, &format!("site: publish {added} lessons"), &[RECORD])?;
+    }
+    Ok(())
 }
 
 /// Writes the staging folder: the template, the allowed lessons and `site.json`.
@@ -296,8 +326,7 @@ fn without_ciphertext(text: &str) -> String {
 /// Leak findings in the built text files, lesson pages that belong to no published lesson, and
 /// protected titles, tags and paths in plain text. A finding names a protected lesson by id only.
 fn check(env: &Env, dist: &Path, s: &site::Site) -> Vec<String> {
-    let kb: rkb_core::config::KbConfig =
-        std::fs::read_to_string(env.root.join("kb.toml")).ok().and_then(|t| rkb_core::config::parse(&t).ok()).unwrap_or_default();
+    let kb = kb_config(env);
     let scanner = LeakScanner::new(&kb.leak, env.lint.user.as_deref(), env.lint.home.as_deref());
     // Text that public lessons show anyway cannot give a protected lesson away.
     let public: String =
@@ -385,7 +414,8 @@ fn listed(index: &Value, key: &str, ids: &[String]) -> Vec<String> {
 }
 
 /// `rkb site build` and `rkb site serve`. `approved` holds the ids the user just agreed to publish.
-pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approved) -> Result<Output, CliError> {
+/// With `no_ask`, a first publication fails instead of asking, and the knowledge base is not written.
+pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approved, no_ask: bool) -> Result<Output, CliError> {
     kb::open(&env.root)?;
     check_passwords()?;
     let s = site::collect(&env.root, password_set)?;
@@ -398,17 +428,26 @@ pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approv
         .cloned()
         .collect();
     if !new_clear.is_empty() || !new_enc.is_empty() {
-        let mut question = format!("Publish {} lessons for the first time?", new_clear.len() + new_enc.len());
+        let n = new_clear.len() + new_enc.len();
+        let mut list = String::new();
         if !new_clear.is_empty() {
-            question.push_str(&format!("\nIn the clear:\n{}", listed(&s.index, "lessons", &new_clear).join("\n")));
+            list.push_str(&format!("\nIn the clear:\n{}", listed(&s.index, "lessons", &new_clear).join("\n")));
         }
         let mut by_env: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for i in &new_enc {
             by_env.entry(site::password_env(s.groups.get(i).cloned().flatten().as_deref())).or_default().push(i.clone());
         }
         for (var, ids) in &by_env {
-            question.push_str(&format!("\nEncrypted with {var}:\n{}", listed(&s.index, "protected", ids).join("\n")));
+            list.push_str(&format!("\nEncrypted with {var}:\n{}", listed(&s.index, "protected", ids).join("\n")));
         }
+        if no_ask {
+            return Err(CliError::new(
+                ErrorCode::Refused,
+                format!("{n} lessons would be published for the first time, which needs the user's yes:{list}"),
+                "run `rkb site build` on your machine, answer `publish`, and push the knowledge base; nothing was written",
+            ));
+        }
+        let question = format!("Publish {n} lessons for the first time?{list}");
         let req = Request {
             id: request::new_id(),
             created: request::now(),
@@ -496,8 +535,10 @@ pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approv
     }
     let out = out.map(PathBuf::from).unwrap_or_else(|| site_dir().join("dist"));
     replace(&dist, &out).map_err(|e| io_error(format!("{}: {e}", out.display()), "check that the output folder is writable"))?;
-    let enc: Vec<(String, String)> = s.protected.iter().map(|i| (i.clone(), group_name(&s, i))).collect();
-    record(env, &s.ids, &enc)?;
+    if !no_ask {
+        let enc: Vec<(String, String)> = s.protected.iter().map(|i| (i.clone(), group_name(&s, i))).collect();
+        record(env, &s.ids, &enc)?;
+    }
     let mut human = format!("{} {count} lessons ({} protected) to {}", paint(env.colored, "32", "built"), s.protected.len(), out.display());
     for n in &notes {
         human.push_str(&format!("\n{} {n}", paint(env.colored, "33", "note:")));
@@ -517,9 +558,7 @@ pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approv
 /// `rkb site init`: the built-in template into `$RKB_HOME/site/`, keeping files that exist.
 pub fn init(env: &Env) -> Result<Output, CliError> {
     kb::open(&env.root)?;
-    let kbc: rkb_core::config::KbConfig =
-        std::fs::read_to_string(env.root.join("kb.toml")).ok().and_then(|t| rkb_core::config::parse(&t).ok()).unwrap_or_default();
-    let _lock = rkb_core::write::kb_lock(&env.root, &kbc)?;
+    let _lock = rkb_core::write::kb_lock(&env.root, &kb_config(env))?;
     let fix = "check that the knowledge base is writable";
     let (mut written, mut skipped) = (vec![], vec![]);
     for (rel, text) in TEMPLATE {
@@ -558,6 +597,65 @@ pub fn init(env: &Env) -> Result<Output, CliError> {
         "written": written,
         "skipped": skipped,
         "help": ["Edit site/config.lua and site/templates/, then run `rkb site build`"],
+    });
+    Ok(Output { data, human, exit: 0, raw: false })
+}
+
+/// `rkb site ci`: `.github/workflows/site.yml` into the knowledge base, kept when it exists.
+pub fn ci(env: &Env) -> Result<Output, CliError> {
+    kb::open(&env.root)?;
+    let kbc = kb_config(env);
+    let _lock = rkb_core::write::kb_lock(&env.root, &kbc)?;
+    const PATH: &str = ".github/workflows/site.yml";
+    let branch = String::from_utf8_lossy(&rkb_core::git::run(&env.root, &["rev-parse", "--abbrev-ref", "HEAD"])?).trim().to_string();
+    let mut secrets = vec!["SITE_PASSWORD".to_string()];
+    secrets.extend(kbc.labels.get("password").into_iter().flatten().map(|g| site::password_env(Some(g))));
+    secrets.extend(["CLOUDFLARE_API_TOKEN".into(), "CLOUDFLARE_ACCOUNT_ID".into()]);
+    let variables = ["CLOUDFLARE_PROJECT_NAME"];
+    let p = env.root.join(PATH);
+    let written = !p.exists();
+    if written {
+        let env_lines: Vec<String> =
+            secrets.iter().filter(|s| s.starts_with("SITE_PASSWORD")).map(|s| format!("          {s}: ${{{{ secrets.{s} }}}}")).collect();
+        let text = include_str!("../site/ci.yml")
+            .replace("@BRANCH@", &branch)
+            .replace("@VERSION@", env!("CARGO_PKG_VERSION"))
+            .replace("@PASSWORDS@", &env_lines.join("\n"));
+        let fix = "check that the knowledge base is writable";
+        std::fs::create_dir_all(p.parent().expect("the workflow is in a folder")).map_err(|e| io_error(e, fix))?;
+        let mut f = std::fs::File::create_new(&p).map_err(|e| io_error(format!("{}: {e}", p.display()), fix))?;
+        f.write_all(text.as_bytes()).map_err(|e| io_error(e, fix))?;
+        rkb_core::git::run(&env.root, &["add", "--", PATH])?;
+        if !rkb_core::git::run(&env.root, &["status", "--porcelain", "--", PATH])?.is_empty() {
+            rkb_core::git::commit_paths(&env.root, "site: add the CI workflow", &[PATH])?;
+        }
+    }
+    let mut notes = vec![];
+    if kbc.site.base_url.as_deref().unwrap_or_default().is_empty() {
+        notes.push(
+            "[site] base_url in kb.toml is empty; set it to the site's address for absolute links, the sitemap and link previews"
+                .to_string(),
+        );
+    }
+    let mut human = if written {
+        format!("{} {PATH} (rkb {}, branch {branch})", paint(env.colored, "32", "wrote  "), env!("CARGO_PKG_VERSION"))
+    } else {
+        format!("{} {PATH} (exists)", paint(env.colored, "2", "kept   "))
+    };
+    human.push_str(&format!("\nset these repository secrets: {}", secrets.join(", ")));
+    human.push_str(&format!("\nset this repository variable: {}", variables.join(", ")));
+    for n in &notes {
+        human.push_str(&format!("\n{} {n}", paint(env.colored, "33", "note:")));
+    }
+    let data = json!({
+        "status": if written { "written" } else { "kept" },
+        "path": PATH,
+        "branch": branch,
+        "rkb": env!("CARGO_PKG_VERSION"),
+        "secrets": secrets,
+        "variables": variables,
+        "notes": notes,
+        "help": ["Set the secrets and the variable in the repository settings, then push the knowledge base"],
     });
     Ok(Output { data, human, exit: 0, raw: false })
 }

@@ -25,3 +25,4 @@ laya = ["dep:rkb-rerank"]
 
 [dev-dependencies]
 tempfile.workspace = true
+serde_norway.workspace = true

@@ -1742,6 +1742,7 @@ dependencies = [
  "rkb-rerank",
  "serde",
  "serde_json",
+ "serde_norway",
  "sha2",
  "tempfile",
  "toml",

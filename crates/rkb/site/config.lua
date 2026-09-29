@@ -9,6 +9,10 @@ local rs = require("rs-web")
 local site = rs.data.load_json("site.json")
 local settings = site.site or {}
 local title = settings.title or "Lessons learned"
+local description = (settings.description ~= nil and settings.description ~= "") and settings.description
+  or "Notes on problems solved and decisions made."
+-- Without `[site] base_url`, pages carry no absolute URLs and there is no sitemap.
+local base_url = (settings.base_url or ""):gsub("/+$", "")
 local protected = site.protected or {}
 
 local by_id = {}
@@ -286,6 +290,16 @@ local function plain(l)
   return (rs.html.strip_tags(rs.markdown.render(body(l))):gsub("%s+", " "))
 end
 
+-- The start of the plain text, cut at a word, for link previews.
+local function summary(text)
+  text = text:gsub("^%s+", "")
+  local cut = utf8.offset(text, 161)
+  if not cut then
+    return text
+  end
+  return text:sub(1, cut - 1):gsub("%s+%S*$", "") .. "…"
+end
+
 local function entry(l)
   return {
     id = l.id,
@@ -307,9 +321,24 @@ local global = {
   tree = tree,
   protected_count = #protected,
   types = type_counts,
+  base_url = base_url,
 }
 
-local function page(path, template, page_title, data)
+-- Paths of the public pages, for the sitemap.
+local indexed = {}
+
+-- `summary` describes the page in link previews; `noindex` keeps it out of search engines and the sitemap.
+local function page(path, template, page_title, data, summary_text, noindex)
+  data.meta = {
+    title = page_title,
+    description = summary_text or description,
+    url = base_url ~= "" and (base_url .. path) or "",
+    kind = template == "lesson.html" and "article" or "website",
+    noindex = noindex or false,
+  }
+  if not noindex then
+    table.insert(indexed, path)
+  end
   return { path = path, template = template, title = page_title, data = data }
 end
 
@@ -324,7 +353,7 @@ end
 return {
   site = {
     title = title,
-    description = settings.description ~= "" and settings.description or "Notes on problems solved and decisions made.",
+    description = description,
     base_url = settings.base_url ~= "" and settings.base_url or "http://localhost:3000",
     author = settings.author or "",
   },
@@ -338,6 +367,7 @@ return {
   end,
 
   pages = function()
+    indexed = {}
     local recent = {}
     for _, l in ipairs(site.lessons) do
       table.insert(recent, card(l))
@@ -373,8 +403,8 @@ return {
       }),
     }
     for _, l in ipairs(site.lessons) do
-      table.insert(pages, page(l.url, "lesson.html", l.title, { main = lesson_html(l, false), open = place(l), current = l.id }))
-      table.insert(pages, page("/lessons/" .. l.id .. "/", "redirect.html", l.title, { to = l.url }))
+      table.insert(pages, page(l.url, "lesson.html", l.title, { main = lesson_html(l, false), open = place(l), current = l.id }, summary(plain(l))))
+      table.insert(pages, page("/lessons/" .. l.id .. "/", "redirect.html", l.title, { to = l.url }, nil, true))
     end
     for _, g in pairs(groups) do
       local label = g.scope == "general" and "Topic" or (g.scope == "projects" and "Project" or "System")
@@ -403,9 +433,9 @@ return {
         table.insert(pages, page(l.url, "protected.html", "Protected lesson", {
           block = rs.crypt.encrypt_html(lesson_html(l, true), { slug = l.id, password = rs.env.get(l.password_env) }),
           open = "protected",
-        }))
+        }, nil, true))
       end
-      table.insert(pages, page("/protected/", "protected-index.html", "Protected lessons", { open = "protected" }))
+      table.insert(pages, page("/protected/", "protected-index.html", "Protected lessons", { open = "protected" }, nil, true))
     end
     return pages
   end,
@@ -449,7 +479,7 @@ return {
         end
         rs.fs.write(out .. "/static/protected.json", rs.data.to_json(boxes))
       end
-      local base = (settings.base_url ~= nil and settings.base_url ~= "") and settings.base_url:gsub("/+$", "") or ctx.base_url
+      local base = base_url
       local items = {}
       local all = {}
       for _, l in ipairs(site.lessons) do
@@ -465,9 +495,22 @@ return {
       rs.fs.write(
         out .. "/feed.xml",
         '<?xml version="1.0" encoding="UTF-8"?>\n<rss version="2.0"><channel><title>' .. esc(title) .. "</title><link>" .. base
-          .. "/</link><description>" .. esc(settings.description ~= "" and settings.description or title) .. "</description>"
+          .. "/</link><description>" .. esc(description) .. "</description>"
           .. table.concat(items) .. "</channel></rss>\n"
       )
+      if base ~= "" then
+        table.sort(indexed)
+        local urls = {}
+        for _, path in ipairs(indexed) do
+          table.insert(urls, "<url><loc>" .. esc(base .. path) .. "</loc></url>")
+        end
+        rs.fs.write(
+          out .. "/sitemap.xml",
+          '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            .. table.concat(urls) .. "</urlset>\n"
+        )
+        rs.fs.write(out .. "/robots.txt", "User-agent: *\nAllow: /\nSitemap: " .. base .. "/sitemap.xml\n")
+      end
     end,
   },
 }

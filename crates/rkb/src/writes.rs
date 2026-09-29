@@ -363,7 +363,13 @@ pub fn confirm(env: &Env, id: String, choice: String) -> Result<Output, CliError
         if choice == "cancel" {
             return Ok(outcome(env, Outcome::Cancelled));
         }
-        return crate::site::run(env, out.clone(), *serve, &crate::site::Approved { clear: ids.clone(), encrypted: encrypted.clone() });
+        return crate::site::run(
+            env,
+            out.clone(),
+            *serve,
+            &crate::site::Approved { clear: ids.clone(), encrypted: encrypted.clone() },
+            false,
+        );
     }
     let o = write::confirm(&env.ctx(), &req, &choice)?;
     Ok(outcome(env, o))
