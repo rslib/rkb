@@ -1,30 +1,7 @@
 {% extends "base.html" %}
 
-{% block title %}{{ page.title }} | {{ site.title }}{% endblock %}
-
 {% block content %}
-<article>
-  <h1>{{ page.title }}</h1>
-  <p class="meta">
-    <span class="chip">{{ page.data.lesson.type }}</span>
-    <a href="{{ page.data.topic_url }}">{{ page.data.lesson.topic }}</a>
-    · verified {{ page.data.lesson.verified }}
-    {% if page.data.lesson.status == "stale" %}· <strong>stale</strong>{% endif %}
-  </p>
-  {% if page.data.when | length > 0 %}
-  <p class="meta">Holds when: {% for w in page.data.when %}<code>{{ w }}</code> {% endfor %}</p>
-  {% endif %}
-  {{ content | safe }}
-  {% if page.data.tags | length > 0 %}
-  <p class="chips">{% for t in page.data.tags %}<a href="{{ t.url }}">{{ t.name }}</a>{% endfor %}</p>
-  {% endif %}
-  {% if page.data.related | length > 0 %}
-  <h2>Related</h2>
-  <ul class="cards">
-  {% for r in page.data.related %}
-    <li><a href="{{ r.url }}">{{ r.title }}</a> <span class="meta">{{ r.type }}</span></li>
-  {% endfor %}
-  </ul>
-  {% endif %}
-</article>
+<div class="page lesson-page">
+{{ page.data.main | safe }}
+</div>
 {% endblock %}

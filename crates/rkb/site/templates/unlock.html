@@ -1,0 +1,13 @@
+<div class="unlock" id="unlock">
+  <div class="unlock-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
+  <div>
+    <h1>{% if page.path == "/protected/" %}{{ global.protected_count }} protected lessons{% else %}Protected lesson{% endif %}</h1>
+    <p class="lead">Their titles, projects and text are encrypted in these pages. Enter the password once: the sidebar fills in, and every lesson it opens stays open until you close this tab.</p>
+  </div>
+  <form id="unlock-form">
+    <label for="pw">Password</label>
+    <input id="pw" type="password" autocomplete="current-password" required>
+    <button type="submit" class="btn primary">Unlock</button>
+    <span class="muted small" id="unlock-msg" role="status">Decrypted in your browser. The password is never sent anywhere.</span>
+  </form>
+</div>

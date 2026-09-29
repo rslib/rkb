@@ -1,34 +1,41 @@
 {% extends "base.html" %}
 
+{% block title %}{{ global.title }}{% endblock %}
+
 {% block content %}
-<p class="muted">{{ site.description }}</p>
-{% if page.data.topics | length > 0 %}
-<h2>Topics</h2>
-<p class="chips">{% for g in page.data.topics %}<a href="{{ g.url }}">{{ g.name }} ({{ g.count }})</a>{% endfor %}</p>
-{% endif %}
-{% if page.data.projects | length > 0 %}
-<h2>Projects</h2>
-<p class="chips">{% for g in page.data.projects %}<a href="{{ g.url }}">{{ g.name }} ({{ g.count }})</a>{% endfor %}</p>
-{% endif %}
-{% if page.data.systems | length > 0 %}
-<h2>Systems</h2>
-<p class="chips">{% for g in page.data.systems %}<a href="{{ g.url }}">{{ g.name }} ({{ g.count }})</a>{% endfor %}</p>
-{% endif %}
-{% if page.data.protected_count > 0 %}
-<p class="muted"><a href="/protected/">{{ page.data.protected_count }} protected lessons</a> need the site password.</p>
-{% endif %}
-<h2>Recent lessons</h2>
-{% if page.data.lessons | length > 0 %}
-<ul class="cards">
-{% for l in page.data.lessons %}
-  <li><a href="{{ l.url }}">{{ l.title }}</a> <span class="meta">{{ l.type }} · {{ l.topic }} · {{ l.verified }}</span></li>
-{% endfor %}
-</ul>
-{% else %}
-<p class="muted">No published lessons yet.</p>
-{% endif %}
-{% if page.data.tags | length > 0 %}
-<h2>Tags</h2>
-<p class="chips">{% for g in page.data.tags %}<a href="{{ g.url }}">{{ g.name }}</a>{% endfor %}</p>
-{% endif %}
+<div class="page home">
+  <section class="intro">
+    <h1>{{ global.title }}</h1>
+    {% if page.data.description %}<p class="lead">{{ page.data.description }}</p>{% else %}<p class="lead">Pitfalls with their fixes, recipes, facts and decisions from real work. Each lesson says what was checked, how and when, and where it holds.</p>{% endif %}
+    <div class="pills">
+      {% for t in global.types %}<span class="pill t-{{ t.type }}"><span class="dot"></span>{{ t.name }} {{ t.count }}</span>{% endfor %}
+      {% if global.protected_count > 0 %}<a class="pill" href="/protected/"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>Protected {{ global.protected_count }}</a>{% endif %}
+    </div>
+  </section>
+  {% if page.data.cards | length > 0 %}
+  <section>
+    <div class="section-head"><h2>Browse by topic</h2><a href="/general/">All {{ page.data.topic_total }} topics</a></div>
+    <div class="cards">
+      {% for c in page.data.cards %}
+      <a class="card" href="{{ c.url }}">
+        <span class="card-head"><span class="mono">{{ c.name }}</span><span class="muted">{{ c.count }} lesson{% if c.count != 1 %}s{% endif %}</span></span>
+        {% for l in c.lessons %}<span class="card-line">{{ l.title_html | safe }}</span>{% endfor %}
+      </a>
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+  <section>
+    <div class="section-head"><h2>Recently verified</h2><a href="/feed.xml">RSS</a></div>
+    {% if page.data.recent | length > 0 %}
+    <div class="rows">
+      {% for r in page.data.recent %}
+      <a class="row t-{{ r.type }}" href="{{ r.url }}"><span class="dot" role="img" aria-label="{{ r.type_name }}"></span><span class="row-title">{{ r.title_html | safe }}</span><span class="mono muted">{{ r.topic }}</span><span class="muted date">{{ r.date }}</span></a>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="muted">No published lessons yet.</p>
+    {% endif %}
+  </section>
+</div>
 {% endblock %}

@@ -171,6 +171,7 @@ fn folder_rules() {
 #[test]
 fn config_rules() {
     assert_eq!(rules(&[("kb.toml", "[lables]\n")]), ["config/invalid"]);
+    assert_eq!(rules(&[("kb.toml", "[site]\ncolour = \"x\"\n")]), ["config/invalid"]);
     assert_eq!(rules(&[("systems/tuolumne/README.md", "---\nenv: {A: b}\n---\n# Tuolumne\n")]), ["config/invalid"]);
     assert_eq!(rules(&[("projects/dftracer/README.md", "---\nremotes: x\n---\n")]), ["config/invalid"]);
     assert_eq!(rules(&[("general/cpp/README.md", "---\ncolor: red\n---\n")]), ["config/invalid"]);

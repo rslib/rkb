@@ -1,12 +1,10 @@
 {% extends "base.html" %}
 
-{% block title %}Protected lesson | {{ site.title }}{% endblock %}
+{% block title %}Protected lesson | {{ global.title }}{% endblock %}
 
 {% block content %}
-<article>
-  <h1>Protected lesson</h1>
-  {{ page.data.block | safe }}
-</article>
-<script src="/static/argon2.umd.min.js"></script>
-<script src="/static/decrypt.js"></script>
+<div class="page lesson-page" id="protected-page">
+  {% include "unlock.html" %}
+  <div class="encrypted" hidden>{{ page.data.block | safe }}</div>
+</div>
 {% endblock %}

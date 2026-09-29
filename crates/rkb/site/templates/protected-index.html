@@ -1,13 +1,11 @@
 {% extends "base.html" %}
 
-{% block title %}Protected lessons | {{ site.title }}{% endblock %}
-
 {% block content %}
-<h1>Protected lessons</h1>
-<p class="muted">These lessons are encrypted. Open one and enter the site password to read it.</p>
-<ul class="cards">
-{% for p in page.data.pages %}
-  <li><a href="{{ p.url }}">Protected lesson {{ p.n }}</a></li>
-{% endfor %}
-</ul>
+<div class="page" id="protected-index">
+  {% include "unlock.html" %}
+  <section class="protected-list" id="protected-list" hidden>
+    <h1>{{ global.protected_count }} protected lessons</h1>
+    <div id="protected-groups"></div>
+  </section>
+</div>
 {% endblock %}

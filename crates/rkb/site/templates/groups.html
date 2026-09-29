@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page">
+  <h1>{{ page.data.heading }}</h1>
+  {% if page.data.groups | length > 0 %}
+  <div class="cards">
+    {% for g in page.data.groups %}
+    <a class="card" href="{{ g.url }}"><span class="card-head"><span class="mono">{{ g.name }}</span><span class="muted">{{ g.count }} lesson{% if g.count != 1 %}s{% endif %}</span></span></a>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="muted">No published lessons yet.</p>
+  {% endif %}
+</div>
+{% endblock %}

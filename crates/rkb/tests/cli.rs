@@ -2948,6 +2948,14 @@ fn site_protects_internal_lessons_with_a_password() {
     let m = v["error"]["message"].as_str().unwrap();
     assert!(m.contains("about/index.html: shows protected lesson `1a00000004` in plain text"), "{m}");
     assert!(!m.contains("Shallow clones"), "the finding names the lesson by id only: {m}");
+    let (v, code) = site(
+        &env,
+        &["site", "build", "--out", out_s],
+        &[pw[0], pw[1], ("FAKE_RS_WEB_EXTRA", "general/git/shallow-clones-break-git-describe/index.html"), ("FAKE_RS_WEB_TEXT", "x")],
+    );
+    assert_eq!(code, Some(1), "{v}");
+    let m = v["error"]["message"].as_str().unwrap();
+    assert!(m.contains("a page at the path of protected lesson `1a00000004`"), "{m}");
 
     let p = env.kb().join("general/git/shallow-clones-break-git-describe.md");
     std::fs::write(&p, std::fs::read_to_string(&p).unwrap().replacen("\n---\n", "\nlabels:\n  sensitivity: public\n---\n", 1)).unwrap();
@@ -2955,6 +2963,66 @@ fn site_protects_internal_lessons_with_a_password() {
     assert_eq!(code, Some(3), "encrypted before, public now: asks again: {v}");
     let q = v["question"].as_str().unwrap();
     assert!(q.contains("In the clear:\n  1a00000004"), "{q}");
+}
+
+#[test]
+fn site_group_passwords() {
+    let env = site_kb();
+    let out = env.dir.path().join("out");
+    let out_s = out.to_str().unwrap();
+    let toml = env.kb().join("kb.toml");
+    std::fs::write(&toml, std::fs::read_to_string(&toml).unwrap().replacen("[labels]\n", "[labels]\npassword = [\"team-a\"]\n", 1))
+        .unwrap();
+    let p = env.kb().join("general/git/squash-fixups-with-autosquash.md");
+    std::fs::write(
+        &p,
+        std::fs::read_to_string(&p).unwrap().replace("  sensitivity: public\n", "  sensitivity: public\n  password: team-a\n"),
+    )
+    .unwrap();
+    let no_index = ("FAKE_RS_WEB_NO_INDEX", "1");
+
+    let (v, code) = site(&env, &["site", "build", "--out", out_s], &[no_index, ("SITE_PASSWORD_TEAM_A", "short")]);
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("SITE_PASSWORD_TEAM_A has 5 characters"), "{v}");
+
+    let (v, code) = site(&env, &["site", "build", "--out", out_s], &[no_index]);
+    assert_eq!(code, Some(3), "{v}");
+    let q = v["question"].as_str().unwrap();
+    assert!(q.contains("1a00000003") && !q.contains("1a00000005"), "a lesson whose password is unset is left out: {q}");
+    let (v, code) = site(&env, &["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], &[no_index]);
+    assert_eq!(code, Some(0), "{v}");
+    assert!(v["notes"].to_string().contains("1 lessons were left out; set SITE_PASSWORD_TEAM_A"), "{v}");
+
+    let team = [no_index, ("SITE_PASSWORD_TEAM_A", PASSWORD)];
+    let (v, code) = site(&env, &["site", "build", "--out", out_s], &team);
+    assert_eq!(code, Some(3), "{v}");
+    let q = v["question"].as_str().unwrap();
+    assert!(q.contains("Encrypted with SITE_PASSWORD_TEAM_A:\n  1a00000005"), "a password label protects a public lesson: {q}");
+    let (v, code) = site(&env, &["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], &team);
+    assert_eq!(code, Some(0), "{v}");
+    let published = std::fs::read_to_string(env.dir.path().join("state/rkb/site-published.json")).unwrap();
+    assert!(published.contains("\"1a00000005\":\"team-a\""), "{published}");
+    let (v, code) = site(&env, &["site", "build", "--out", out_s], &team);
+    assert_eq!(code, Some(0), "published with this password before, so no question: {v}");
+
+    std::fs::write(
+        &p,
+        std::fs::read_to_string(&p).unwrap().replace("  sensitivity: public\n  password: team-a\n", "  sensitivity: internal\n"),
+    )
+    .unwrap();
+    let site_pw = [no_index, ("SITE_PASSWORD", PASSWORD)];
+    let (v, code) = site(&env, &["site", "build", "--out", out_s], &site_pw);
+    assert_eq!(code, Some(3), "another password asks again: {v}");
+    let q = v["question"].as_str().unwrap();
+    assert!(q.contains("Encrypted with SITE_PASSWORD:\n") && q.contains("1a00000005"), "{q}");
+
+    std::fs::write(
+        env.dir.path().join("state/rkb/site-published.json"),
+        r#"{"clear":["1a00000003"],"encrypted":["1a00000001","1a00000002","1a00000004","1a00000005","1a00000006","1a00000007","1a00000008","1a00000009","1a00000010","1a00000011","1a00000012","1a00000013","1a00000014","1a00000015","1a00000016"]}"#,
+    )
+    .unwrap();
+    let (v, code) = site(&env, &["site", "build", "--out", out_s], &site_pw);
+    assert_eq!(code, Some(0), "an old record's encrypted list is the site password: {v}");
 }
 
 #[test]
@@ -2980,7 +3048,7 @@ fn site_init_keeps_user_edits_and_is_used() {
     let env = site_kb();
     let (v, code) = site(&env, &["site", "init"], &[]);
     assert_eq!(code, Some(0), "{v}");
-    assert_eq!(v["written"].as_array().unwrap().len(), 10, "{v}");
+    assert_eq!(v["written"].as_array().unwrap().len(), 17, "{v}");
     let log = stdout(&env.git(&["log", "-1", "--name-only", "--format=%s"]));
     assert!(log.starts_with("site: add the rs-web template") && log.contains("site/config.lua"), "{log}");
 
@@ -3019,18 +3087,51 @@ fn site_builds_with_real_rs_web() {
     assert_eq!(code, Some(3), "{v}");
     let (v, code) = real(&["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], false);
     assert_eq!(code, Some(0), "{v}");
-    let page = std::fs::read_to_string(out.join("lessons/1a00000003/index.html")).unwrap();
+    let page = std::fs::read_to_string(out.join("general/git/rebase-with-local-edits-using-autostash/index.html")).unwrap();
     assert!(page.contains("Rebase with local edits using autostash") && page.contains("autosquash"), "{page}");
-    assert!(out.join("feed.xml").is_file() && out.join("topics/git/index.html").is_file());
-    assert!(!out.join("lessons/1a00000004").exists() && !out.join("protected").exists());
+    let redirect = std::fs::read_to_string(out.join("lessons/1a00000003/index.html")).unwrap();
+    assert!(redirect.contains("/general/git/rebase-with-local-edits-using-autostash/"), "{redirect}");
+    for part in [
+        "href=/general/git/>git</a>",
+        "<strong>Recipe.</strong>",
+        "id=when-to-use",
+        "id=steps",
+        "id=evidence",
+        "On this page",
+        "25 Sep 2026, read it",
+        "href=/tags/rebase/>rebase</a>",
+        "Next in git",
+        "href=/general/git/squash-fixups-with-autosquash/",
+        "aria-current=page",
+    ] {
+        assert!(page.contains(part), "the lesson page lacks {part}: {page}");
+    }
+    assert!(out.join("feed.xml").is_file() && out.join("general/git/index.html").is_file());
+    assert!(out.join("static/site.js").is_file() && out.join("static/fonts/Geist-Variable.woff2").is_file());
+    let search: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("search.json")).unwrap()).unwrap();
+    let ids: Vec<&str> = search.as_array().unwrap().iter().map(|e| e["id"].as_str().unwrap()).collect();
+    assert_eq!(ids.len(), 2, "{search}");
+    assert!(ids.contains(&"1a00000003") && ids.contains(&"1a00000005"), "{search}");
+    assert!(search.to_string().contains("git pull --rebase --autostash"), "{search}");
+    assert!(
+        !out.join("lessons/1a00000004").exists()
+            && !out.join("general/git/shallow-clones-break-git-describe").exists()
+            && !out.join("protected").exists()
+            && !out.join("static/protected.json").exists()
+    );
 
     let (v, code) = real(&["site", "build", "--out", out.to_str().unwrap()], true);
     assert_eq!(code, Some(3), "{v}");
     let (v, code) = real(&["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], true);
     assert_eq!(code, Some(0), "{v}");
     let page = std::fs::read_to_string(out.join("protected/1a00000004/index.html")).unwrap();
-    assert!(page.contains("encrypted-content") && page.contains("/static/decrypt.js"), "{page}");
+    assert!(page.contains("encrypted-content") && page.contains("/static/site.js") && page.contains("unlock-form"), "{page}");
     assert!(out.join("protected/index.html").is_file() && out.join("static/argon2.umd.min.js").is_file());
+    let list: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("static/protected.json")).unwrap()).unwrap();
+    assert_eq!(list.as_array().map(Vec::len), Some(1), "one password, one list: {list}");
+    assert!(list[0]["ciphertext"].is_string() && list[0]["salt"].is_string() && list[0]["nonce"].is_string(), "{list}");
+    let search = std::fs::read_to_string(out.join("search.json")).unwrap();
+    assert!(!search.contains("1a00000004"), "the public search index names a protected lesson: {search}");
     let mut all = String::new();
     let mut todo = vec![out.clone()];
     while let Some(d) = todo.pop() {
@@ -3043,4 +3144,78 @@ fn site_builds_with_real_rs_web() {
         }
     }
     assert!(!all.contains("Shallow clones break git describe"), "a protected title is in plain text");
+}
+
+/// Runs only with `RKB_TEST_RS_WEB` set to an rs-web binary.
+#[test]
+fn site_group_password_with_real_rs_web() {
+    let Ok(rs_web) = std::env::var("RKB_TEST_RS_WEB") else { return };
+    let env = site_kb();
+    let toml = env.kb().join("kb.toml");
+    std::fs::write(&toml, std::fs::read_to_string(&toml).unwrap().replacen("[labels]\n", "[labels]\npassword = [\"team-a\"]\n", 1))
+        .unwrap();
+    let p = env.kb().join("general/git/squash-fixups-with-autosquash.md");
+    std::fs::write(
+        &p,
+        std::fs::read_to_string(&p).unwrap().replace("  sensitivity: public\n", "  sensitivity: public\n  password: team-a\n"),
+    )
+    .unwrap();
+    const TEAM: &str = "team-a-battery-staple-horse";
+    let out = env.dir.path().join("out");
+    let real = |args: &[&str]| {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.env("RKB_RS_WEB", &rs_web).env("CLAUDECODE", "1").env("SITE_PASSWORD", PASSWORD).env("SITE_PASSWORD_TEAM_A", TEAM);
+        let mut all = args.to_vec();
+        all.extend(["--format", "json"]);
+        let o = rkb_with(c, &all, "");
+        (serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o))), o.status.code())
+    };
+    let (v, code) = real(&["site", "build", "--out", out.to_str().unwrap()]);
+    assert_eq!(code, Some(3), "{v}");
+    let (v, code) = real(&["confirm", v["request"].as_str().unwrap(), "--choice", "publish"]);
+    assert_eq!(code, Some(0), "{v}");
+
+    let boxes: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("static/protected.json")).unwrap()).unwrap();
+    assert_eq!(boxes.as_array().map(Vec::len), Some(2), "one list per password: {boxes}");
+    assert!(out.join("protected/1a00000005/index.html").is_file() && !out.join("general/git/squash-fixups-with-autosquash").exists());
+    let mut all = String::new();
+    let mut todo = vec![out.clone()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            if e.path().is_dir() {
+                todo.push(e.path());
+            } else if let Ok(t) = std::fs::read_to_string(e.path()) {
+                all.push_str(&t);
+            }
+        }
+    }
+    for word in ["team-a", "TEAM_A", "Squash fixups with autosquash", "Shallow clones break git describe"] {
+        assert!(!all.contains(word), "`{word}` is in plain text in the built site");
+    }
+
+    // Decrypt the group page with rs-web itself: the team password opens it, the site password does not.
+    let probe = env.dir.path().join("probe");
+    std::fs::create_dir_all(probe.join("templates")).unwrap();
+    std::fs::write(probe.join("templates/p.html"), "x").unwrap();
+    let page = out.join("protected/1a00000005/index.html");
+    std::fs::write(
+        probe.join("config.lua"),
+        format!(
+            r#"local rs = require("rs-web")
+local html = rs.fs.read("{}")
+local function attr(n) return html:match(n .. '="([^"]+)"') or html:match(n .. "=([^%s>]+)") end
+local box = {{ ciphertext = attr("data%-encrypted"), salt = attr("data%-salt"), nonce = attr("data%-nonce") }}
+print("TEAM", pcall(rs.crypt.decrypt, box, "{TEAM}"))
+print("SITE", pcall(rs.crypt.decrypt, box, "{PASSWORD}"))
+return {{ site = {{ title = "p", description = "", base_url = "http://x", author = "" }}, build = {{ output_dir = "dist" }},
+  pages = function() return {{ {{ path = "/", template = "p.html", title = "p" }} }} end }}
+"#,
+            page.display()
+        ),
+    )
+    .unwrap();
+    let o = std::process::Command::new(&rs_web).arg("build").current_dir(&probe).env_remove("SITE_PASSWORD").output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(text.contains("TEAM\ttrue") && text.contains("Squash fixups with autosquash"), "{text}");
+    assert!(text.contains("SITE\tfalse"), "the site password opens a team page: {text}");
 }

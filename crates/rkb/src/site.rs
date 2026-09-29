@@ -1,6 +1,6 @@
 //! `rkb site`: build, preview and customize an rs-web site of the lessons the `web` sink allows.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,18 +24,26 @@ const ASSETS: [(&str, &str, &str, &str); 3] = [
     ("linux", "x86_64", "rs-web-linux-x86_64", "da5f75d0b5165329138f84743076ed28f735999124610fb9b2f83d9484c6db3f"),
 ];
 
-const TEMPLATE: [(&str, &str); 10] = [
-    ("config.lua", include_str!("../site/config.lua")),
-    ("templates/base.html", include_str!("../site/templates/base.html")),
-    ("templates/home.html", include_str!("../site/templates/home.html")),
-    ("templates/lesson.html", include_str!("../site/templates/lesson.html")),
-    ("templates/list.html", include_str!("../site/templates/list.html")),
-    ("templates/protected.html", include_str!("../site/templates/protected.html")),
-    ("templates/protected-index.html", include_str!("../site/templates/protected-index.html")),
-    ("static/decrypt.js", include_str!("../site/static/decrypt.js")),
+const TEMPLATE: [(&str, &[u8]); 17] = [
+    ("config.lua", include_bytes!("../site/config.lua")),
+    ("templates/base.html", include_bytes!("../site/templates/base.html")),
+    ("templates/home.html", include_bytes!("../site/templates/home.html")),
+    ("templates/lesson.html", include_bytes!("../site/templates/lesson.html")),
+    ("templates/list.html", include_bytes!("../site/templates/list.html")),
+    ("templates/groups.html", include_bytes!("../site/templates/groups.html")),
+    ("templates/protected.html", include_bytes!("../site/templates/protected.html")),
+    ("templates/protected-index.html", include_bytes!("../site/templates/protected-index.html")),
+    ("templates/unlock.html", include_bytes!("../site/templates/unlock.html")),
+    ("templates/redirect.html", include_bytes!("../site/templates/redirect.html")),
+    ("static/site.css", include_bytes!("../site/static/site.css")),
+    ("static/site.js", include_bytes!("../site/static/site.js")),
     // hash-wasm 4.12.0, MIT (https://www.npmjs.com/package/hash-wasm): Argon2id in the browser.
-    ("static/argon2.umd.min.js", include_str!("../site/static/argon2.umd.min.js")),
-    ("static/hash-wasm.LICENSE", include_str!("../site/static/hash-wasm.LICENSE")),
+    ("static/argon2.umd.min.js", include_bytes!("../site/static/argon2.umd.min.js")),
+    ("static/hash-wasm.LICENSE", include_bytes!("../site/static/hash-wasm.LICENSE")),
+    // Geist and Geist Mono from the geist 1.7.2 npm package, SIL OFL 1.1.
+    ("static/fonts/Geist-Variable.woff2", include_bytes!("../site/static/fonts/Geist-Variable.woff2")),
+    ("static/fonts/GeistMono-Variable.woff2", include_bytes!("../site/static/fonts/GeistMono-Variable.woff2")),
+    ("static/fonts/OFL.txt", include_bytes!("../site/static/fonts/OFL.txt")),
 ];
 
 const TEXT: [&str; 7] = ["html", "xml", "json", "js", "css", "txt", "md"];
@@ -165,7 +173,8 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Minimum length of `SITE_PASSWORD`. Pages can be guessed at offline, so the password must be long.
+/// Minimum length of `SITE_PASSWORD` and each group password. Pages can be guessed at offline, so a
+/// password must be long.
 pub const MIN_PASSWORD: usize = 16;
 
 /// Ids the user agreed to publish for the first time, in the clear and encrypted.
@@ -175,28 +184,37 @@ pub struct Approved {
     pub encrypted: Vec<String>,
 }
 
-/// Whether protected lessons are built: `SITE_PASSWORD` is set and long enough.
-fn protection() -> Result<bool, CliError> {
-    match std::env::var("SITE_PASSWORD").ok().filter(|p| !p.is_empty()) {
-        None => Ok(false),
-        Some(p) if p.chars().count() < MIN_PASSWORD => Err(CliError::new(
-            ErrorCode::Refused,
-            format!("SITE_PASSWORD has {} characters; protected pages need at least {MIN_PASSWORD}", p.chars().count()),
-            "use a long random password, such as the output of `openssl rand -base64 24`, or unset SITE_PASSWORD to leave internal lessons out",
-        )),
-        Some(_) => Ok(true),
+/// Refuses a `SITE_PASSWORD` or `SITE_PASSWORD_<GROUP>` that is set but too short.
+fn check_passwords() -> Result<(), CliError> {
+    for (name, value) in std::env::vars() {
+        let n = value.chars().count();
+        if (name == "SITE_PASSWORD" || name.starts_with("SITE_PASSWORD_")) && n > 0 && n < MIN_PASSWORD {
+            return Err(CliError::new(
+                ErrorCode::Refused,
+                format!("{name} has {n} characters; protected pages need at least {MIN_PASSWORD}"),
+                format!(
+                    "use a long random password, such as the output of `openssl rand -base64 24`, or unset {name} to leave its lessons out"
+                ),
+            ));
+        }
     }
+    Ok(())
+}
+
+fn password_set(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| !v.is_empty())
 }
 
 fn published_file(env: &Env) -> PathBuf {
     env.state.join("site-published.json")
 }
 
-/// Ids published in the clear and encrypted. An older file's `ids` are in the clear.
+/// Ids published in the clear, and ids published encrypted with their password group (`""` for the
+/// site password). An older file's `ids` are in the clear, and its `encrypted` list is the site password.
 #[derive(Default)]
 struct Published {
     clear: BTreeSet<String>,
-    encrypted: BTreeSet<String>,
+    encrypted: BTreeMap<String, String>,
 }
 
 fn published(env: &Env) -> Published {
@@ -206,15 +224,24 @@ fn published(env: &Env) -> Published {
     };
     let mut clear = set("clear");
     clear.extend(set("ids"));
-    Published { clear, encrypted: set("encrypted") }
+    let mut encrypted: BTreeMap<String, String> = set("encrypted").into_iter().map(|i| (i, String::new())).collect();
+    if let Some(m) = v["encrypted"].as_object() {
+        encrypted.extend(m.iter().map(|(k, g)| (k.clone(), g.as_str().unwrap_or_default().to_string())));
+    }
+    Published { clear, encrypted }
 }
 
-/// Adds `clear` and `encrypted` ids; a lesson now public no longer counts as encrypted only.
-fn record(env: &Env, clear: &[String], encrypted: &[String]) -> Result<(), CliError> {
+fn group_name(s: &site::Site, id: &str) -> String {
+    s.groups.get(id).cloned().flatten().unwrap_or_default()
+}
+
+/// Adds `clear` ids and `encrypted` ids with their groups; a lesson now public no longer counts as
+/// encrypted only.
+fn record(env: &Env, clear: &[String], encrypted: &[(String, String)]) -> Result<(), CliError> {
     let mut p = published(env);
     p.clear.extend(clear.iter().cloned());
     p.encrypted.extend(encrypted.iter().cloned());
-    p.encrypted.retain(|i| !p.clear.contains(i) || encrypted.contains(i));
+    p.encrypted.retain(|i, _| !p.clear.contains(i) || encrypted.iter().any(|(e, _)| e == i));
     let fix = "check that the state folder is writable";
     std::fs::create_dir_all(&env.state).map_err(|e| io_error(e, fix))?;
     std::fs::write(published_file(env), json!({ "clear": p.clear, "encrypted": p.encrypted }).to_string()).map_err(|e| io_error(e, fix))
@@ -236,8 +263,8 @@ fn stage(env: &Env, s: &site::Site, dir: &Path) -> Result<(), CliError> {
             put(&rel, &std::fs::read(&p).map_err(|e| io_error(e, fix))?)?;
         }
     } else {
-        for (rel, text) in TEMPLATE {
-            put(rel, text.as_bytes())?;
+        for (rel, data) in TEMPLATE {
+            put(rel, data)?;
         }
     }
     for (path, data) in &s.files {
@@ -246,12 +273,14 @@ fn stage(env: &Env, s: &site::Site, dir: &Path) -> Result<(), CliError> {
     put("site.json", serde_json::to_string_pretty(&s.index).expect("the index serializes").as_bytes())
 }
 
-/// Removes the values of the encrypted-content attributes, so random base64 cannot look like a finding.
-/// A minified page may drop the quotes around a value.
+/// Removes the values of the encrypted-content attributes and of the `ciphertext`, `salt` and `nonce`
+/// keys of an encrypted JSON file, so random base64 cannot look like a finding. A minified page may drop
+/// the quotes around a value.
 fn without_ciphertext(text: &str) -> String {
+    const KEYS: [&str; 6] = ["data-encrypted=", "data-salt=", "data-nonce=", "\"ciphertext\":", "\"salt\":", "\"nonce\":"];
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(i) = ["data-encrypted=", "data-salt=", "data-nonce="].iter().filter_map(|a| rest.find(a).map(|i| i + a.len())).min() {
+    while let Some(i) = KEYS.iter().filter_map(|a| rest.find(a).map(|i| i + a.len())).min() {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
         let end = match rest.strip_prefix('"') {
@@ -288,8 +317,8 @@ fn check(env: &Env, dist: &Path, s: &site::Site) -> Vec<String> {
         if p.extension().and_then(|e| e.to_str()).is_some_and(|e| TEXT.contains(&e))
             && let Ok(text) = std::fs::read_to_string(&p)
         {
-            // The vendored Argon2 build is minified code whose tokens look like job ids; rkb ships it as is.
-            if TEMPLATE.iter().any(|(rel, body)| rel.ends_with(".min.js") && *body == text) {
+            // The vendored Argon2 build and font files ship as is; minified tokens can look like job ids.
+            if TEMPLATE.iter().any(|(rel, body)| vendored(rel) && *body == text.as_bytes()) {
                 continue;
             }
             let text = without_ciphertext(&text);
@@ -302,6 +331,9 @@ fn check(env: &Env, dist: &Path, s: &site::Site) -> Vec<String> {
                 }
             }
         }
+        if let Some(x) = s.secrets.iter().find(|x| rel.starts_with(&format!("{}/", x.path.strip_suffix(".md").unwrap_or(&x.path)))) {
+            out.push(format!("{rel}: a page at the path of protected lesson `{}`", x.id));
+        }
         for (prefix, ids, what) in [("lessons/", &s.ids, "public"), ("protected/", &s.protected, "protected")] {
             if let Some(id) = rel.strip_prefix(prefix).and_then(|r| r.split('/').next()).filter(|id| !id.contains('.'))
                 && !ids.iter().any(|i| i == id)
@@ -312,6 +344,10 @@ fn check(env: &Env, dist: &Path, s: &site::Site) -> Vec<String> {
     }
     out.dedup();
     out
+}
+
+fn vendored(rel: &str) -> bool {
+    rel.ends_with(".min.js") || rel.starts_with("static/fonts/")
 }
 
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -351,19 +387,27 @@ fn listed(index: &Value, key: &str, ids: &[String]) -> Vec<String> {
 /// `rkb site build` and `rkb site serve`. `approved` holds the ids the user just agreed to publish.
 pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approved) -> Result<Output, CliError> {
     kb::open(&env.root)?;
-    let protect = protection()?;
-    let s = site::collect(&env.root, protect)?;
+    check_passwords()?;
+    let s = site::collect(&env.root, password_set)?;
     let before = published(env);
     let new_clear: Vec<String> = s.ids.iter().filter(|i| !before.clear.contains(*i) && !approved.clear.contains(i)).cloned().collect();
-    let new_enc: Vec<String> =
-        s.protected.iter().filter(|i| !before.encrypted.contains(*i) && !approved.encrypted.contains(i)).cloned().collect();
+    let new_enc: Vec<String> = s
+        .protected
+        .iter()
+        .filter(|i| before.encrypted.get(*i) != Some(&group_name(&s, i)) && !approved.encrypted.contains(i))
+        .cloned()
+        .collect();
     if !new_clear.is_empty() || !new_enc.is_empty() {
         let mut question = format!("Publish {} lessons for the first time?", new_clear.len() + new_enc.len());
         if !new_clear.is_empty() {
             question.push_str(&format!("\nIn the clear:\n{}", listed(&s.index, "lessons", &new_clear).join("\n")));
         }
-        if !new_enc.is_empty() {
-            question.push_str(&format!("\nEncrypted with SITE_PASSWORD:\n{}", listed(&s.index, "protected", &new_enc).join("\n")));
+        let mut by_env: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for i in &new_enc {
+            by_env.entry(site::password_env(s.groups.get(i).cloned().flatten().as_deref())).or_default().push(i.clone());
+        }
+        for (var, ids) in &by_env {
+            question.push_str(&format!("\nEncrypted with {var}:\n{}", listed(&s.index, "protected", ids).join("\n")));
         }
         let req = Request {
             id: request::new_id(),
@@ -383,7 +427,13 @@ pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approv
         .clear
         .iter()
         .filter(|i| !s.ids.contains(i))
-        .chain(before.encrypted.iter().filter(|i| !s.protected.contains(i) && !s.ids.contains(i)))
+        .chain(
+            before
+                .encrypted
+                .iter()
+                .filter(|(i, g)| !s.ids.contains(i) && (!s.protected.contains(i) || **g != group_name(&s, i)))
+                .map(|(i, _)| i),
+        )
         .cloned()
         .collect();
     let (bin, note) = rs_web()?;
@@ -397,15 +447,14 @@ pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approv
             gone.join(", ")
         ));
     }
-    if s.left_out > 0 {
-        notes.push(format!(
-            "{} internal lessons were left out; set SITE_PASSWORD ({MIN_PASSWORD}+ characters) to publish them encrypted",
-            s.left_out
-        ));
+    for (var, n) in &s.left_out {
+        let what = if var == "SITE_PASSWORD" { "internal lessons" } else { "lessons" };
+        notes.push(format!("{n} {what} were left out; set {var} ({MIN_PASSWORD}+ characters) to publish them encrypted"));
     }
     let count = s.ids.len() + s.protected.len();
     if let Some(port) = serve {
-        record(env, &approved.clear, &approved.encrypted)?;
+        let enc: Vec<(String, String)> = approved.encrypted.iter().map(|i| (i.clone(), group_name(&s, i))).collect();
+        record(env, &approved.clear, &enc)?;
         for n in &notes {
             eprintln!("note: {n}");
         }
@@ -447,7 +496,8 @@ pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approv
     }
     let out = out.map(PathBuf::from).unwrap_or_else(|| site_dir().join("dist"));
     replace(&dist, &out).map_err(|e| io_error(format!("{}: {e}", out.display()), "check that the output folder is writable"))?;
-    record(env, &s.ids, &s.protected)?;
+    let enc: Vec<(String, String)> = s.protected.iter().map(|i| (i.clone(), group_name(&s, i))).collect();
+    record(env, &s.ids, &enc)?;
     let mut human = format!("{} {count} lessons ({} protected) to {}", paint(env.colored, "32", "built"), s.protected.len(), out.display());
     for n in &notes {
         human.push_str(&format!("\n{} {n}", paint(env.colored, "33", "note:")));
@@ -481,7 +531,7 @@ pub fn init(env: &Env) -> Result<Output, CliError> {
         }
         std::fs::create_dir_all(p.parent().expect("template files are in a folder")).map_err(|e| io_error(e, fix))?;
         let mut f = std::fs::File::create(&p).map_err(|e| io_error(format!("{}: {e}", p.display()), fix))?;
-        f.write_all(text.as_bytes()).map_err(|e| io_error(e, fix))?;
+        f.write_all(text).map_err(|e| io_error(e, fix))?;
         written.push(path);
     }
     if !written.is_empty() {
@@ -523,6 +573,7 @@ mod tests {
             r#"<div data-encrypted= data-nonce=>x</div>"#
         );
         assert_eq!(without_ciphertext("a data-salt=abc"), "a data-salt=");
+        assert_eq!(without_ciphertext(r#"{"ciphertext":"QUJD","salt":"c2FsdA==","nonce":"bm9u"}"#), r#"{"ciphertext":,"salt":,"nonce":}"#);
     }
 
     #[test]

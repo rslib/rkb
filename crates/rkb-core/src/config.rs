@@ -14,6 +14,8 @@ pub struct KbConfig {
     pub sinks: BTreeMap<String, Sink>,
     #[serde(default)]
     pub leak: LeakConfig,
+    #[serde(default)]
+    pub site: SiteConfig,
     pub rerank: Option<toml::Table>,
     pub facts: Option<toml::Table>,
     pub probe: Option<toml::Table>,
@@ -23,6 +25,15 @@ pub struct KbConfig {
     pub lock: Option<toml::Table>,
     pub jev: Option<toml::Table>,
     pub dupes: Option<toml::Table>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SiteConfig {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub base_url: Option<String>,
+    pub author: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -159,6 +170,13 @@ mod tests {
         let c: KbConfig = parse(DEFAULT_KB_TOML).unwrap();
         assert_eq!(c.labels["sensitivity"].len(), 3);
         assert_eq!(c.sinks.len(), 3);
+    }
+
+    #[test]
+    fn site_section() {
+        let c: KbConfig = parse("[site]\ntitle = \"Field notes\"\nbase_url = \"https://example.org\"\n").unwrap();
+        assert_eq!((c.site.title.as_deref(), c.site.base_url.as_deref()), (Some("Field notes"), Some("https://example.org")));
+        assert!(parse::<KbConfig>("[site]\ncolour = \"x\"\n").unwrap_err().contains("colour"));
     }
 
     #[test]
