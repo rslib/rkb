@@ -16,7 +16,9 @@ repos:
         always_run: true
       - id: cargo-test
         name: cargo test
-        entry: cargo test --quiet
+        # Inside a git hook, git exports GIT_INDEX_FILE (and in some setups GIT_DIR and GIT_WORK_TREE)
+        # for this repository; the tests' own git repositories must not inherit them.
+        entry: env -u GIT_INDEX_FILE -u GIT_DIR -u GIT_WORK_TREE -u GIT_PREFIX -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES cargo test --quiet
         language: system
         pass_filenames: false
         always_run: true
