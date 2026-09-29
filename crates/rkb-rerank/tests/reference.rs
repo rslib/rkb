@@ -7,7 +7,7 @@ fn check(pref: Pref, tolerance: f32) {
     let Some(dir) = std::env::var_os("RKB_TEST_LAYA_DIR") else { return };
     let dir = std::path::Path::new(&dir);
     if pref == Pref::Auto {
-        rkb_rerank::warm(dir).unwrap();
+        rkb_rerank::warm(dir, || Ok(std::time::Duration::ZERO)).unwrap();
     }
     let model = Laya::open(dir, pref).unwrap();
     let want_device = if pref == Pref::Auto && cfg!(target_os = "macos") { "gpu" } else { "cpu" };

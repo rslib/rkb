@@ -260,8 +260,7 @@ fn ranked_search(
     let mut found = search::search(root, &place, &facts, &Mode::Ranked(query.to_string()), &opts)?;
     let items = search::rerank_items(root, &found.hits);
     let timeout = cfg.get("hook_timeout_ms").and_then(toml::Value::as_integer).map_or(DEFAULT_HOOK_TIMEOUT_MS, |v| v.max(0) as u64);
-    let ranked =
-        rerank::run(&settings, None, &crate::rerankers::opener(&settings), query, &items, std::time::Duration::from_millis(timeout))?;
+    let ranked = crate::rerankers::run(&settings, None, query, &items, std::time::Duration::from_millis(timeout))?;
     if let Some(scores) = &ranked.scores {
         search::apply_relevance(&mut found.hits, scores);
     }

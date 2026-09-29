@@ -462,12 +462,18 @@ enum ModelsCmd {
         #[arg(default_value = "laya", value_parser = ["laya"])]
         name: String,
     },
-    /// Compile the GPU kernels for this rkb once (about 10 s), so searches can use the GPU. Needs no network.
+    /// Compile the GPU kernels (about 10 s when cold) and check them in a fresh process, so searches can use the GPU. Needs no network.
     #[command(after_help = "Example:\n  rkb models warm")]
     Warm {
         #[arg(default_value = "laya", value_parser = ["laya"])]
         name: String,
+        /// The detached run after a GPU timeout: no output, errors to hook-errors.log, removes the warm-up lock.
+        #[arg(long, hide = true)]
+        background: bool,
     },
+    /// Time one short GPU scoring call in this process and print the milliseconds.
+    #[command(hide = true)]
+    Probe,
 }
 
 /// Turns a clap error into rkb's error record on stdout, so an agent can correct the call in one step.
@@ -755,7 +761,9 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Inbox { action: Some(InboxCmd::Show { id }) } => inbox::show(&env, &id),
         Cmd::Inbox { action: Some(InboxCmd::Done { ids }) } => inbox::done(&env, &ids),
         Cmd::Models { action: ModelsCmd::Fetch { .. } } => models_fetch(),
-        Cmd::Models { action: ModelsCmd::Warm { .. } } => models_warm(),
+        Cmd::Models { action: ModelsCmd::Warm { background: false, .. } } => models_warm(),
+        Cmd::Models { action: ModelsCmd::Warm { background: true, .. } } => models_warm_background(),
+        Cmd::Models { action: ModelsCmd::Probe } => models_probe(),
         Cmd::Site { action: SiteCmd::Build { out, no_ask } } => site::run(&env, out, None, &site::Approved::default(), no_ask),
         Cmd::Site { action: SiteCmd::Serve { port } } => site::run(&env, None, Some(port), &site::Approved::default(), false),
         Cmd::Site { action: SiteCmd::Init } => site::init(&env),
@@ -905,15 +913,15 @@ fn models_fetch() -> Result<Output, CliError> {
         human.push_str(&format!("present    {name}\n"));
     }
     human.push_str(&format!("{mb:.0} MB downloaded into {}; every file matches its pinned hash", dir.display()));
-    let warm = rkb_rerank::warm(&dir).map_err(|e| {
+    let warm = rkb_rerank::warm(&dir, rerankers::probe_child).map_err(|e| {
         CliError::new(
             output::ErrorCode::Io,
             format!("warming the GPU kernels failed: {e:#}"),
             "run `rkb models warm` to try again; the CPU engine works without it",
         )
     })?;
-    if let Some(t) = warm {
-        human.push_str(&format!("\nGPU kernels compiled for this rkb in {:.1} s", t.as_secs_f64()));
+    if let Some(w) = &warm {
+        human.push_str(&format!("\n{}", rerankers::warm_line(w)));
     }
     let data = json!({
         "dir": dir.display().to_string(),
@@ -921,30 +929,72 @@ fn models_fetch() -> Result<Output, CliError> {
         "downloaded": f.downloaded,
         "present": f.present,
         "bytes": f.bytes,
-        "gpu_warm_s": warm.map(|t| (t.as_secs_f64() * 10.0).round() / 10.0),
+        "gpu_warm_s": warm.map(|w| secs1(w.compile)),
+        "gpu_confirmed": warm.map(|w| w.confirmed),
         "help": ["Add \"laya\" to `chain` under [rerank] in kb.toml to rerank with it"],
     });
     Ok(Output { data, human, exit: 0, raw: false })
 }
 
 #[cfg(feature = "laya")]
+fn secs1(t: std::time::Duration) -> f64 {
+    (t.as_secs_f64() * 10.0).round() / 10.0
+}
+
+#[cfg(feature = "laya")]
 fn models_warm() -> Result<Output, CliError> {
     let dir = rkb_rerank::files::default_dir();
-    let t = rkb_rerank::warm(&dir).map_err(|e| {
+    let w = rkb_rerank::warm(&dir, rerankers::probe_child).map_err(|e| {
         CliError::new(
             output::ErrorCode::Io,
             format!("warming the GPU kernels failed: {e:#}"),
             "run `rkb models fetch` if the files are missing; the CPU engine works without the GPU",
         )
     })?;
-    let (human, data) = match t {
-        Some(t) => (
-            format!("GPU kernels compiled for this rkb in {:.1} s; searches can use the GPU now", t.as_secs_f64()),
-            json!({ "gpu": true, "seconds": (t.as_secs_f64() * 10.0).round() / 10.0 }),
+    let (human, data) = match w {
+        Some(w) => (
+            rerankers::warm_line(&w),
+            json!({ "gpu": true, "seconds": secs1(w.compile), "probe_seconds": secs1(w.probe), "compiles": w.compiles, "confirmed": w.confirmed }),
         ),
         None => ("This rkb has no GPU engine; searches use the CPU".to_string(), json!({ "gpu": false })),
     };
     Ok(Output { data, human, exit: 0, raw: false })
+}
+
+/// The detached warm-up after a GPU timeout. Nobody reads its output, so problems go to `hook-errors.log`.
+#[cfg(feature = "laya")]
+fn models_warm_background() -> Result<Output, CliError> {
+    let dir = rkb_rerank::files::default_dir();
+    let problem = match rkb_rerank::warm(&dir, rerankers::probe_child) {
+        Ok(Some(w)) if !w.confirmed => Some(rerankers::warm_line(&w)),
+        Ok(_) => None,
+        Err(e) => Some(format!("{e:#}")),
+    };
+    let _ = std::fs::remove_file(rkb_rerank::warming_lock(&dir));
+    if let Some(p) = problem {
+        let line = json!({ "time": jiff::Timestamp::now().to_string(), "event": "models warm --background", "error": p });
+        let _ = rkb_core::lock::append_line(&paths::state_dir().join("hook-errors.log"), &line.to_string());
+    }
+    Ok(Output { data: json!({}), human: String::new(), exit: 0, raw: true })
+}
+
+#[cfg(feature = "laya")]
+fn models_probe() -> Result<Output, CliError> {
+    let t = rkb_rerank::gpu_once(&rkb_rerank::files::default_dir())
+        .map_err(|e| CliError::new(output::ErrorCode::Io, format!("the GPU engine did not start: {e:#}"), "rkb models fetch"))?
+        .ok_or_else(|| CliError::new(output::ErrorCode::Usage, "this rkb has no GPU engine", "searches use the CPU engine"))?;
+    let ms = t.as_millis() as u64;
+    Ok(Output { data: json!({ "ms": ms }), human: format!("{ms} ms"), exit: 0, raw: false })
+}
+
+#[cfg(not(feature = "laya"))]
+fn models_warm_background() -> Result<Output, CliError> {
+    models_fetch()
+}
+
+#[cfg(not(feature = "laya"))]
+fn models_probe() -> Result<Output, CliError> {
+    models_fetch()
 }
 
 #[cfg(not(feature = "laya"))]

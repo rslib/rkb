@@ -50,7 +50,7 @@ pub fn rerank_hits(
     let n = if wants_model(&settings, only) { settings.top.min(r.hits.len()) } else { 0 };
     let items = search::rerank_items(&env.root, &r.hits[..n]);
     let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(settings.timeout_ms));
-    let ranked = rerank::run(&settings, only, &crate::rerankers::opener(&settings), query, &items, timeout)?;
+    let ranked = crate::rerankers::run(&settings, only, query, &items, timeout)?;
     if let Some(scores) = &ranked.scores {
         search::apply_relevance(&mut r.hits, scores);
     }
