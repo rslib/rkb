@@ -24,7 +24,7 @@ const ASSETS: [(&str, &str, &str, &str); 3] = [
     ("linux", "x86_64", "rs-web-linux-x86_64", "da5f75d0b5165329138f84743076ed28f735999124610fb9b2f83d9484c6db3f"),
 ];
 
-const TEMPLATE: [(&str, &[u8]); 19] = [
+const TEMPLATE: [(&str, &[u8]); 20] = [
     ("config.lua", include_bytes!("../site/config.lua")),
     ("templates/base.html", include_bytes!("../site/templates/base.html")),
     ("templates/home.html", include_bytes!("../site/templates/home.html")),
@@ -38,6 +38,7 @@ const TEMPLATE: [(&str, &[u8]); 19] = [
     ("templates/404.html", include_bytes!("../site/templates/404.html")),
     ("static/site.css", include_bytes!("../site/static/site.css")),
     ("static/site.js", include_bytes!("../site/static/site.js")),
+    ("static/theme.js", include_bytes!("../site/static/theme.js")),
     ("static/highlight.css", include_bytes!("../site/static/highlight.css")),
     // hash-wasm 4.12.0, MIT (https://www.npmjs.com/package/hash-wasm): Argon2id in the browser.
     ("static/argon2.umd.min.js", include_bytes!("../site/static/argon2.umd.min.js")),

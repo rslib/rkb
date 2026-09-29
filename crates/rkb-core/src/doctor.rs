@@ -230,6 +230,10 @@ fn kb_checks(root: &Path, place: &Place, state_dir: &Path, env: &LintEnv, out: &
         Err(e) => out.push(check("lint", Level::Fail, e.to_string(), Some("run `rkb lint`".into()))),
     }
 
+    if let Some(c) = site_workflow(root) {
+        out.push(c);
+    }
+
     let changes = git::run(root, &["status", "--porcelain"]).map(|o| String::from_utf8_lossy(&o).lines().count()).unwrap_or(0);
     out.push(if changes == 0 {
         check("uncommitted changes", Level::Ok, "none", None)
@@ -278,6 +282,24 @@ fn kb_checks(root: &Path, place: &Place, state_dir: &Path, env: &LintEnv, out: &
     if let Some(c) = root_commit_missing(root, place) {
         out.push(c);
     }
+}
+
+/// The rkb version `.github/workflows/site.yml` downloads, against the running one.
+fn site_workflow(root: &Path) -> Option<Check> {
+    const PATH: &str = ".github/workflows/site.yml";
+    let text = std::fs::read_to_string(root.join(PATH)).ok()?;
+    let pinned = text.lines().find_map(|l| l.trim().strip_prefix("RKB_VERSION:"))?.trim().trim_matches('"').to_string();
+    let ours = env!("CARGO_PKG_VERSION");
+    Some(if pinned == ours {
+        check("site workflow", Level::Ok, format!("{PATH} uses rkb {ours}"), None)
+    } else {
+        check(
+            "site workflow",
+            Level::Warn,
+            format!("{PATH} downloads rkb {pinned}, but this is rkb {ours}"),
+            Some(format!("set `RKB_VERSION: \"{ours}\"` in {PATH} once rkb {ours} is released, or delete the file and run `rkb site ci`")),
+        )
+    })
 }
 
 /// A project matched by remote whose note lacks the repository's single root commit.

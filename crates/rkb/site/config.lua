@@ -325,6 +325,12 @@ local function plain(l)
   return (rs.html.strip_tags(rs.markdown.render(body(l))):gsub("%s+", " "))
 end
 
+-- The lesson's prose as plain text: headings and code blocks left out.
+local function prose(l)
+  local html = rs.markdown.render(body(l)):gsub("<h%d[^>]*>.-</h%d>", " "):gsub("<pre[^>]*>.-</pre>", " ")
+  return (rs.html.strip_tags(html):gsub("%s+", " "))
+end
+
 -- The start of the plain text, cut at a word, for link previews.
 local function summary(text)
   text = text:gsub("^%s+", "")
@@ -446,7 +452,7 @@ return {
       }),
     }
     for _, l in ipairs(site.lessons) do
-      table.insert(pages, page(l.url, "lesson.html", l.title, { main = lesson_html(l, false), open = place(l), current = l.id }, summary(plain(l))))
+      table.insert(pages, page(l.url, "lesson.html", l.title, { main = lesson_html(l, false), open = place(l), current = l.id }, summary(prose(l))))
       table.insert(pages, page("/lessons/" .. l.id .. "/", "redirect.html", l.title, { to = l.url }, nil, true))
     end
     for _, g in pairs(groups) do
@@ -490,6 +496,7 @@ return {
       for _, f in ipairs({
         "site.css",
         "site.js",
+        "theme.js",
         "highlight.css",
         "argon2.umd.min.js",
         "hash-wasm.LICENSE",
@@ -506,6 +513,19 @@ return {
           rs.fs.copy(staged, out .. l.url .. file_name(staged))
         end
       end
+      -- Security headers for Cloudflare Pages and Netlify. The site has no inline script; hash-wasm
+      -- compiles WebAssembly for Argon2, and protected images are data: URLs.
+      rs.fs.write(out .. "/_headers", table.concat({
+        "/*",
+        "  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:;"
+          .. " font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        "  X-Content-Type-Options: nosniff",
+        "  X-Frame-Options: DENY",
+        "  Referrer-Policy: strict-origin-when-cross-origin",
+        "/protected/*",
+        "  X-Robots-Tag: noindex",
+        "",
+      }, "\n"))
       local tree_json = {}
       for key, g in pairs(groups) do
         tree_json[key] = {}

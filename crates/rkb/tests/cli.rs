@@ -3100,6 +3100,16 @@ fn site_ci_writes_the_workflow_once() {
     assert_eq!(deploy["with"]["command"].as_str(), Some("pages deploy dist --project-name=${{ vars.CLOUDFLARE_PROJECT_NAME }}"));
     assert_eq!(deploy["with"]["apiToken"].as_str(), Some("${{ secrets.CLOUDFLARE_API_TOKEN }}"));
 
+    let doctor = |env: &Env| {
+        let (v, _) = env.json(&["doctor"], "");
+        v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "site workflow").cloned().unwrap_or_else(|| panic!("{v}"))
+    };
+    assert_eq!(doctor(&env)["status"], "ok");
+    std::fs::write(env.kb().join(".github/workflows/site.yml"), text.replace(env!("CARGO_PKG_VERSION"), "0.0.1-old")).unwrap();
+    let c = doctor(&env);
+    assert_eq!(c["status"], "warn", "{c}");
+    assert!(c["detail"].as_str().unwrap().contains("0.0.1-old") && c["fix"].as_str().unwrap().contains(env!("CARGO_PKG_VERSION")), "{c}");
+
     std::fs::write(env.kb().join(".github/workflows/site.yml"), "# mine\n").unwrap();
     let before = commit_count(&env);
     let (v, code) = site(&env, &["site", "ci"], &[]);
@@ -3131,7 +3141,7 @@ fn site_init_keeps_user_edits_and_is_used() {
     let env = site_kb();
     let (v, code) = site(&env, &["site", "init"], &[]);
     assert_eq!(code, Some(0), "{v}");
-    assert_eq!(v["written"].as_array().unwrap().len(), 19, "{v}");
+    assert_eq!(v["written"].as_array().unwrap().len(), 20, "{v}");
     let log = stdout(&env.git(&["log", "-1", "--name-only", "--format=%s"]));
     assert!(log.starts_with("site: add the rs-web template") && log.contains("site/config.lua"), "{log}");
 
@@ -3304,6 +3314,23 @@ fn site_builds_with_real_rs_web() {
         assert!(lesson.contains(part), "the lesson page lacks {part}: {lesson}");
     }
     assert!(!lesson.contains("noindex"), "{lesson}");
+    let desc = lesson.split("og:description").next().unwrap().rsplit("content=").next().unwrap();
+    assert!(desc.starts_with("\"When you want to pull or rebase") && !desc.contains("When to use") && !desc.contains("git pull"), "{desc}");
+    let headers = std::fs::read_to_string(out.join("_headers")).unwrap();
+    assert!(headers.contains("Content-Security-Policy: default-src 'self'") && !headers.contains("unsafe-inline"), "{headers}");
+    assert!(headers.contains("/protected/*\n  X-Robots-Tag: noindex"), "{headers}");
+    let mut todo = vec![out.clone()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                todo.push(p);
+            } else if p.extension().is_some_and(|x| x == "html") {
+                let html = std::fs::read_to_string(&p).unwrap();
+                assert!(!html.contains("<script>"), "{} has an inline script", p.display());
+            }
+        }
+    }
     let sitemap = std::fs::read_to_string(out.join("sitemap.xml")).unwrap();
     assert!(sitemap.contains(&format!("<loc>{url}</loc>")) && sitemap.contains("<loc>https://kb.example.org/</loc>"), "{sitemap}");
     assert!(!sitemap.contains("/protected/") && !sitemap.contains("/lessons/"), "{sitemap}");
