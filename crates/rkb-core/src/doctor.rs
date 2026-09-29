@@ -116,7 +116,7 @@ pub fn permission_check(home: &Path) -> Option<Check> {
         "claude permissions",
         Level::Warn,
         format!("Claude Code's default mode is {mode}, so the agent is denied `rkb confirm`"),
-        Some("the user runs each `rkb confirm` the agent shows, in a separate terminal window".into()),
+        Some("the user runs each `rkb confirm` the agent shows, in a separate terminal window or with Claude Code's `!` prefix".into()),
     ))
 }
 

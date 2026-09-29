@@ -196,7 +196,7 @@ pub fn confirm_deny_reason(mode: &str, id: Option<&str>, question: Option<&str>,
         command.push_str(&format!(" --choice \"{}\"", c.replace('"', "\\\"")));
     }
     let mut out = format!(
-        "rkb confirm needs a person, and Claude Code does not ask in {mode} mode. Show the user this question and ask them to run: {command} in a separate terminal window"
+        "rkb confirm needs a person, and Claude Code does not ask in {mode} mode. Show the user this question and ask them to run: {command} in a separate terminal window, or as `! {command}` in Claude Code"
     );
     if let Some(q) = question {
         out.push_str(&format!(" -- question: {q}"));
@@ -611,7 +611,7 @@ mod tests {
         assert!(!mode_skips_prompts(Some("auto")) && !mode_skips_prompts(Some("default")) && !mode_skips_prompts(None));
         assert_eq!(
             confirm_deny_reason("bypassPermissions", Some("r-4f2a9c"), Some("Create general/cmak?"), Some("continue")),
-            "rkb confirm needs a person, and Claude Code does not ask in bypassPermissions mode. Show the user this question and ask them to run: rkb confirm r-4f2a9c --choice \"continue\" in a separate terminal window -- question: Create general/cmak? -- choice: continue"
+            "rkb confirm needs a person, and Claude Code does not ask in bypassPermissions mode. Show the user this question and ask them to run: rkb confirm r-4f2a9c --choice \"continue\" in a separate terminal window, or as `! rkb confirm r-4f2a9c --choice \"continue\"` in Claude Code -- question: Create general/cmak? -- choice: continue"
         );
         assert!(confirm_deny_reason("dontAsk", None, None, None).contains("run: rkb confirm <request id> in a separate"));
     }
