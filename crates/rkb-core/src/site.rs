@@ -128,10 +128,6 @@ pub fn password_env(group: Option<&str>) -> String {
 }
 
 /// Whether `labels` pass every key of the sink's `allow`. An empty `allow` passes nothing.
-fn allowed(allow: &BTreeMap<String, Vec<String>>, labels: &BTreeMap<String, String>) -> bool {
-    !allow.is_empty() && allow.iter().all(|(k, vals)| labels.get(k).is_some_and(|v| vals.contains(v)))
-}
-
 /// The page of a lesson: a public lesson at its knowledge-base path without `.md`, a protected one
 /// at `/protected/<id>/`, since its path would show its topic and title. `/lessons/<id>/` is kept as
 /// a redirect to a public lesson's page, so links survive `rkb move` and `rkb rename`.
@@ -201,7 +197,7 @@ pub fn collect_holding(root: &Path, usable: impl Fn(&str) -> bool, held: &BTreeS
         .map(|l| {
             let labels = crate::write::effective(&snap, &l.path, &l.frontmatter.labels);
             let group = labels.get(PASSWORD_LABEL).cloned();
-            let (public, protectable) = (allowed(&sink.allow, &labels), allowed(protected_allow, &labels));
+            let (public, protectable) = (config::sink_allows(&sink.allow, &labels), config::sink_allows(protected_allow, &labels));
             passwords.push(group.clone());
             if !matches!(l.frontmatter.status, Status::Active | Status::Stale) {
                 return None;
@@ -554,7 +550,7 @@ mod tests {
 
     #[test]
     fn empty_allow_and_missing_sink_publish_nothing() {
-        assert!(!allowed(&BTreeMap::new(), &BTreeMap::from([("sensitivity".into(), "public".into())])));
+        assert!(!config::sink_allows(&BTreeMap::new(), &BTreeMap::from([("sensitivity".into(), "public".into())])));
         let dir = kb(&[]);
         std::fs::write(dir.path().join("kb.toml"), "[labels]\nsensitivity = [\"public\"]\n").unwrap();
         assert!(matches!(collect(dir.path(), |_: &str| true), Err(Error::NotReady { .. })));

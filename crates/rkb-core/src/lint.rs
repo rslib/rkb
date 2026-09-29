@@ -139,6 +139,18 @@ pub fn lint(snap: &Snapshot, env: &LintEnv, focus: Option<&BTreeSet<String>>) ->
         }
         Some(data) => config::parse(&String::from_utf8_lossy(data)).map_err(|e| out.error("kb.toml", None, "config/invalid", e)).ok(),
     };
+    for (key, value) in kb.as_ref().and_then(|k| k.jev.as_ref()).into_iter().flatten() {
+        let message = match (key.as_str(), value) {
+            ("model", toml::Value::String(_)) | ("batch", toml::Value::Boolean(_)) => continue,
+            ("api_key" | "api_key_cmd", _) => format!(
+                "[jev] {key} must not be in kb.toml, which every machine syncs; put it in ~/.config/rkb/config.toml (mode 600) on each machine, or set RKB_JEV_API_KEY"
+            ),
+            ("model", _) => "[jev] model must be a string".into(),
+            ("batch", _) => "[jev] batch must be true or false".into(),
+            _ => format!("[jev] has an unknown key `{key}`; the keys are model and batch"),
+        };
+        out.error("kb.toml", None, "config/jev", message);
+    }
     // The file itself usually sits in site/, which lint does not read; `rkb site build` reports it missing.
     if let Some(img) = kb.as_ref().and_then(|k| k.site.image.as_deref()) {
         let ext = img.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();

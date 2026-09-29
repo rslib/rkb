@@ -1,5 +1,6 @@
 //! The rerank chain: try each backend in order, fall back to BM25, and say why a backend was skipped.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,7 +93,17 @@ impl Ranked {
 
 /// Runs the chain: `only` replaces it for one call; `RKB_NO_MODEL=1` forces BM25 over everything.
 /// Each model backend is opened and asked on a worker thread, so `timeout` covers loading too.
-pub fn run(settings: &Settings, only: Option<&str>, opener: &Opener, query: &str, items: &[String], timeout: Duration) -> Result<Ranked> {
+/// A backend in `blocked` is skipped with its reason before it is opened, such as Jev when a
+/// candidate may not leave the machine.
+pub fn run(
+    settings: &Settings,
+    only: Option<&str>,
+    opener: &Opener,
+    query: &str,
+    items: &[String],
+    timeout: Duration,
+    blocked: &BTreeMap<String, String>,
+) -> Result<Ranked> {
     if std::env::var("RKB_NO_MODEL").is_ok_and(|v| v == "1") {
         return Ok(Ranked::bm25(vec![]));
     }
@@ -105,9 +116,12 @@ pub fn run(settings: &Settings, only: Option<&str>, opener: &Opener, query: &str
         if name == BM25 || items.is_empty() {
             return Ok(Ranked::bm25(skipped));
         }
-        let reason = match ask(&name, opener, query, items, timeout) {
-            Ok((scores, device)) => return Ok(Ranked { backend: name, device, scores: Some(scores), skipped }),
-            Err(reason) => reason,
+        let reason = match blocked.get(&name) {
+            Some(reason) => reason.clone(),
+            None => match ask(&name, opener, query, items, timeout) {
+                Ok((scores, device)) => return Ok(Ranked { backend: name, device, scores: Some(scores), skipped }),
+                Err(reason) => reason,
+            },
         };
         if settings.strict {
             return Err(Error::Refused(format!(
@@ -185,22 +199,42 @@ mod tests {
 
     #[test]
     fn first_that_answers_wins() {
-        let r =
-            run(&settings(&["missing", "broken", "fast", BM25], false), None, &opener(), "q", &items(), Duration::from_secs(2)).unwrap();
+        let r = run(
+            &settings(&["missing", "broken", "fast", BM25], false),
+            None,
+            &opener(),
+            "q",
+            &items(),
+            Duration::from_secs(2),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(r.backend, "fast");
         assert_eq!(r.scores.as_deref(), Some(&[0.0, 0.1, 0.2][..]));
         assert_eq!(r.describe(), "fast (cpu) (missing: not configured; broken: model crashed)");
     }
 
     #[test]
+    fn a_blocked_backend_is_skipped_unopened() {
+        let blocked = BTreeMap::from([("fast".to_string(), "a candidate is not allowed by sinks.fast".to_string())]);
+        let r = run(&settings(&["fast", BM25], false), None, &opener(), "q", &items(), Duration::from_secs(1), &blocked).unwrap();
+        assert_eq!(r.describe(), "bm25 (fast: a candidate is not allowed by sinks.fast)");
+        let e = run(&settings(&["fast"], true), None, &opener(), "q", &items(), Duration::from_secs(1), &blocked).unwrap_err();
+        assert!(e.to_string().contains("not allowed by sinks.fast"), "{e}");
+    }
+
+    #[test]
     fn fallback_timeout_and_strict() {
-        let r = run(&settings(&["slow", BM25], false), None, &opener(), "q", &items(), Duration::from_millis(100)).unwrap();
+        let r =
+            run(&settings(&["slow", BM25], false), None, &opener(), "q", &items(), Duration::from_millis(100), &BTreeMap::new()).unwrap();
         assert_eq!(r.describe(), "bm25 (slow: timeout after 100 ms)");
-        let r = run(&settings(&["missing"], false), None, &opener(), "q", &items(), Duration::from_secs(1)).unwrap();
+        let r = run(&settings(&["missing"], false), None, &opener(), "q", &items(), Duration::from_secs(1), &BTreeMap::new()).unwrap();
         assert_eq!((r.backend.as_str(), r.scores.is_none()), (BM25, true), "an exhausted chain falls back to BM25");
-        let e = run(&settings(&["missing"], true), None, &opener(), "q", &items(), Duration::from_secs(1)).unwrap_err().to_string();
+        let e = run(&settings(&["missing"], true), None, &opener(), "q", &items(), Duration::from_secs(1), &BTreeMap::new())
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("missing") && e.contains("not configured") && e.contains("strict"), "{e}");
-        let r = run(&settings(&[BM25], true), Some("fast"), &opener(), "q", &items(), Duration::from_secs(1)).unwrap();
+        let r = run(&settings(&[BM25], true), Some("fast"), &opener(), "q", &items(), Duration::from_secs(1), &BTreeMap::new()).unwrap();
         assert_eq!(r.backend, "fast", "--rerank replaces the chain");
     }
 

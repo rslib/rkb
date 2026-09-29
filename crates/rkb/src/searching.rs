@@ -1,7 +1,7 @@
 use rkb_core::conditions::{Facts, Verdict};
 use rkb_core::eval;
 use rkb_core::lesson::Status;
-use rkb_core::rerank::{self, BM25, Ranked, Settings};
+use rkb_core::rerank::{BM25, Ranked, Settings};
 use rkb_core::search::{self, Found, Mode, Options, RANKED_BY, Results};
 use serde_json::{Value, json};
 
@@ -48,9 +48,8 @@ pub fn rerank_hits(
 ) -> Result<Ranked, CliError> {
     let settings = Settings::load(&env.root);
     let n = if wants_model(&settings, only) { settings.top.min(r.hits.len()) } else { 0 };
-    let items = search::rerank_items(&env.root, &r.hits[..n]);
     let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(settings.timeout_ms));
-    let ranked = crate::rerankers::run(&settings, only, query, &items, timeout)?;
+    let ranked = crate::rerankers::run(&env.root, &settings, only, query, &r.hits[..n], timeout)?;
     if let Some(scores) = &ranked.scores {
         search::apply_relevance(&mut r.hits, scores);
     }
@@ -251,16 +250,15 @@ pub fn eval(
     };
     let mut settings = Settings::load(&env.root);
     settings.strict = true;
-    let opener = crate::rerankers::opener(&settings);
     let mut ranked_by = BM25.to_string();
     let depth = if backend == BM25 { 0 } else { settings.top };
     let report = eval::run(&env.root, &queries, depth, &mut |q, r| {
         if backend == BM25 {
             return Ok(());
         }
-        let items = search::rerank_items(&env.root, &r.hits[..settings.top.min(r.hits.len())]);
         // Eval is not interactive, so a slow backend still counts; only a skip fails it.
-        let ranked = rerank::run(&settings, Some(backend), &opener, q, &items, std::time::Duration::from_secs(120))?;
+        let n = settings.top.min(r.hits.len());
+        let ranked = crate::rerankers::run(&env.root, &settings, Some(backend), q, &r.hits[..n], std::time::Duration::from_secs(120))?;
         if ranked.backend != backend {
             return Err(rkb_core::Error::Refused(format!(
                 "rerank backend {backend} did not run ({}); unset RKB_NO_MODEL, or run `rkb models fetch`",
@@ -413,8 +411,7 @@ pub fn replay(env: &Env, days: u64, min_recall: Option<f64>, backend: Option<&st
         let facts = Facts::gather(&env.root, &place, &[]);
         let opts = Options { all: false, every_status: false, limit: settings.top.max(1), probes: search::ProbeMode::Cached };
         let mut res = search::search(&env.root, &place, &facts, &Mode::Ranked(r.query.clone()), &opts)?;
-        let items = search::rerank_items(&env.root, &res.hits);
-        let ranked = crate::rerankers::run(&settings, backend, &r.query, &items, timeout)?;
+        let ranked = crate::rerankers::run(&env.root, &settings, backend, &r.query, &res.hits, timeout)?;
         if let Some(scores) = &ranked.scores {
             search::apply_relevance(&mut res.hits, scores);
         }

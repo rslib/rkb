@@ -125,7 +125,9 @@ pub fn doctor(env: &Env, place: &Place, break_lock: bool) -> Result<Output, CliE
         });
     }
     let mut checks = doctor::run(&env.root, place, &env.state, &paths::config_dir(), &env.lint);
-    checks.extend(crate::rerankers::model_check(&rkb_core::rerank::Settings::load(&env.root)));
+    let settings = rkb_core::rerank::Settings::load(&env.root);
+    checks.extend(crate::rerankers::model_check(&settings));
+    checks.extend(crate::rerankers::jev_checks(&env.root, &settings));
     let failed = checks.iter().filter(|c| c.level == Level::Fail).count();
     let warned = checks.iter().filter(|c| c.level == Level::Warn).count();
     Ok(Output {

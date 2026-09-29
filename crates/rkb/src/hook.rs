@@ -261,9 +261,8 @@ fn ranked_search(
     let settings = rerank::Settings::load(root);
     let opts = Options { all: false, every_status: false, limit: settings.top.max(1), probes: rkb_core::search::ProbeMode::Cached };
     let mut found = search::search(root, &place, &facts, &Mode::Ranked(query.to_string()), &opts)?;
-    let items = search::rerank_items(root, &found.hits);
     let timeout = cfg.get("hook_timeout_ms").and_then(toml::Value::as_integer).map_or(DEFAULT_HOOK_TIMEOUT_MS, |v| v.max(0) as u64);
-    let ranked = crate::rerankers::run(&settings, None, query, &items, std::time::Duration::from_millis(timeout))?;
+    let ranked = crate::rerankers::run(root, &settings, None, query, &found.hits, std::time::Duration::from_millis(timeout))?;
     if let Some(scores) = &ranked.scores {
         search::apply_relevance(&mut found.hits, scores);
     }

@@ -204,6 +204,17 @@ pub(crate) fn effective(snap: &Snapshot, path: &str, own: &Mapping) -> BTreeMap<
     effective_with(snap, path, own, None)
 }
 
+/// The effective labels of the lesson at `path`; a file that does not parse has only its folders'.
+pub fn effective_at(snap: &Snapshot, path: &str) -> BTreeMap<String, String> {
+    let own = snap
+        .files
+        .get(path)
+        .and_then(|d| lesson::parse(path, &String::from_utf8_lossy(d)).ok())
+        .map(|l| l.frontmatter.labels)
+        .unwrap_or_default();
+    effective(snap, path, &own)
+}
+
 /// Like `effective`, with the note at `.0` read as the text `.1` instead of the file.
 fn effective_with(snap: &Snapshot, path: &str, own: &Mapping, note: Option<(&str, &str)>) -> BTreeMap<String, String> {
     let notes: Vec<BTreeMap<String, String>> = note_chain(path)

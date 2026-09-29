@@ -4375,3 +4375,196 @@ return {{ site = {{ title = "p", description = "", base_url = "http://x", author
     assert!(text.contains("TEAM\ttrue") && text.contains("Squash fixups with autosquash"), "{text}");
     assert!(text.contains("SITE\tfalse"), "the site password opens a team page: {text}");
 }
+
+/// One request the fake Jev API got: its `Authorization` header and its JSON body.
+type JevLog = std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+
+/// A fake Jev API on 127.0.0.1. `reply` gives the status and body for each request's JSON body.
+fn fake_jev(reply: impl Fn(&serde_json::Value) -> (u16, String) + Send + 'static) -> (String, JevLog) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1/systemone", listener.local_addr().unwrap());
+    let log: JevLog = Default::default();
+    let seen = log.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut r = BufReader::new(stream.try_clone().unwrap());
+            let (mut auth, mut len) = (String::new(), 0usize);
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.split_once(':').unwrap_or((&line, ""));
+                match name.to_ascii_lowercase().as_str() {
+                    "authorization" => auth = value.trim().to_string(),
+                    "content-length" => len = value.trim().parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+            let mut body = vec![0u8; len];
+            r.read_exact(&mut body).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let (status, text) = reply(&body);
+            seen.lock().unwrap().push((auth, body));
+            let mut w = stream;
+            let _ = write!(
+                w,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                text.len()
+            );
+        }
+    });
+    (url, log)
+}
+
+/// Answers every question, rating later candidates higher, so a Jev ranking reverses BM25's.
+fn jev_answers(body: &serde_json::Value) -> (u16, String) {
+    let keys: Vec<String> = body["questions"].as_object().unwrap().keys().cloned().collect();
+    let n = |k: &str| k.strip_prefix("lesson_").and_then(|n| n.parse::<f64>().ok()).unwrap_or(0.0);
+    let answers: serde_json::Map<String, serde_json::Value> =
+        keys.iter().map(|k| (k.clone(), serde_json::json!({ "type": "noul", "noul": (0.1 + n(k) / 100.0).min(1.0) }))).collect();
+    (200, serde_json::json!({ "model": "jev-test", "answers": answers }).to_string())
+}
+
+fn jev_search(env: &Env, url: &str, query: &str, vars: &[(&str, &str)]) -> (serde_json::Value, String) {
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_JEV_URL", url).env_remove("RKB_JEV_API_KEY");
+    for (k, v) in vars {
+        c.env(k, v);
+    }
+    let o = rkb_with(c, &["search", query, "--format", "json"], "");
+    let out = format!("{}{}", stdout(&o), String::from_utf8_lossy(&o.stderr));
+    (serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{out}")), out)
+}
+
+fn jev_config(env: &Env, text: &str, mode: u32) {
+    let p = env.dir.path().join("config/rkb/config.toml");
+    env.write_abs(&p, text);
+    std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(mode)).unwrap();
+}
+
+#[test]
+fn jev_ranks_with_the_key_from_config() {
+    let env = search_kb();
+    set_chain(&env, "chain = [\"jev\", \"bm25\"]");
+    let (url, log) = fake_jev(jev_answers);
+    let (v, out) = jev_search(&env, &url, "git rebase", &[]);
+    assert!(v["ranked_by"].as_str().unwrap().starts_with("bm25 (jev: not configured"), "{v}");
+    assert!(log.lock().unwrap().is_empty());
+
+    jev_config(&env, "[jev]\napi_key = \"sekrit-key-1\"\n", 0o644);
+    let (v, out2) = jev_search(&env, &url, "git rebase", &[]);
+    let why = v["ranked_by"].as_str().unwrap();
+    assert!(why.contains("can be read by others") && why.contains("chmod 600"), "{v}");
+    assert!(log.lock().unwrap().is_empty() && !out.contains("sekrit") && !out2.contains("sekrit"));
+
+    std::fs::set_permissions(env.dir.path().join("config/rkb/config.toml"), std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let (bm25, _) = env.json(&["search", "git rebase", "--no-model"], "");
+    let (v, out) = jev_search(&env, &url, "git rebase", &[]);
+    assert_eq!(v["ranked_by"], "jev", "{v}");
+    assert!(!out.contains("sekrit"), "the key never shows: {out}");
+    let first =
+        |v: &serde_json::Value| v["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let (b, j) = (first(&bm25), first(&v));
+    assert_eq!(j.first(), b.last(), "Jev rated the last BM25 candidate highest: {b:?} {j:?}");
+    let (auth, body) = log.lock().unwrap()[0].clone();
+    assert_eq!(auth, "Bearer sekrit-key-1");
+    assert_eq!(body["model"], "jev-latest");
+    assert!(body["state"].as_str().unwrap().starts_with("problem: git rebase\n\nlessons:\n\n[0]\n# "), "{body}");
+    assert_eq!(body["questions"]["lesson_0"]["type"], "noul");
+    assert_eq!(log.lock().unwrap().len(), 1, "one request for all candidates");
+
+    let (v, _) = jev_search(&env, &url, "git rebase", &[("RKB_JEV_API_KEY", "env-key")]);
+    assert_eq!(v["ranked_by"], "jev");
+    assert_eq!(log.lock().unwrap().last().unwrap().0, "Bearer env-key", "the environment wins");
+
+    jev_config(&env, "[jev]\napi_key_cmd = \"printf cmd-key\"\n", 0o644);
+    let (v, _) = jev_search(&env, &url, "git rebase", &[]);
+    assert_eq!(v["ranked_by"], "jev", "{v}");
+    assert_eq!(log.lock().unwrap().last().unwrap().0, "Bearer cmd-key");
+    jev_config(&env, "[jev]\napi_key_cmd = \"exit 3\"\n", 0o600);
+    let (v, _) = jev_search(&env, &url, "git rebase", &[]);
+    assert!(v["ranked_by"].as_str().unwrap().contains("api_key_cmd exited with 3"), "{v}");
+}
+
+#[test]
+fn jev_falls_back_and_sends_nothing_it_may_not() {
+    let env = search_kb();
+    set_chain(&env, "chain = [\"jev\", \"bm25\"]");
+    jev_config(&env, "[jev]\napi_key = \"k\"\n", 0o600);
+    let (url, log) = fake_jev(|_| (429, "{}".into()));
+    let (v, _) = jev_search(&env, &url, "git rebase", &[]);
+    assert_eq!(v["ranked_by"], "bm25 (jev: HTTP 429)", "{v}");
+    assert_eq!(log.lock().unwrap().len(), 1);
+
+    let (v, _) = jev_search(&env, &url, "testuser git rebase", &[]);
+    assert!(v["ranked_by"].as_str().unwrap().contains("jev: the leak scan matched"), "$USER is testuser: {v}");
+    assert_eq!(log.lock().unwrap().len(), 1, "nothing sent");
+
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write(
+        "kb.toml",
+        &toml.replace(
+            "[sinks.jev]\nallow = { sensitivity = [\"public\", \"internal\"] }",
+            "[sinks.jev]\nallow = { sensitivity = [\"public\"] }",
+        ),
+    );
+    let (v, _) = jev_search(&env, &url, "git rebase", &[]);
+    assert_eq!(v["ranked_by"], "bm25 (jev: a candidate is not allowed by sinks.jev)", "{v}");
+    assert_eq!(log.lock().unwrap().len(), 1, "nothing sent");
+
+    env.write("kb.toml", &toml);
+    let (url401, _) = fake_jev(|_| (401, "{}".into()));
+    set_chain(&env, "chain = [\"jev\"]\nstrict = true");
+    let (v, _) = jev_search(&env, &url401, "git rebase", &[]);
+    assert!(v["error"]["message"].as_str().unwrap().contains("jev") && v["error"]["message"].as_str().unwrap().contains("HTTP 401"), "{v}");
+}
+
+#[test]
+fn jev_one_request_per_candidate() {
+    let env = search_kb();
+    set_chain(&env, "chain = [\"jev\", \"bm25\"]");
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write("kb.toml", &format!("{toml}\n[jev]\nbatch = false\nmodel = \"jev-test\"\n"));
+    jev_config(&env, "[jev]\napi_key = \"k\"\n", 0o600);
+    let (url, log) = fake_jev(|_| (200, serde_json::json!({ "answers": { "relevant": { "type": "noul", "noul": 0.5 } } }).to_string()));
+    let (v, _) = jev_search(&env, &url, "git rebase", &[]);
+    assert_eq!(v["ranked_by"], "jev", "{v}");
+    let log = log.lock().unwrap();
+    assert!(log.len() >= 2, "one request per candidate: {}", log.len());
+    assert!(log.iter().all(|(_, b)| b["model"] == "jev-test" && b["questions"].as_object().unwrap().len() == 1));
+    assert!(log[0].1["state"].as_str().unwrap().starts_with("problem: git rebase\nlesson:\n# "), "{}", log[0].1);
+}
+
+#[test]
+fn jev_config_lint_default_and_doctor() {
+    let env = Env::new();
+    env.init();
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    assert!(toml.contains("[sinks.jev]\nallow = { sensitivity = [\"public\"] }"), "{toml}");
+    env.write("kb.toml", &format!("{toml}\n[jev]\napi_key = \"k\"\n"));
+    let o = env.rkb(&["lint", "--format", "json"]);
+    let out = stdout(&o);
+    assert!(out.contains("config/jev") && out.contains("~/.config/rkb/config.toml"), "{out}");
+
+    env.write("kb.toml", &toml.replace("chain = [\"bm25\"]", "chain = [\"jev\", \"bm25\"]"));
+    jev_config(&env, "[jev]\napi_key = \"sekrit-key-2\"\n", 0o600);
+    let o = env.rkb(&["doctor", "--format", "json"]);
+    let out = stdout(&o);
+    assert!(!out.contains("sekrit"), "{out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let jev: Vec<&serde_json::Value> = v["checks"].as_array().unwrap().iter().filter(|c| c["check"] == "jev").collect();
+    assert_eq!((jev.len(), jev[0]["status"].as_str(), jev[0]["detail"].as_str()), (1, Some("ok"), Some("key from config.toml")), "{v}");
+
+    env.write(
+        "kb.toml",
+        &toml.replace("chain = [\"bm25\"]", "chain = [\"jev\", \"bm25\"]").replace(
+            "allow = { sensitivity = [\"public\"] }\n\n[rerank]",
+            "allow = { sensitivity = [\"public\", \"internal\"] }\n\n[rerank]",
+        ),
+    );
+    let (v, _) = env.json(&["doctor"], "");
+    let warn = v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "jev" && c["status"] == "warn").cloned().unwrap_or_default();
+    assert!(warn["detail"].as_str().unwrap_or("").contains("internal"), "{v}");
+}

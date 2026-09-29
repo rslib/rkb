@@ -139,7 +139,7 @@ allow = { sensitivity = ["public"] }
 allow = { sensitivity = ["public", "internal"] }
 
 [sinks.jev]
-allow = { sensitivity = ["public", "internal"] }
+allow = { sensitivity = ["public"] }
 
 [rerank]
 chain = ["bm25"]
@@ -151,6 +151,12 @@ allow = []
 "#;
 
 pub const DEFAULT_SENSITIVITY: &str = "internal";
+
+/// Whether a sink's `allow` lets a lesson with these effective labels through: every key it names
+/// must hold one of its values. An empty `allow` lets nothing through.
+pub fn sink_allows(allow: &BTreeMap<String, Vec<String>>, labels: &BTreeMap<String, String>) -> bool {
+    !allow.is_empty() && allow.iter().all(|(k, vals)| labels.get(k).is_some_and(|v| vals.contains(v)))
+}
 
 /// A lesson's labels: its own, then each folder note from nearest to farthest, then `sensitivity = "internal"`.
 pub fn effective_labels(lesson: &Mapping, folders: &[&BTreeMap<String, String>]) -> BTreeMap<String, String> {
