@@ -211,7 +211,7 @@ pub fn review(candidates: &[rkb_core::review::Candidate], c: bool) -> Output {
     human.push_str(&format!("{}\nArchive with: rkb archive <id> --reason \"<why>\"", plural(candidates.len(), "candidate")));
     let data = json!({
         "candidates": candidates,
-        "help": ["Show the candidates to the user; archive only the ones they agree to, with `rkb archive <id> --reason \"<why>\"`"],
+        "help": ["For each candidate: fix it with `rkb edit`, merge it with `rkb supersede`, archive it with `rkb archive <id> --reason \"<why>\"`, or leave it; tell the user what you did"],
     });
     Output { data, human, exit: 0, raw: false }
 }

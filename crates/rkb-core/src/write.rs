@@ -61,6 +61,8 @@ pub enum Note {
     ProjectNote { path: String, remote: String },
     /// An existing lesson in the same topic that looks like the new one.
     Similar { id: String, title: String, path: String },
+    /// A new topic folder whose name is close to existing topics, which may be where the lesson belongs.
+    CloseTopic { folder: String, close: Vec<String> },
 }
 
 impl Note {
@@ -75,6 +77,10 @@ impl Note {
             Note::ProjectNote { path, remote } => format!("wrote {path} with the remote {remote}"),
             Note::Similar { id, title, path } => format!(
                 "looks like {id} \"{title}\" ({path}); merge them with `rkb show {id}` and `rkb edit {id} --base <hash>` if they say the same"
+            ),
+            Note::CloseTopic { folder, close } => format!(
+                "{folder} is new and its name is close to {}; if the lesson belongs there, run `rkb move <id> <folder>`",
+                close.join(", ")
             ),
         }
     }
@@ -243,16 +249,19 @@ pub(crate) struct Prepared {
 pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcome> {
     let kb: KbConfig = std::fs::read_to_string(ctx.root.join("kb.toml")).ok().and_then(|t| config::parse(&t).ok()).unwrap_or_default();
     let _lock = kb_lock(ctx.root, &kb)?;
+    if let Some(step) = burst(ctx.root, &kb, action, approved)? {
+        return saved(ctx, step);
+    }
     let snap = Snapshot::from_dir(ctx.root)?;
     let prepared = match action {
         Action::Add { text, topic, assets } => add(ctx, &kb, &snap, action, approved, text, topic, assets)?,
         Action::Edit { id, text, base, assets } => edit(&kb, &snap, action, approved, id, text, base, assets)?,
         Action::Flag { id, reason } => flag(&snap, id, reason)?,
-        Action::Supersede { id, by, reason } => supersede(&snap, action, approved, id, by, reason)?,
+        Action::Supersede { id, by, reason } => supersede(&snap, id, by, reason)?,
         Action::Archive { target, reason } => archive(ctx, &snap, action, approved, target, reason)?,
         Action::Unarchive { id } => unarchive(&snap, id)?,
-        Action::Move { id, folder } => return saved(ctx, relocate(ctx, snap, action, approved, id, Some(folder), None)?),
-        Action::Rename { id, slug } => return saved(ctx, relocate(ctx, snap, action, approved, id, None, Some(slug))?),
+        Action::Move { id, folder } => return saved(ctx, relocate(ctx, snap, approved, id, Some(folder), None)?),
+        Action::Rename { id, slug } => return saved(ctx, relocate(ctx, snap, approved, id, None, Some(slug))?),
         Action::BreakLock { .. }
         | Action::Install { .. }
         | Action::Import { .. }
@@ -266,6 +275,29 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
         Ok(p) => finish(ctx, snap, p),
         Err(outcome) => saved(ctx, outcome),
     }
+}
+
+/// Commits a looping agent may make in an hour before rkb asks the user.
+pub const DEFAULT_BURST: i64 = 30;
+
+/// Asks before a write when the knowledge base had more than `writes.burst` commits in the last hour,
+/// so an agent stuck in a loop cannot flood it. Agents write freely otherwise.
+fn burst(root: &Path, kb: &KbConfig, action: &Action, approved: &[Decision]) -> Result<Option<Outcome>> {
+    if approved.contains(&Decision::Continue) {
+        return Ok(None);
+    }
+    let limit = kb.writes.as_ref().and_then(|t| t.get("burst")).and_then(|v| v.as_integer()).unwrap_or(DEFAULT_BURST);
+    let count: i64 = git::run(root, &["rev-list", "--count", "--since=1.hour", "HEAD"])
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o).trim().parse().ok())
+        .unwrap_or(0);
+    if count <= limit {
+        return Ok(None);
+    }
+    let question = format!(
+        "The knowledge base had {count} commits in the last hour, more than writes.burst ({limit}). An agent may be looping. Write this change anyway?"
+    );
+    ask(action, approved, question, vec![Choice { text: "continue".into(), decision: Some(Decision::Continue) }]).map(Some)
 }
 
 /// Saves the request of a `NeedsUser` outcome, so `rkb confirm` can find it.
@@ -386,17 +418,11 @@ pub(crate) fn add(
         let topics = topics_in(ctx.root, &scope);
         let limit = (name.chars().count() / 4).max(1);
         let close: Vec<&String> = topics.iter().filter(|t| *t != name && crate::text::edit_distance(name, t) <= limit).collect();
+        // A near-duplicate topic name is a note, not a question: the folder is created, and moving the
+        // lesson is one reversible commit.
         if !close.is_empty() && !decided {
-            let question = format!(
-                "Topic folder {folder} does not exist, and its name is close to an existing topic. Create it, or use the existing one?"
-            );
-            let mut choices =
-                vec![Choice { text: format!("create {folder}"), decision: Some(Decision::CreateFolder { path: folder.clone() }) }];
-            for t in closest(name, &topics) {
-                let path = format!("{scope}/{t}");
-                choices.push(Choice { text: format!("use {path}"), decision: Some(Decision::UseTopic { path }) });
-            }
-            return ask(action, approved, question, choices).map(Err);
+            let close = closest(name, &topics).into_iter().map(|t| format!("{scope}/{t}")).collect();
+            notes.push(Note::CloseTopic { folder: folder.clone(), close });
         }
         if let Some(repo) = new_project_repo(ctx, &scope)
             && let Some(first) = repo.remotes.first()
@@ -715,7 +741,7 @@ fn current_or_refuse(l: &Lesson, what: &str) -> Result<()> {
     }
 }
 
-fn supersede(snap: &Snapshot, action: &Action, approved: &[Decision], id: &str, by: &str, reason: &str) -> Result<Step> {
+fn supersede(snap: &Snapshot, id: &str, by: &str, reason: &str) -> Result<Step> {
     let (lessons, _) = snap.lessons();
     let old = find(&lessons, id)?;
     let new = find(&lessons, by)?;
@@ -729,16 +755,6 @@ fn supersede(snap: &Snapshot, action: &Action, approved: &[Decision], id: &str, 
     current_or_refuse(new, "the replacement must be active or stale")?;
     let old_title = title_of(&old.body).unwrap_or_default();
     let new_title = title_of(&new.body).unwrap_or_default();
-    if !approved.contains(&Decision::Supersede) {
-        let question = format!(
-            "Supersede {id} \"{old_title}\" ({}) by {by} \"{new_title}\" ({})? Search will hide {id}.\nReason: {}",
-            old.path,
-            new.path,
-            reason.trim()
-        );
-        let choices = vec![Choice { text: format!("supersede {id}"), decision: Some(Decision::Supersede) }];
-        return ask(action, approved, question, choices).map(Err);
-    }
     let mut fm = old.frontmatter.clone();
     fm.status = Status::Superseded;
     fm.superseded_by = Some(by.to_string());
@@ -778,7 +794,8 @@ fn archive(ctx: &Ctx, snap: &Snapshot, action: &Action, approved: &[Decision], t
         }
         Err(e) => return Err(e),
     };
-    if !approved.contains(&Decision::Archive) {
+    // One lesson is archived without a question (one commit, `rkb unarchive` undoes it); a folder asks.
+    if chosen.len() > 1 && !approved.contains(&Decision::Archive) {
         let mut question = format!("Archive {} lesson(s) under {target}? Search will hide them.\nReason: {}", chosen.len(), reason.trim());
         for l in &chosen {
             question.push_str(&format!("\n- {} {} ({})", l.frontmatter.id, title_of(&l.body).unwrap_or_default(), l.path));
@@ -862,15 +879,7 @@ fn valid_slug(slug: &str) -> bool {
 }
 
 /// Moves a lesson to `folder` or renames it to `slug`, with its assets, and rewrites every link to them in one commit.
-fn relocate(
-    ctx: &Ctx,
-    snap: Snapshot,
-    action: &Action,
-    approved: &[Decision],
-    id: &str,
-    folder: Option<&str>,
-    slug: Option<&str>,
-) -> Result<Outcome> {
+fn relocate(ctx: &Ctx, snap: Snapshot, approved: &[Decision], id: &str, folder: Option<&str>, slug: Option<&str>) -> Result<Outcome> {
     let (lessons, _) = snap.lessons();
     let old = find(&lessons, id)?;
     let (old_dir, old_file) = old.path.rsplit_once('/').expect("lessons live in folders");
@@ -899,22 +908,14 @@ fn relocate(
             Decision::UseTopic { path } => Some(path.clone()),
             _ => None,
         }) {
-            return relocate(ctx, snap, action, &[], id, Some(&use_topic), None);
+            return relocate(ctx, snap, &[], id, Some(&use_topic), None);
         }
         let (scope, name) = new_dir.rsplit_once('/').unwrap_or(("", new_dir));
         let topics = topics_in(ctx.root, scope);
         let limit = (name.chars().count() / 4).max(1);
         if !decided && topics.iter().any(|t| t != name && crate::text::edit_distance(name, t) <= limit) {
-            let question = format!(
-                "Topic folder {new_dir} does not exist, and its name is close to an existing topic. Create it, or use the existing one?"
-            );
-            let mut choices =
-                vec![Choice { text: format!("create {new_dir}"), decision: Some(Decision::CreateFolder { path: new_dir.to_string() }) }];
-            for t in closest(name, &topics) {
-                let path = format!("{scope}/{t}");
-                choices.push(Choice { text: format!("use {path}"), decision: Some(Decision::UseTopic { path }) });
-            }
-            return ask(action, approved, question, choices);
+            let close = closest(name, &topics).into_iter().map(|t| format!("{scope}/{t}")).collect();
+            notes.push(Note::CloseTopic { folder: new_dir.to_string(), close });
         }
         notes.push(Note::NewFolder(new_dir.to_string()));
     }

@@ -111,11 +111,22 @@ pub struct ImportItem {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Decision {
-    CreateFolder { path: String },
-    UseTopic { path: String },
+    CreateFolder {
+        path: String,
+    },
+    UseTopic {
+        path: String,
+    },
     AddAnyway,
-    Loosen { key: String, value: String },
-    CreateProject { path: String, remotes: Vec<String>, root_commit: Option<String> },
+    Loosen {
+        key: String,
+        value: String,
+    },
+    CreateProject {
+        path: String,
+        remotes: Vec<String>,
+        root_commit: Option<String>,
+    },
     BreakLock,
     Install,
     ImportAll,
@@ -124,6 +135,8 @@ pub enum Decision {
     Archive,
     Approve,
     Publish,
+    /// Write although the knowledge base had many commits in the last hour.
+    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

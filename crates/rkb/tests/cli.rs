@@ -497,52 +497,83 @@ fn add_refuses_bad_input() {
     assert_eq!(stdout(&env.git(&["rev-list", "--count", "HEAD"])).trim(), "2");
 }
 
+/// A lesson labeled `public`: adding it loosens the default `internal`, one of the questions that remain.
+fn public_pitfall() -> String {
+    PITFALL.replacen("\n---\n", "\nlabels:\n  sensitivity: public\n---\n", 1)
+}
+
+const LOOSEN: &str = "loosen sensitivity to public";
+
 #[test]
-fn new_topic_needs_user_and_confirm_paths() {
+fn close_topic_is_a_note_and_confirm_paths() {
     let env = kb_with_topics();
-    let o = env.rkb_in(&["add", "--topic", "cmak", "--toon"], PITFALL);
+    let (v, code) = env.json(&["add", "--topic", "cmak"], PITFALL);
+    assert_eq!((v["status"].as_str(), code), (Some("written"), Some(0)), "no question for a close topic name: {v}");
+    assert!(v["path"].as_str().unwrap().starts_with("general/cmak/"), "{v}");
+    assert!(v["notes"].to_string().contains("close to general/cmake") && v["notes"].to_string().contains("rkb move"), "{v}");
+
+    let o = env.rkb_in(&["add", "--topic", "cmake", "--toon"], &public_pitfall());
     assert_eq!(o.status.code(), Some(3));
     let out = stdout(&o);
-    assert!(out.contains("status: needs_user") && out.contains("create general/cmak") && out.contains("use general/cmake"), "{out}");
-    let (v, _) = env.json(&["add", "--topic", "cmak"], PITFALL);
+    assert!(out.contains("status: needs_user") && out.contains(LOOSEN), "{out}");
+    let (v, _) = env.json(&["add", "--topic", "cmake"], &public_pitfall());
     let req = v["request"].as_str().unwrap().to_string();
-    assert_eq!(v["options"][0], "create general/cmak");
+    assert_eq!(v["options"][0], LOOSEN);
     assert!(v["next"].as_str().unwrap().starts_with(&format!("rkb confirm {req} --choice")));
 
     let (bad, _) = env.json(&["confirm", &req, "--choice", "delete everything"], "");
     assert_eq!(bad["error"]["code"], "bad_choice");
-    assert!(bad["error"]["options"].as_array().unwrap().iter().any(|o| o == "use general/cmake"));
+    assert!(bad["error"]["options"].as_array().unwrap().iter().any(|o| o == LOOSEN));
 
-    let (nt, _) = env.json(&["confirm", &req, "--choice", "use general/cmake"], "");
+    let (nt, _) = env.json(&["confirm", &req, "--choice", LOOSEN], "");
     assert_eq!(nt["error"]["code"], "needs_terminal");
-    assert!(nt["error"]["fix"].as_str().unwrap().contains(&format!("rkb confirm {req} --choice \"use general/cmake\"")));
+    assert!(nt["error"]["fix"].as_str().unwrap().contains(&format!("rkb confirm {req} --choice \"{LOOSEN}\"")));
 
     let tty = env.dir.path().join("tty");
     std::fs::write(&tty, "yes\n").unwrap();
     let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
     c.env("RKB_TTY", &tty);
-    let o = rkb_with(c, &["confirm", &req, "--choice", "use general/cmake", "--format", "json"], "");
+    let o = rkb_with(c, &["confirm", &req, "--choice", LOOSEN, "--format", "json"], "");
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["status"], "written", "{v}");
     assert!(v["path"].as_str().unwrap().starts_with("general/cmake/"));
     assert!(std::fs::read_to_string(&tty).unwrap().contains("Type yes to confirm"));
 
-    let (again, _) = env.json(&["confirm", &req, "--choice", "use general/cmake"], "");
+    let (again, _) = env.json(&["confirm", &req, "--choice", LOOSEN], "");
     assert_eq!(again["error"]["code"], "expired");
+}
+
+#[test]
+fn write_burst_asks_before_flooding() {
+    let env = kb_with_topics();
+    env.trust_claude();
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap() + "\n[writes]\nburst = 2\n";
+    env.write("kb.toml", &toml);
+    add_ok(&env, "cmake", &lesson_with("First lesson of the burst"));
+    let before = commit_count(&env);
+    let (v, code) = env.json(&["add", "--topic", "cmake"], &lesson_with("Second lesson of the burst"));
+    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "3 commits in the last hour > 2: {v}");
+    assert!(v["question"].as_str().unwrap().contains("may be looping"), "{v}");
+    assert_eq!(commit_count(&env), before, "nothing written");
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("CLAUDECODE", "1");
+    let o = rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", "continue", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["status"], "written", "{v}");
 }
 
 #[test]
 fn trusted_harness_confirms_without_terminal() {
     let env = kb_with_topics();
     env.trust_claude();
-    let (v, _) = env.json(&["add", "--topic", "cmak"], PITFALL);
+    let (v, _) = env.json(&["add", "--topic", "cmake"], &public_pitfall());
     let req = v["request"].as_str().unwrap();
     let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
     c.env("CLAUDECODE", "1");
-    let o = rkb_with(c, &["confirm", req, "--choice", "create general/cmak", "--format", "json"], "");
+    let o = rkb_with(c, &["confirm", req, "--choice", LOOSEN, "--format", "json"], "");
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["status"], "written", "{v}");
-    assert!(env.kb().join("general/cmak").is_dir());
+    assert!(std::fs::read_to_string(env.kb().join(v["path"].as_str().unwrap())).unwrap().contains("sensitivity: public"));
 }
 
 #[test]
@@ -775,13 +806,13 @@ fn held_lock_gives_locked_error() {
 #[test]
 fn expired_request() {
     let env = kb_with_topics();
-    let (v, _) = env.json(&["add", "--topic", "cmak"], PITFALL);
+    let (v, _) = env.json(&["add", "--topic", "cmake"], &public_pitfall());
     let req = v["request"].as_str().unwrap();
     let file = env.dir.path().join(format!("state/rkb/requests/{req}.json"));
     let mut r: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     r["created"] = serde_json::json!(0);
     std::fs::write(&file, r.to_string()).unwrap();
-    let (v, _) = env.json(&["confirm", req, "--choice", "create general/cmak"], "");
+    let (v, _) = env.json(&["confirm", req, "--choice", LOOSEN], "");
     assert_eq!(v["error"]["code"], "expired");
 }
 
@@ -806,12 +837,15 @@ fn long_diff_is_cut_and_needs_user_reads_well_for_people() {
     assert_eq!(diff.len(), 81);
     assert!(last.contains("lines; run `git -C") && last.contains(v["commit"].as_str().unwrap()), "{last}");
 
-    let o = env.rkb_in(&["add", "--topic", "cmak", "--format", "human"], PITFALL);
+    let o = env.rkb_in(
+        &["add", "--topic", "cmake", "--format", "human"],
+        &public_pitfall().replace("CMake cannot find HDF5", "CMake still cannot find HDF5"),
+    );
     assert_eq!(o.status.code(), Some(3));
     let out = stdout(&o);
     assert!(
         out.contains("Needs your decision:")
-            && out.contains("Options: \"create general/cmak\"")
+            && out.contains(&format!("Options: \"{LOOSEN}\""))
             && out.contains("Answer with: rkb confirm r-")
             && !out.contains("  1. "),
         "{out}"
@@ -835,7 +869,10 @@ fn full_write_flow() {
     assert_eq!(v["notes"], serde_json::json!(["created the folder general/cmake"]));
     let id = v["id"].as_str().unwrap().to_string();
 
-    let (v, _) = env.json(&["add", "--topic", "cmak"], &lesson_with("Something else about cmake builds"));
+    let (v, _) = env.json(
+        &["add", "--topic", "cmake"],
+        &public_pitfall().replace("CMake cannot find HDF5", "Something else about cmake builds and HDF5"),
+    );
     let v = trusted(&["confirm", v["request"].as_str().unwrap(), "--choice", "cancel"]);
     assert_eq!(v["status"], "cancelled");
 
@@ -1036,8 +1073,8 @@ fn doctor_healthy_then_problems() {
     std::fs::remove_file(env.kb().join(".git/hooks/pre-commit")).unwrap();
     env.write("general/demo/a.md", FACT);
     env.git(&["config", "--unset", "receive.denyCurrentBranch"]);
-    let (v, _) = env.json(&["add", "--topic", "demp"], PITFALL);
-    assert_eq!(v["status"], "needs_user", "`demp` is a likely typo of `demo`: {v}");
+    let (v, _) = env.json(&["add", "--topic", "demo"], &public_pitfall());
+    assert_eq!(v["status"], "needs_user", "loosening a label asks: {v}");
     env.write(".git/rkb.lock", "otherhost 1 0");
     let o = env.rkb(&["doctor", "--format", "json"]);
     assert_eq!(o.status.code(), Some(1));
@@ -1720,8 +1757,8 @@ fn rkb_add_builds_the_lesson() {
     near["topic"] = "cmak".into();
     near["title"] = "Another lesson for a close topic".into();
     let (out, code) = tool(&env, "rkb_add", &near);
-    assert_eq!(code, Some(3), "{out}");
-    assert!(out.contains("status: needs_user") && out.contains("use general/cmake"), "{out}");
+    assert_eq!(code, Some(0), "no question for a close topic: {out}");
+    assert!(out.contains("status: written") && out.contains("close to general/cmake"), "{out}");
 }
 
 #[test]
@@ -2490,13 +2527,11 @@ fn import_without_duplicates_and_stop_on_change() {
     }
     let (report, _) = env.json(&["import", dir2.to_str().unwrap()], "");
     assert_eq!(report["options"], serde_json::json!(["import all", "cancel"]));
-    // `ninj` is new and far from every topic at report time; `ninja` created now makes it a likely typo.
+    // A close topic name no longer asks, so a topic created after the report does not stop the import.
     add_ok(&env, "ninja", &lesson_with("Ninja needs a build.ninja file"));
     let (v, code) = confirm_on_tty(&env, report["request"].as_str().unwrap(), "import all");
-    assert_eq!((v["status"].as_str(), code), (Some("stopped"), Some(1)), "{v}");
-    assert_eq!(v["added"].as_array().unwrap().len(), 2);
-    assert_eq!(v["not_added"][0]["source"], "ninj/c.md");
-    assert!(v["not_added"][0]["reason"].as_str().unwrap().contains("changed since the report"), "{v}");
+    assert_eq!((v["status"].as_str(), code), (Some("done"), Some(0)), "{v}");
+    assert_eq!(v["added"].as_array().unwrap().len(), 3);
 }
 
 #[test]
@@ -2586,13 +2621,8 @@ fn supersede_archive_unarchive() {
     let before = commit_count(&env);
 
     let (v, code) = env.json(&["supersede", "5d2e8a1c90", "--by", "9a4c7e2b10", "--reason", "the regex advice is wrong now"], "");
-    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{v}");
-    assert_eq!(v["options"], serde_json::json!(["supersede 5d2e8a1c90", "cancel"]));
-    let q = v["question"].as_str().unwrap();
-    assert!(q.contains("5d2e8a1c90") && q.contains("9a4c7e2b10") && q.contains("Search will hide"), "{q}");
-    assert_eq!(commit_count(&env), before, "nothing before confirm");
-    let v = trusted_confirm(&env, v["request"].as_str().unwrap(), "supersede 5d2e8a1c90");
-    assert_eq!(v["status"], "written", "{v}");
+    assert_eq!((v["status"].as_str(), code), (Some("written"), Some(0)), "no question: {v}");
+    assert_eq!(commit_count(&env), before + 1);
     let text = std::fs::read_to_string(env.kb().join("general/cpp/avoid-std-regex-in-hot-loops.md")).unwrap();
     assert!(text.contains("status: superseded") && text.contains("superseded_by: 9a4c7e2b10"), "{text}");
     assert!(
@@ -2629,8 +2659,8 @@ fn supersede_archive_unarchive() {
     let (v, _) = env.json(&["unarchive", "5d2e8a1c90"], "");
     assert_eq!(v["error"]["code"], "refused", "a superseded lesson is not archived: {v}");
 
-    let (v, _) = env.json(&["archive", "c04e11a9f3", "--reason", "tuolumne retired"], "");
-    trusted_confirm(&env, v["request"].as_str().unwrap(), "archive c04e11a9f3");
+    let (v, code) = env.json(&["archive", "c04e11a9f3", "--reason", "tuolumne retired"], "");
+    assert_eq!((v["status"].as_str(), code), (Some("written"), Some(0)), "one lesson, no question: {v}");
     assert!(head_subject(&env).starts_with("archive(systems/tuolumne/lustre): ") && head_subject(&env).ends_with("[c04e11a9f3]"));
     assert!(env.kb().join("systems/tuolumne/lustre/lustre-needs-striping-for-large-files.md").exists(), "files never move");
     let lint = env.rkb(&["lint"]);
