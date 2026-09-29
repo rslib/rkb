@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 
 use crate::lesson::LessonType;
 
-pub const NAMES: [&str; 4] = ["rkb_search", "rkb_show", "rkb_add", "rkb_note"];
+pub const NAMES: [&str; 7] = ["rkb_search", "rkb_show", "rkb_add", "rkb_note", "rkb_used", "rkb_flag", "rkb_edit"];
 
 const TYPES: [&str; 5] = ["pitfall", "recipe", "fact", "decision", "preference"];
 
@@ -33,7 +33,7 @@ fn section_fields() -> Vec<(String, Vec<&'static str>)> {
     out
 }
 
-/// The four tool definitions: `name`, `description`, and a JSON Schema as `inputSchema`.
+/// The tool definitions: `name`, `description`, and a JSON Schema as `inputSchema`.
 pub fn definitions() -> Vec<Value> {
     let mut add_props = json!({
         "type": { "type": "string", "enum": TYPES, "description": "pitfall: an error and its fix; recipe: steps that work; fact: something true here; decision: a choice and why; preference: how the user wants things done" },
@@ -58,7 +58,7 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rkb_show",
-            "description": "Read one lesson in full by its id (from rkb_search). Check its `applies` result and its Check section before you act on it.",
+            "description": "Read one lesson in full by its id (from rkb_search). Check its `applies` result and its Check section before you act on it. Its `hash` is the `base` for rkb_edit. After you apply a lesson, report the outcome with rkb_used.",
             "inputSchema": { "type": "object", "properties": {
                 "id": { "type": "string", "description": "The lesson id, such as 7f3a9c2b41" },
             }, "required": ["id"], "additionalProperties": false },
@@ -74,6 +74,32 @@ pub fn definitions() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {
                 "text": { "type": "string", "description": "What you found" },
             }, "required": ["text"], "additionalProperties": false },
+        }),
+        json!({
+            "name": "rkb_used",
+            "description": "Report whether a lesson you applied worked. Call it every time you act on a lesson from rkb_search, rkb_show or an rkb hook: `worked` when the task then succeeded, `failed` with the reason when it did not (that also flags the lesson). This is how the knowledge base learns which lessons help.",
+            "inputSchema": { "type": "object", "properties": {
+                "id": { "type": "string", "description": "The lesson id" },
+                "result": { "type": "string", "enum": ["worked", "failed"], "description": "worked or failed" },
+                "reason": { "type": "string", "description": "Why it failed, or what it helped with" },
+            }, "required": ["id", "result"], "additionalProperties": false },
+        }),
+        json!({
+            "name": "rkb_flag",
+            "description": "Mark a lesson stale because it looks wrong or out of date and you cannot fix it now. Give the concrete reason (the version, the error, what changed). Prefer rkb_edit when you know the right content.",
+            "inputSchema": { "type": "object", "properties": {
+                "id": { "type": "string", "description": "The lesson id" },
+                "reason": { "type": "string", "description": "What is wrong, concretely" },
+            }, "required": ["id", "reason"], "additionalProperties": false },
+        }),
+        json!({
+            "name": "rkb_edit",
+            "description": "Fix or extend a lesson: pass the full new lesson file (frontmatter and body, from rkb_show) and the `hash` rkb_show gave as `base`; the edit fails if the lesson changed since. Keep the id, and keep the real error text and evidence. Use it to correct a wrong lesson, add a case, or merge a near-duplicate instead of adding a new lesson. rkb checks and commits it.",
+            "inputSchema": { "type": "object", "properties": {
+                "id": { "type": "string", "description": "The lesson id" },
+                "base": { "type": "string", "description": "The hash rkb_show printed" },
+                "text": { "type": "string", "description": "The full new lesson file" },
+            }, "required": ["id", "base", "text"], "additionalProperties": false },
         }),
     ]
 }

@@ -699,11 +699,56 @@ fn parallel_writers_and_appends() {
     for mut c in used {
         assert!(c.wait().unwrap().success());
     }
-    let log = std::fs::read_to_string(env.dir.path().join("state/rkb/usage.jsonl")).unwrap();
+    let files: Vec<_> = std::fs::read_dir(env.kb().join(".rkb/usage"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        .collect();
+    assert_eq!(files.len(), 1, "one file for this machine, even when 20 processes start at once");
+    let log = std::fs::read_to_string(files[0].path()).unwrap();
     assert_eq!(log.lines().count(), 20);
     for l in log.lines() {
-        serde_json::from_str::<serde_json::Value>(l).unwrap();
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        assert_eq!(v["event"], "worked");
     }
+}
+
+#[test]
+fn review_reads_use_records() {
+    let env = search_kb();
+    let dir = env.kb().join(".rkb/usage");
+    std::fs::create_dir_all(&dir).unwrap();
+    let line = |id: &str, event: &str| format!("{{\"time\":\"2026-09-28T00:00:00Z\",\"id\":\"{id}\",\"event\":\"{event}\"}}\n");
+    let mut text = line("1a00000012", "failed") + &line("1a00000012", "failed");
+    for _ in 0..5 {
+        text += &line("1a00000003", "injected");
+    }
+    text += &line("1a00000005", "injected");
+    std::fs::write(dir.join("other-0001.jsonl"), text).unwrap();
+    let (v, code) = env.json(&["review"], "");
+    assert_eq!(code, Some(0), "{v}");
+    let reasons = |id: &str| -> Vec<String> {
+        v["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["id"] == id)
+            .flat_map(|c| c["reasons"].as_array().unwrap().iter().map(|r| r["kind"].as_str().unwrap().to_string()))
+            .collect()
+    };
+    assert_eq!(reasons("1a00000012"), ["failed_repeatedly"], "{v}");
+    assert_eq!(reasons("1a00000003"), ["never_helped"], "{v}");
+    assert!(reasons("1a00000005").is_empty(), "one injection is not enough: {v}");
+}
+
+/// Every use record in the knowledge base, over every machine's file.
+fn usage_records(env: &Env) -> Vec<serde_json::Value> {
+    let mut out = vec![];
+    for e in std::fs::read_dir(env.kb().join(".rkb/usage")).into_iter().flatten().flatten() {
+        let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+        out.extend(text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()));
+    }
+    out
 }
 
 fn show_first_id(env: &Env) -> String {
@@ -803,7 +848,17 @@ fn full_write_flow() {
     assert!(show(&env, &id)["last_worked"].is_string());
     let lint = env.rkb(&["lint"]);
     assert!(lint.status.success(), "{}", stdout(&lint));
-    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "?? .rkb/\n", "the use record waits for the next rkb commit");
+    assert_eq!(
+        env.json(&["doctor"], "").0["checks"].as_array().unwrap().iter().find(|c| c["check"] == "uncommitted changes").unwrap()["status"],
+        "ok"
+    );
+    let (text, hash) = current(&env, &id);
+    let (v, _) = env.json(&["edit", &id, "--base", &hash], &text.replace("to the prefix.", "to the install prefix."));
+    assert_eq!(v["status"], "written");
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "", "the next write carries it");
+    let files = stdout(&env.git(&["show", "--name-only", "--format=", "HEAD"]));
+    assert!(files.contains(".rkb/usage/") && files.contains(".rkb/.gitignore"), "{files}");
 }
 
 fn list_cmd(env: &Env, args: &[&str], columns: &str, lang: &str) -> String {
@@ -1593,7 +1648,7 @@ fn agent_tools_match_the_commands() {
     let env = search_kb();
     let (v, _) = env.json(&["tools"], "");
     let names: Vec<&str> = v["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["rkb_search", "rkb_show", "rkb_add", "rkb_note"]);
+    assert_eq!(names, ["rkb_search", "rkb_show", "rkb_add", "rkb_note", "rkb_used", "rkb_flag", "rkb_edit"]);
     assert!(
         v["tools"][0]["description"].as_str().unwrap().contains("before a web search")
             || v["tools"][0]["description"].as_str().unwrap().contains("BEFORE a web search")
@@ -1609,6 +1664,31 @@ fn agent_tools_match_the_commands() {
     assert_eq!((code, out), (Some(0), stdout(&env.rkb(&["show", "1a00000012", "--toon"]))));
     let (out, _) = tool(&env, "rkb_note", &serde_json::json!({ "text": "tuolumne wants module load cmake" }));
     assert!(out.starts_with("id: "), "{out}");
+
+    let (out, code) = tool(&env, "rkb_used", &serde_json::json!({ "id": "1a00000012", "result": "worked" }));
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("status: recorded"), "{out}");
+    assert_eq!(usage_records(&env).iter().filter(|r| r["id"] == "1a00000012" && r["event"] == "worked").count(), 1);
+    let (out, code) = tool(&env, "rkb_used", &serde_json::json!({ "id": "1a00000012", "result": "failed" }));
+    assert_eq!(code, Some(2), "a failure needs a reason: {out}");
+    let (out, code) = tool(&env, "rkb_used", &serde_json::json!({ "id": "1a00000012", "result": "maybe" }));
+    assert_eq!(code, Some(2), "{out}");
+
+    let (v, _) = env.json(&["show", "1a00000012"], "");
+    let (hash, path) = (v["hash"].as_str().unwrap().to_string(), v["path"].as_str().unwrap().to_string());
+    let text = std::fs::read_to_string(env.kb().join(&path)).unwrap();
+    let edited = format!("{}\nAlso seen with clang.\n", text.trim_end());
+    let (out, code) = tool(&env, "rkb_edit", &serde_json::json!({ "id": "1a00000012", "base": hash, "text": edited }));
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("status: written") && std::fs::read_to_string(env.kb().join(&path)).unwrap().contains("Also seen with clang."),
+        "{out}"
+    );
+    let (out, code) = tool(&env, "rkb_edit", &serde_json::json!({ "id": "1a00000012", "base": hash, "text": text }));
+    assert_ne!(code, Some(0), "a stale base is refused: {out}");
+    let (out, code) = tool(&env, "rkb_flag", &serde_json::json!({ "id": "1a00000012", "reason": "breaks with lld 18" }));
+    assert_eq!(code, Some(0), "{out}");
+    assert!(std::fs::read_to_string(env.kb().join(&path)).unwrap().contains("stale_reason: breaks with lld 18"));
 }
 
 #[test]
@@ -1662,7 +1742,7 @@ fn mcp_server_offers_the_tools() {
     assert_eq!(replies.len(), 6, "one reply per request, none for the notification: {replies:?}");
     assert_eq!(replies[0]["result"]["protocolVersion"], "2025-06-18");
     assert!(replies[0]["result"]["capabilities"]["tools"].is_object());
-    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 4);
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 7);
     let text = replies[2]["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(format!("{text}\n"), stdout(&env.rkb(&["search", "undefined reference to vtable", "--toon"])));
     assert_eq!(replies[2]["result"]["isError"], false);
@@ -1958,8 +2038,17 @@ fn hook_full_session() {
     assert_eq!(reply["hookSpecificOutput"]["hookEventName"], "PostToolUseFailure");
     assert!(context.contains("1a00000012") && context.contains("rkb show 1a00000012") && context.lines().count() <= 2, "{context}");
     assert_eq!(hook(&env, "tool-failed", &failed), "", "once per session");
-    let injections = std::fs::read_to_string(home.join("state/rkb/injections.jsonl")).unwrap();
-    assert_eq!(injections.lines().count(), 1);
+    let injections: Vec<_> = usage_records(&env).into_iter().filter(|r| r["event"] == "injected").collect();
+    assert_eq!(injections.len(), 1);
+    assert_eq!((injections[0]["id"].as_str(), injections[0]["session"].as_str()), (Some("1a00000012"), Some("s1")));
+    assert_eq!(hook(&env, "tool-ok", &bash("s1", &cwd, "g++ main.o -o app")), "");
+    assert_eq!(hook(&env, "tool-ok", &bash("s1", &cwd, "g++ main.o -o app")), "", "a second success infers nothing new");
+    let inferred: Vec<_> = usage_records(&env).into_iter().filter(|r| r["event"] == "inferred").collect();
+    assert_eq!(inferred.len(), 1, "g++ worked after the lesson was injected");
+    assert_eq!((inferred[0]["id"].as_str(), inferred[0]["session"].as_str()), (Some("1a00000012"), Some("s1")));
+    let (v, code) = env.json(&["review", "--signals"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!((v["signals"]["injected"].as_u64(), v["signals"]["injected_then_helped"].as_u64()), (Some(1), Some(1)), "{v}");
 
     let mut weak = bash("s1", &cwd, "make");
     weak["error"] = "Exit code 2\nerror: the build did not work today\n".into();
@@ -1980,7 +2069,11 @@ fn hook_full_session() {
     let session = std::fs::read_to_string(home.join("state/rkb/sessions/s1.jsonl")).unwrap();
     let kinds: Vec<String> =
         session.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["kind"].as_str().unwrap().to_string()).collect();
-    assert_eq!(kinds, ["failed", "injected", "failed", "failed", "failed", "fixed", "correction", "remember"], "{session}");
+    assert_eq!(
+        kinds,
+        ["failed", "injected", "failed", "fixed", "inferred", "failed", "failed", "fixed", "correction", "remember"],
+        "{session}"
+    );
     assert!(
         !session.contains("sleep") && !session.contains("-B") && !session.contains("release") && !session.contains("actually"),
         "{session}"
@@ -2142,6 +2235,49 @@ fn commit_file(env: &Env, kb: &Path, rel: &str, text: &str, message: &str) {
 
 fn fact(id: &str, title: &str, statement: &str) -> String {
     FACT.replace("0a1b2c3d4e", id).replace("# A fact", &format!("# {title}")).replace("Something is true.", statement)
+}
+
+#[test]
+fn usage_from_two_machines_syncs_without_conflict() {
+    let (env, _bare, second) = sync_pair();
+    let id = {
+        let mut todo = vec![env.kb().join("general")];
+        let mut found = None;
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    todo.push(p);
+                } else if found.is_none() && p.extension().is_some_and(|x| x == "md") && e.file_name() != "README.md" {
+                    found = std::fs::read_to_string(&p)
+                        .unwrap()
+                        .lines()
+                        .find_map(|l| l.strip_prefix("id: ").map(|v| v.trim_matches('"').to_string()));
+                }
+            }
+        }
+        found.unwrap()
+    };
+    let used = |kb: &Path, config: &str| {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.env("RKB_HOME", kb).env("XDG_CONFIG_HOME", env.dir.path().join(config)).env("CLAUDE_CODE_SESSION_ID", config);
+        let o = rkb_with(c, &["used", &id, "--worked", "--format", "json"], "");
+        assert!(o.status.success(), "{}", stdout(&o));
+    };
+    used(&env.kb(), "machine-a");
+    used(&second, "machine-b");
+    for kb in [env.kb(), second.clone(), env.kb()] {
+        let (v, code) = sync_at(&env, &kb, &[]);
+        assert_eq!(code, Some(0), "no conflict: {v}");
+    }
+    for kb in [env.kb(), second] {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.env("RKB_HOME", &kb);
+        let o = rkb_with(c, &["show", &id, "--format", "json"], "");
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+        assert_eq!(v["usage"]["worked"], 2, "both machines' records count: {v}");
+        assert!(std::fs::read_dir(kb.join(".rkb/usage")).unwrap().count() >= 2, "one file per machine");
+    }
 }
 
 #[test]

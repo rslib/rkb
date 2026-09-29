@@ -21,6 +21,8 @@ pub enum ReasonKind {
     Unsupported,
     LongStale,
     MissingCommit,
+    FailedRepeatedly,
+    NeverHelped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -92,8 +94,49 @@ fn full_checkout(state: &Path, project: &str) -> Option<PathBuf> {
 }
 
 /// Current lessons under `folder` (or the whole knowledge base) that have at least one review reason. Reads only.
+/// What this machine's sessions show: how often signals came up, and whether injected lessons helped.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Signals {
+    pub sessions: usize,
+    pub with_failed: usize,
+    pub with_fixed: usize,
+    pub with_correction: usize,
+    pub with_remember: usize,
+    pub injected: usize,
+    pub injected_then_helped: usize,
+    pub extracts: usize,
+}
+
+/// Reads this machine's session logs and use records. Changes nothing.
+pub fn signals(root: &Path, state: &Path) -> Signals {
+    let records = usage::records(root);
+    let mut out = Signals::default();
+    for e in std::fs::read_dir(state.join("sessions")).into_iter().flatten().flatten() {
+        let Some(session) = e.path().file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
+        let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+        let lines: Vec<serde_json::Value> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        let has = |k: &str| lines.iter().any(|r| r["kind"] == k);
+        out.sessions += 1;
+        out.with_failed += usize::from(has("failed"));
+        out.with_fixed += usize::from(has("fixed"));
+        out.with_correction += usize::from(has("correction"));
+        out.with_remember += usize::from(has("remember"));
+        out.extracts += lines.iter().filter(|r| r["kind"] == "extracted").count();
+        for r in lines.iter().filter(|r| r["kind"] == "injected") {
+            let Some(id) = r["id"].as_str() else { continue };
+            out.injected += 1;
+            let inferred = lines.iter().any(|x| x["kind"] == "inferred" && x["id"] == id);
+            let worked = records.iter().any(|u| u.id == id && u.event == "worked" && u.session.as_deref() == Some(session.as_str()));
+            out.injected_then_helped += usize::from(inferred || worked);
+        }
+    }
+    out
+}
+
 pub fn review(root: &Path, state: &Path, folder: Option<&str>) -> Result<Vec<Candidate>> {
     let folder = folder.map(|f| f.trim_end_matches('/'));
+    let usage = usage::counts(root);
+    let records = usage::records(root);
     if let Some(f) = folder
         && (f.is_empty() || !root.join(f).is_dir())
     {
@@ -150,10 +193,21 @@ pub fn review(root: &Path, state: &Path, folder: Option<&str>) -> Result<Vec<Can
                 }
             }
         }
+        let c = usage.get(&l.frontmatter.id).cloned().unwrap_or_default();
+        let verified = l.frontmatter.verified.to_string();
+        let failed_since =
+            records.iter().filter(|r| r.id == l.frontmatter.id && r.event == "failed" && r.time.as_str() >= verified.as_str()).count();
+        if failed_since >= 2 {
+            reasons.push(Reason { kind: ReasonKind::FailedRepeatedly, detail: format!("failed {failed_since} times since {verified}") });
+        }
+        if c.injected >= 5 && c.worked == 0 && c.inferred == 0 {
+            reasons
+                .push(Reason { kind: ReasonKind::NeverHelped, detail: format!("injected {} times, never reported to help", c.injected) });
+        }
         if reasons.is_empty() {
             continue;
         }
-        let (last_worked, last_failed) = usage::last(state, &l.frontmatter.id);
+        let (last_worked, last_failed) = (c.last_worked, c.last_failed);
         out.push(Candidate {
             id: l.frontmatter.id.clone(),
             title: crate::body::scan(&l.body).h1.into_iter().next().map(|(_, t)| t).unwrap_or_default(),

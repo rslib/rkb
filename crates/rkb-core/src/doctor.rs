@@ -237,7 +237,10 @@ fn kb_checks(root: &Path, place: &Place, state_dir: &Path, env: &LintEnv, out: &
         out.push(c);
     }
 
-    let changes = git::run(root, &["status", "--porcelain"]).map(|o| String::from_utf8_lossy(&o).lines().count()).unwrap_or(0);
+    // Use records are committed with the next rkb write or `rkb sync`, so they are not "outside rkb".
+    let changes = git::run(root, &["status", "--porcelain"])
+        .map(|o| String::from_utf8_lossy(&o).lines().filter(|l| !l.get(3..).unwrap_or(l).starts_with(".rkb/")).count())
+        .unwrap_or(0);
     out.push(if changes == 0 {
         check("uncommitted changes", Level::Ok, "none", None)
     } else {

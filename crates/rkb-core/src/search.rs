@@ -297,7 +297,13 @@ fn pieces(query: &str) -> Vec<Vec<String>> {
     query.split_whitespace().map(tokens).filter(|t| !t.is_empty()).collect()
 }
 
-fn rank(lessons: &[&Lesson], place: &Place, query: &str) -> Vec<(usize, f64)> {
+/// BM25 scores, times the place boost and each lesson's usage factor (0.9–1.1).
+fn rank(
+    lessons: &[&Lesson],
+    place: &Place,
+    query: &str,
+    usage: &std::collections::BTreeMap<String, crate::usage::Counts>,
+) -> Vec<(usize, f64)> {
     let titles: Vec<String> = lessons.iter().map(|l| title(l)).collect();
     let pieces = pieces(query);
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -387,7 +393,8 @@ fn rank(lessons: &[&Lesson], place: &Place, query: &str) -> Vec<(usize, f64)> {
                     w * idf * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * c.len / avg))
                 })
                 .sum();
-            (s > 0.0).then(|| (d, s * boost(&lessons[d].path, place)))
+            let used = usage.get(&lessons[d].frontmatter.id).map_or(1.0, crate::usage::Counts::factor);
+            (s > 0.0).then(|| (d, s * boost(&lessons[d].path, place) * used))
         })
         .collect();
     scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| titles[a.0].cmp(&titles[b.0])));
@@ -416,7 +423,9 @@ pub fn search(root: &Path, place: &Place, facts: &Facts, mode: &Mode, opts: &Opt
     let lessons: Vec<&Lesson> = loaded.iter().map(|(l, _)| l).filter(|l| opts.every_status || l.frontmatter.status.is_current()).collect();
 
     let ordered: Vec<Hit> = match mode {
-        Mode::Ranked(q) => rank(&lessons, place, q).into_iter().map(|(i, s)| hit(lessons[i], s, None)).collect(),
+        Mode::Ranked(q) => {
+            rank(&lessons, place, q, &crate::usage::counts(root)).into_iter().map(|(i, s)| hit(lessons[i], s, None)).collect()
+        }
         Mode::Literal(_) | Mode::Regex(_) => {
             let re = match mode {
                 Mode::Literal(t) => Regex::new(&regex::escape(t)),
@@ -565,6 +574,26 @@ mod tests {
 
     fn place(project: Option<&str>) -> Place {
         Place { project: project.map(|p| Matched { name: p.into(), rule: Rule::Flag }), system: None, repo: None, dir: None }
+    }
+
+    #[test]
+    fn usage_breaks_a_tie() {
+        let kb = tempfile::tempdir().unwrap();
+        let r = kb.path();
+        write(r, "general/a/x.md", "0000000001", "Striping large files", "", "Words.");
+        write(r, "general/a/y.md", "0000000002", "Striping large files", "", "Words.");
+        let facts = Facts { values: Default::default(), ancestry: None };
+        let q = Mode::Ranked("striping".into());
+        let before = ids(&search(r, &place(None), &facts, &q, &opts()).unwrap()).iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let other = if before[0] == "0000000001" { "0000000002" } else { "0000000001" };
+        let dir = r.join(crate::usage::DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lines: String =
+            (0..3).map(|_| serde_json::to_string(&crate::usage::now(other, "worked", None, None)).unwrap() + "\n").collect();
+        std::fs::write(dir.join("m-0000.jsonl"), lines).unwrap();
+        let after = search(r, &place(None), &facts, &q, &opts()).unwrap();
+        assert_eq!(ids(&after)[0], other, "the lesson that worked three times ranks first");
+        assert_eq!(after.hits.len(), 2, "nothing is hidden");
     }
 
     #[test]

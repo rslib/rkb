@@ -215,6 +215,9 @@ enum Cmd {
         /// The hash `rkb show` printed; the edit fails if the lesson changed since.
         #[arg(long)]
         base: Option<String>,
+        /// Lesson text from the rkb_edit tool instead of stdin.
+        #[arg(skip)]
+        text: Option<String>,
         /// An image (png, jpg, webp or svg) to store with the lesson, metadata removed; replaces one of the same name. Repeatable.
         #[arg(long = "asset", value_name = "FILE")]
         assets: Vec<String>,
@@ -231,6 +234,9 @@ enum Cmd {
     Review {
         /// Only lessons under this folder.
         folder: Option<String>,
+        /// Instead, summarize this machine's sessions: signals, injections and whether they helped.
+        #[arg(long)]
+        signals: bool,
     },
     /// Mark a wrong lesson as replaced by another. Asks the user, because search then hides it.
     #[command(after_help = "Example:\n  rkb supersede 7f3a9c2b41 --by 0a1b2c3d4e --reason \"the flag is wrong on 1.14\"")]
@@ -298,6 +304,9 @@ enum Cmd {
         failed: bool,
         #[arg(long)]
         reason: Option<String>,
+        /// The session the lesson was used in. Default: the harness's session, else the session that injected it.
+        #[arg(long)]
+        session: Option<String>,
     },
     /// List the commits that changed a lesson, newest first.
     #[command(after_help = "Example:\n  rkb log 7f3a9c2b41")]
@@ -643,10 +652,13 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             Ok(list::render(&listing, &root, colored))
         }
         Cmd::Add { topic, kind, template, text, assets } => writes::add(&env, topic, kind, template, text, assets),
-        Cmd::Edit { id, base, assets } => writes::edit(&env, id, base, assets),
+        Cmd::Edit { id, base, assets, text } => writes::edit(&env, id, base, assets, text),
         Cmd::Flag { id, reason } => writes::flag(&env, id, reason),
-        Cmd::Review { folder } => {
+        Cmd::Review { folder, signals } => {
             kb::open(&root)?;
+            if signals {
+                return Ok(session::signals(&rkb_core::review::signals(&root, &env.state), colored));
+            }
             let c = rkb_core::review::review(&root, &env.state, folder.as_deref())?;
             Ok(session::review(&c, colored))
         }
@@ -687,7 +699,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             Ok(writes::outcome(&env, o))
         }
         Cmd::Unarchive { id } => writes::lifecycle(&env, rkb_core::request::Action::Unarchive { id }),
-        Cmd::Used { id, failed, reason, .. } => writes::used(&env, id, failed, reason),
+        Cmd::Used { id, failed, reason, session, .. } => writes::used(&env, id, failed, reason, session),
         Cmd::Log { id } => writes::log(&env, id),
         Cmd::Confirm { request, choice } => writes::confirm(&env, request, choice),
         Cmd::Hook { .. } => unreachable!("main runs hooks first"),
@@ -762,9 +774,16 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
                 n => format!("{n} days ago"),
             };
             let hash = rkb_core::write::content_hash(text.as_bytes());
-            let (worked, failed) = usage::last(&env.state, &fm.id);
-            let uses =
-                format!("hash {hash}  worked {}  failed {}", worked.as_deref().unwrap_or("never"), failed.as_deref().unwrap_or("never"));
+            let counts = usage::counts(&root).remove(&fm.id).unwrap_or_default();
+            let (worked, failed) = (counts.last_worked.clone(), counts.last_failed.clone());
+            let uses = format!(
+                "hash {hash}  worked {} (last {})  failed {} (last {})  injected {}",
+                counts.worked,
+                worked.as_deref().unwrap_or("never"),
+                counts.failed,
+                failed.as_deref().unwrap_or("never"),
+                counts.injected
+            );
             let place = env.place.clone().unwrap_or_default();
             rkb_core::facts::refresh(&root, &place);
             let facts = rkb_core::conditions::Facts::gather(&root, &place, with);
@@ -805,6 +824,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
                 "hash": hash,
                 "last_worked": worked,
                 "last_failed": failed,
+                "usage": counts,
                 "applies": {
                     "result": applies.result,
                     "keys": applies.keys.iter().map(|k| json!({

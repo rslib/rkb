@@ -223,9 +223,12 @@ fn absolute(assets: Vec<String>) -> Vec<String> {
     assets.into_iter().map(|a| std::path::absolute(&a).map(|p| p.display().to_string()).unwrap_or(a)).collect()
 }
 
-pub fn edit(env: &Env, id: String, base: Option<String>, assets: Vec<String>) -> Result<Output, CliError> {
+pub fn edit(env: &Env, id: String, base: Option<String>, assets: Vec<String>, given: Option<String>) -> Result<Output, CliError> {
     kb::open(&env.root)?;
-    let (text, base) = if stdin_is_terminal() {
+    let (text, base) = if let Some(text) = given {
+        let base = base.ok_or_else(|| usage_error("rkb_edit needs `base`", &format!("run rkb_show {id} and pass its hash as base")))?;
+        (text, base)
+    } else if stdin_is_terminal() {
         let (_, current) = kb::find(&env.root, &id)?;
         let text = editor(&current)?;
         if text == current && assets.is_empty() {
@@ -253,12 +256,17 @@ pub fn lifecycle(env: &Env, action: Action) -> Result<Output, CliError> {
     Ok(outcome(env, write::apply(&env.ctx(), &action, &[])?))
 }
 
-pub fn used(env: &Env, id: String, failed: bool, reason: Option<String>) -> Result<Output, CliError> {
+pub fn used(env: &Env, id: String, failed: bool, reason: Option<String>, session: Option<String>) -> Result<Output, CliError> {
     kb::open(&env.root)?;
     kb::find(&env.root, &id)?;
     let result = if failed { "failed" } else { "worked" };
-    usage::record(&env.state, &id, result, reason.as_deref())?;
-    let mut data = json!({ "status": "recorded", "id": id, "result": result });
+    if failed && reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
+        return Err(usage_error("a failed use needs a reason", &format!("used {id} --failed --reason \"what went wrong\"")));
+    }
+    let config = paths::config_dir();
+    let session = session.or_else(usage::env_session).or_else(|| usage::recent_injection(&env.root, &config, &id));
+    usage::record(&env.root, &config, &env.state, &usage::now(&id, result, session.clone(), reason.clone()))?;
+    let mut data = json!({ "status": "recorded", "id": id, "result": result, "session": session });
     let mut human = format!("Recorded: {id} {result}");
     if failed {
         let reason = reason.unwrap_or_default();

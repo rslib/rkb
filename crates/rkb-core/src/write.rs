@@ -1049,10 +1049,14 @@ pub(crate) fn finish(ctx: &Ctx, mut snap: Snapshot, p: Prepared) -> Result<Outco
 
     let folder = p.path.rsplit_once('/').map_or("", |(d, _)| d);
     let message = p.message.clone().unwrap_or_else(|| format!("{}({folder}): {} [{}]", p.kind, p.title, p.id));
-    let paths: Vec<&str> = written.iter().map(|s| s.as_str()).collect();
+    let mut paths: Vec<&str> = written.iter().map(|s| s.as_str()).collect();
     let mut add_args = vec!["add", "--"];
     add_args.extend(&paths);
     git::run(ctx.root, &add_args)?;
+    // Use records collected since the last commit ride along, so they never pile up uncommitted.
+    if crate::usage::stage(ctx.root)? {
+        paths.push(".rkb");
+    }
     git::commit_paths(ctx.root, &message, &paths)?;
     let commit = String::from_utf8_lossy(&git::run(ctx.root, &["rev-parse", "--short", "HEAD"])?).trim().to_string();
     let diff = String::from_utf8_lossy(&git::run(ctx.root, &["show", "--format=", &commit])?).into_owned();

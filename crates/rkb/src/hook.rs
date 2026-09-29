@@ -7,7 +7,7 @@ use rkb_core::hooks::{
 };
 use rkb_core::matching::Hints;
 use rkb_core::search::{Mode, Options};
-use rkb_core::{config, kb, lock, paths, request, rerank, search, state};
+use rkb_core::{config, kb, lock, paths, request, rerank, search, state, usage};
 use serde_json::{Value, json};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -128,8 +128,32 @@ fn tool_ok(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {
         .find(|r| r["program"] == program.as_str() && (r["kind"] == "failed" || r["kind"] == "fixed"));
     if last.is_some_and(|r| r["kind"] == "failed") {
         hooks::append(state, session, &json!({ "kind": "fixed", "program": program }))?;
+        // A lesson injected while this program kept failing, and the program now works: it probably helped.
+        // The window starts after the program's previous fix, so retries after the hint still count.
+        let records = hooks::read(state, session);
+        let before_now = &records[..records.len().saturating_sub(1)];
+        let from = before_now.iter().rposition(|r| r["kind"] == "fixed" && r["program"] == program.as_str()).map_or(0, |i| i + 1);
+        let injected: Vec<String> = before_now[from..]
+            .iter()
+            .filter(|r| r["kind"] == "injected")
+            .filter_map(|r| r["id"].as_str().map(String::from))
+            .filter(|id| !records.iter().any(|r| r["kind"] == "inferred" && r["id"] == id.as_str()))
+            .collect();
+        if !injected.is_empty() {
+            let root = kb::home();
+            for id in injected {
+                hooks::append(state, session, &json!({ "kind": "inferred", "id": id }))?;
+                record_use(&root, state, &id, "inferred", session, Some(format!("{program} worked after it was injected")))?;
+            }
+        }
     }
     Ok(None)
+}
+
+/// Appends a use record for a hook event to this machine's usage file in the knowledge base.
+fn record_use(root: &Path, state: &Path, id: &str, event: &str, session: &str, reason: Option<String>) -> Result<()> {
+    let session = (!session.is_empty()).then(|| session.to_string());
+    Ok(usage::record(root, &paths::config_dir(), state, &usage::now(id, event, session, reason))?)
 }
 
 fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {
@@ -162,8 +186,7 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
         return Ok(None);
     }
     hooks::append(state, session, &json!({ "kind": "injected", "id": hit.id }))?;
-    let log = json!({ "time": request::now(), "session": session, "id": hit.id, "ranked_by": ranked.describe(), "relevance": hit.relevance.map(crate::output::score2) });
-    lock::append_line(&state.join("injections.jsonl"), &log.to_string())?;
+    record_use(&root, state, &hit.id, "injected", session, Some(format!("tool-failed, {}", ranked.describe())))?;
     let summary = if hit.summary.is_empty() { String::new() } else { format!(" - {}", hit.summary) };
     let context = format!(
         "rkb: lesson {} may explain this failure: {}{summary}\nRead it with `rkb show {}` and check that it applies before acting on it.",
@@ -240,8 +263,7 @@ fn recall(p: &Value, state: &Path, session: &str, text: &str) -> Result<Option<S
     let mut lines = vec!["rkb: a lesson that may help with this message; check that it applies before acting on it:".to_string()];
     for h in &strong {
         hooks::append(state, session, &json!({ "kind": "injected", "id": h.id }))?;
-        let log = json!({ "time": request::now(), "session": session, "id": h.id, "ranked_by": ranked.describe(), "relevance": h.relevance.map(crate::output::score2), "from": "recall" });
-        lock::append_line(&state.join("injections.jsonl"), &log.to_string())?;
+        record_use(&root, state, &h.id, "injected", session, Some(format!("recall, {}", ranked.describe())))?;
         let summary = if h.summary.is_empty() { String::new() } else { format!(" - {}", h.summary) };
         lines.push(format!("- {} {}{summary} (`rkb show {}`)", h.id, h.title, h.id));
     }

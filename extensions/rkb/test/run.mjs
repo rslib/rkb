@@ -71,7 +71,7 @@ assert.equal(await on("tool_result", { ...bash("cmake -B build -DX=1"), content:
 const inputReply = await on("input", { text: "actually, use the release build and remember this", source: "interactive" });
 assert.deepEqual(inputReply, harness === "pi" ? { action: "continue" } : undefined);
 const kinds = signals().map((s) => s.kind);
-assert.deepEqual(kinds, ["failed", "injected", "failed", "failed", "fixed", "correction", "remember"]);
+assert.deepEqual(kinds, ["failed", "injected", "failed", "failed", "fixed", "inferred", "correction", "remember"]);
 assert.ok(!JSON.stringify(signals()).includes("release"));
 
 // Compaction saves an extract, because the session has a fixed signal; shutdown then finds nothing new.
@@ -102,8 +102,8 @@ await commands["rkb-distill"].handler("", ctx());
 assert.match(sent.at(-1), /^Turn rkb inbox items into lessons/);
 assert.match(sent.at(-1), /the ids the user gave: none/);
 
-// The four agent tools run `rkb tool` and return its TOON text; failures throw, as pi expects.
-assert.deepEqual(Object.keys(tools).sort(), ["rkb_add", "rkb_note", "rkb_search", "rkb_show"]);
+// The agent tools run `rkb tool` and return its TOON text; failures throw, as pi expects.
+assert.deepEqual(Object.keys(tools).sort(), ["rkb_add", "rkb_edit", "rkb_flag", "rkb_note", "rkb_search", "rkb_show", "rkb_used"]);
 assert.match(tools.rkb_search.description, /before a web search/i);
 assert.equal(tools.rkb_search.parameters.properties.query.type, "string");
 const found = await tools.rkb_search.execute("t1", { query: "undefined reference to vtable" });

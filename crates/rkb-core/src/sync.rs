@@ -82,6 +82,7 @@ pub fn sync(root: &Path, other: Other, env: &LintEnv) -> Result<Synced> {
     let branch = text(root, &["symbolic-ref", "--short", "-q", "HEAD"]).map_err(|_| {
         not_ready("HEAD is detached, so there is no branch to sync", format!("check out your branch: git -C {kb_path} switch <branch>"))
     })?;
+    crate::usage::commit(root)?;
     let status = git::run(root, &["status", "--porcelain"])?;
     let dirty: Vec<String> = String::from_utf8_lossy(&status).lines().map(|l| l.get(3..).unwrap_or(l).to_string()).collect();
     if !dirty.is_empty() {

@@ -167,6 +167,24 @@ fn doctor_human(c: bool, checks: &[Check], failed: usize, warned: usize) -> Stri
 }
 
 /// `rkb review`: one block per candidate with every reason and the use dates.
+pub fn signals(s: &rkb_core::review::Signals, c: bool) -> Output {
+    let share = |n: usize, of: usize| (n * 100).checked_div(of).map_or_else(|| "-".to_string(), |p| format!("{p}%"));
+    let human = format!(
+        "{}\n  {} sessions: {} with a failed command, {} with a fix, {} with a correction, {} with \"remember\"\n  {} lessons injected, {} then helped ({})\n  {} extracts saved to the inbox",
+        paint(c, "1", "Signals on this machine"),
+        s.sessions,
+        s.with_failed,
+        s.with_fixed,
+        s.with_correction,
+        s.with_remember,
+        s.injected,
+        s.injected_then_helped,
+        share(s.injected_then_helped, s.injected),
+        s.extracts
+    );
+    Output { data: json!({ "signals": s }), human, exit: 0, raw: false }
+}
+
 pub fn review(candidates: &[rkb_core::review::Candidate], c: bool) -> Output {
     if candidates.is_empty() {
         return Output {

@@ -44,6 +44,15 @@ fn run_tool(name: &str, args: &Value) -> Result<Output, CliError> {
             let (topic, lesson) = tools::lesson(args).map_err(|m| CliError::new(ErrorCode::Usage, m, fix(name)))?;
             Cmd::Add { topic: Some(topic), kind: None, template: false, text: Some(lesson), assets: vec![] }
         }
+        "rkb_used" => Cmd::Used {
+            id: text(args, "id"),
+            worked: args["result"] == "worked",
+            failed: args["result"] == "failed",
+            reason: args["reason"].as_str().map(String::from),
+            session: None,
+        },
+        "rkb_flag" => Cmd::Flag { id: text(args, "id"), reason: text(args, "reason") },
+        "rkb_edit" => Cmd::Edit { id: text(args, "id"), base: Some(text(args, "base")), text: Some(text(args, "text")), assets: vec![] },
         other => return Err(CliError::new(ErrorCode::Usage, format!("unknown tool `{other}`"), fix(other))),
     };
     run(Some(cmd), Format::Toon, &rkb_core::matching::Hints::default(), &[])
