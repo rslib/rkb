@@ -142,7 +142,10 @@ fn run_in(dir: &Path, text: &str, project_root: Option<&Path>, timeout: Duration
             return Some((Run { result, code }, output));
         }
         if start.elapsed() >= timeout {
-            let _ = Command::new("kill").arg("-KILL").arg(format!("-{}", child.id())).stderr(Stdio::null()).status();
+            // The group holds the script's children; killing bash itself as well means `wait` returns
+            // even when the group kill fails.
+            let _ = Command::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).stderr(Stdio::null()).status();
+            let _ = child.kill();
             let _ = child.wait();
             return None;
         }
@@ -158,6 +161,14 @@ mod tests {
         let text =
             format!("---\nschema: 1\nid: 0a1b2c3d4e\ntype: fact\nstatus: active\nverified: 2026-09-25\nverified_how: ran\n---\n{body}");
         crate::lesson::parse("general/x/a.md", &text).unwrap()
+    }
+
+    #[test]
+    fn a_timeout_stops_the_script_and_its_children() {
+        let started = Instant::now();
+        let run = run("sleep 30\n", None, Duration::from_secs(1));
+        assert_eq!((run.result, run.code), (Result::Unknown, None));
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
     }
 
     #[test]
