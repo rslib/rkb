@@ -34,6 +34,8 @@ pub struct SiteConfig {
     pub description: Option<String>,
     pub base_url: Option<String>,
     pub author: Option<String>,
+    /// A PNG or JPEG in the knowledge base for link previews, such as `site/og.png`.
+    pub image: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

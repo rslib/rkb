@@ -139,6 +139,13 @@ pub fn lint(snap: &Snapshot, env: &LintEnv, focus: Option<&BTreeSet<String>>) ->
         }
         Some(data) => config::parse(&String::from_utf8_lossy(data)).map_err(|e| out.error("kb.toml", None, "config/invalid", e)).ok(),
     };
+    // The file itself usually sits in site/, which lint does not read; `rkb site build` reports it missing.
+    if let Some(img) = kb.as_ref().and_then(|k| k.site.image.as_deref()) {
+        let ext = img.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+        if !["png", "jpg", "jpeg"].contains(&ext.as_str()) {
+            out.error("kb.toml", None, "config/site-image", format!("[site] image `{img}` must be a png or jpg file"));
+        }
+    }
     let leak = kb.as_ref().map(|k| &k.leak).cloned().unwrap_or_default();
     let scanner = LeakScanner::new(&leak, env.user.as_deref(), env.home.as_deref());
 

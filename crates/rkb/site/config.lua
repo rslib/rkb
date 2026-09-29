@@ -13,6 +13,10 @@ local description = (settings.description ~= nil and settings.description ~= "")
   or "Notes on problems solved and decisions made."
 -- Without `[site] base_url`, pages carry no absolute URLs and there is no sitemap.
 local base_url = (settings.base_url or ""):gsub("/+$", "")
+-- The link-preview image under static/: `[site] image`, staged by rkb, or the built-in one.
+local og_image = (settings.image ~= nil and settings.image ~= "") and settings.image or "og.png"
+-- Stylesheets and scripts by content hash (`site_css` -> `/static/v/<hash>/site.css`), from rkb.
+local assets = site.assets or {}
 local protected = site.protected or {}
 
 local by_id = {}
@@ -375,6 +379,9 @@ local global = {
   protected_count = #protected,
   types = type_counts,
   base_url = base_url,
+  assets = assets,
+  image = base_url ~= "" and (base_url .. "/static/" .. og_image) or "",
+  image_builtin = og_image == "og.png",
 }
 
 -- Paths of the public pages, for the sitemap, and the verified date of each lesson page.
@@ -547,6 +554,7 @@ return {
         "site.js",
         "theme.js",
         "highlight.css",
+        og_image,
         "argon2.umd.min.js",
         "hash-wasm.LICENSE",
         "fonts/Geist-Variable.woff2",
@@ -556,6 +564,9 @@ return {
         rs.fs.copy("static/" .. f, out .. "/static/" .. f)
       end
       local index = {}
+      for _, url in pairs(assets) do
+        rs.fs.copy("static/" .. file_name(url), out .. url)
+      end
       for _, l in ipairs(site.lessons) do
         table.insert(index, entry(l))
         for _, staged in pairs(l.images or {}) do
@@ -574,6 +585,8 @@ return {
         "  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=()",
         "  Cross-Origin-Opener-Policy: same-origin",
         "  Cross-Origin-Resource-Policy: same-origin",
+        "/static/v/*",
+        "  Cache-Control: public, max-age=31536000, immutable",
         "/protected/*",
         "  X-Robots-Tag: noindex",
       }

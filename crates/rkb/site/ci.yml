@@ -35,6 +35,12 @@ jobs:
           mkdir -p "$HOME/.local/bin"
           tar -xzf "$archive" -C "$HOME/.local/bin" rkb
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      # Each rkb version pins one rs-web, so the key changes exactly when the binary must.
+      - name: Cache rs-web
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/rkb/bin
+          key: rs-web-${{ runner.os }}-${{ env.RKB_VERSION }}
       - name: Build
         env:
           RKB_HOME: ${{ github.workspace }}

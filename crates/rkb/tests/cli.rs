@@ -3092,6 +3092,20 @@ fn site_record_travels_with_the_knowledge_base() {
 }
 
 #[test]
+fn lint_checks_the_site_image() {
+    let env = kb_with_topics();
+    let toml = env.kb().join("kb.toml");
+    let base = std::fs::read_to_string(&toml).unwrap();
+    std::fs::write(&toml, format!("{base}\n[site]\nimage = \"site/og.gif\"\n")).unwrap();
+    let (v, code) = env.json(&["lint"], "");
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v.to_string().contains("config/site-image") && v.to_string().contains("must be a png or jpg"), "{v}");
+    std::fs::write(&toml, format!("{base}\n[site]\nimage = \"site/og.png\"\n")).unwrap();
+    let (v, _) = env.json(&["lint"], "");
+    assert!(!v.to_string().contains("config/site-image"), "{v}");
+}
+
+#[test]
 fn site_ci_writes_the_workflow_once() {
     let env = site_kb();
     let toml = env.kb().join("kb.toml");
@@ -3119,27 +3133,32 @@ fn site_ci_writes_the_workflow_once() {
     let job = &y["jobs"]["deploy"];
     assert_eq!(job["env"]["RKB_VERSION"].as_str(), Some(env!("CARGO_PKG_VERSION")));
     let steps = job["steps"].as_sequence().unwrap();
-    let install = steps[1]["run"].as_str().unwrap();
+    let step = |name: &str| steps.iter().find(|s| s["name"].as_str() == Some(name)).cloned().unwrap_or_else(|| panic!("{name}: {text}"));
+    let cache = step("Cache rs-web");
+    assert_eq!(cache["with"]["key"].as_str(), Some("rs-web-${{ runner.os }}-${{ env.RKB_VERSION }}"));
+    assert_eq!(cache["with"]["path"].as_str(), Some("~/.local/share/rkb/bin"));
+    let install = step("Install rkb")["run"].as_str().unwrap().to_string();
     assert!(install.contains("rkb-linux-x86_64-v$RKB_VERSION.tar.gz") && install.contains("sha256sum -c"), "{install}");
-    let build = &steps[2];
+    let build = &step("Build");
     assert_eq!(build["run"].as_str(), Some("rkb site build --no-ask --out dist"));
     assert_eq!(build["env"]["USER"].as_str(), Some(""), "the runner's user name is not a leak");
     assert_eq!(build["env"]["SITE_PASSWORD"].as_str(), Some("${{ secrets.SITE_PASSWORD }}"));
     assert_eq!(build["env"]["SITE_PASSWORD_TEAM_A"].as_str(), Some("${{ secrets.SITE_PASSWORD_TEAM_A }}"));
-    let create = steps[3]["run"].as_str().unwrap();
+    let create_step = step("Create the Pages project if it does not exist");
+    let create = create_step["run"].as_str().unwrap();
     assert!(create.contains("pages project create") && create.contains(&format!("--production-branch={branch}")), "{create}");
     assert!(
         create.contains("already exists") && create.contains("exit 1") && !create.contains("|| true"),
         "only exists is ignored: {create}"
     );
-    assert_eq!(steps[3]["env"]["PROJECT"].as_str(), Some("${{ vars.CLOUDFLARE_PROJECT_NAME }}"));
+    assert_eq!(create_step["env"]["PROJECT"].as_str(), Some("${{ vars.CLOUDFLARE_PROJECT_NAME }}"));
     assert_eq!(y["concurrency"]["cancel-in-progress"].as_bool(), Some(true));
     assert_eq!(steps[0]["with"]["persist-credentials"].as_bool(), Some(false));
     for s in steps.iter().filter_map(|s| s["uses"].as_str()) {
         let sha = s.split_once('@').map(|(_, v)| v).unwrap_or_default();
         assert!(sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()), "`{s}` is not pinned to a commit");
     }
-    let deploy = &steps[4];
+    let deploy = &step("Deploy");
     assert!(deploy["uses"].as_str().unwrap().starts_with("cloudflare/wrangler-action@"));
     assert!(deploy["with"]["wranglerVersion"].as_str().unwrap().split('.').count() == 3, "wrangler is pinned exactly");
     assert_eq!(
@@ -3192,7 +3211,7 @@ fn site_init_keeps_user_edits_and_is_used() {
     let env = site_kb();
     let (v, code) = site(&env, &["site", "init"], &[]);
     assert_eq!(code, Some(0), "{v}");
-    assert_eq!(v["written"].as_array().unwrap().len(), 20, "{v}");
+    assert_eq!(v["written"].as_array().unwrap().len(), 21, "{v}");
     let log = stdout(&env.git(&["log", "-1", "--name-only", "--format=%s"]));
     assert!(log.starts_with("site: add the rs-web template") && log.contains("site/config.lua"), "{log}");
 
@@ -3357,7 +3376,7 @@ fn site_builds_with_real_rs_web() {
     let (v, code) = real(&["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], true);
     assert_eq!(code, Some(0), "{v}");
     let page = std::fs::read_to_string(out.join("protected/1a00000004/index.html")).unwrap();
-    assert!(page.contains("encrypted-content") && page.contains("/static/site.js") && page.contains("unlock-form"), "{page}");
+    assert!(page.contains("encrypted-content") && page.contains("/site.js") && page.contains("unlock-form"), "{page}");
     assert!(out.join("protected/index.html").is_file() && out.join("static/argon2.umd.min.js").is_file());
     assert!(page.contains("noindex") && !page.contains("og:"), "{page}");
     let url = "https://kb.example.org/general/git/rebase-with-local-edits-using-autostash/";
@@ -3371,6 +3390,18 @@ fn site_builds_with_real_rs_web() {
     let headers = std::fs::read_to_string(out.join("_headers")).unwrap();
     assert!(headers.contains("Content-Security-Policy: default-src 'self'") && !headers.contains("unsafe-inline"), "{headers}");
     assert!(headers.contains("/protected/*\n  X-Robots-Tag: noindex"), "{headers}");
+    assert!(headers.contains("/static/v/*\n  Cache-Control: public, max-age=31536000, immutable"), "{headers}");
+    assert!(lesson.contains("og:image") && lesson.contains("https://kb.example.org/static/og.png"), "{lesson}");
+    assert!(lesson.contains("summary_large_image"), "{lesson}");
+    let og = std::fs::read(out.join("static/og.png")).unwrap();
+    assert!(og.starts_with(b"\x89PNG") && og[16..24] == [0, 0, 4, 176, 0, 0, 2, 118], "og.png is a 1200x630 PNG");
+    let css = lesson.split("/static/v/").nth(1).map(|r| r.split(['"', ' ', '>']).next().unwrap().to_string()).unwrap_or_default();
+    assert!(css.ends_with("/site.css") || lesson.contains("/static/v/"), "pages link hashed files: {lesson}");
+    for f in ["site.css", "site.js", "theme.js", "highlight.css"] {
+        let hashed = lesson.split(&format!("/{f}")).next().unwrap().rsplit("/static/v/").next().unwrap().to_string();
+        assert_eq!(hashed.len(), 12, "{f} is linked under a 12-hex hash: {lesson}");
+        assert!(out.join(format!("static/v/{hashed}/{f}")).is_file(), "{f} is published under its hash");
+    }
     for h in ["Permissions-Policy: camera=()", "Cross-Origin-Opener-Policy: same-origin", "Cross-Origin-Resource-Policy: same-origin"] {
         assert!(headers.contains(h), "{h}: {headers}");
     }
@@ -3465,7 +3496,7 @@ fn site_images_tree_code_and_404_with_real_rs_web() {
     let png = std::fs::read(dir.join("layout.png")).unwrap();
     assert!(png.starts_with(b"\x89PNG") && !String::from_utf8_lossy(&png).contains("GPS"), "the image is published without EXIF");
     assert!(page.contains("/general/git/rebase-with-local-edits-using-autostash/layout.png"), "the page shows the image: {page}");
-    assert!(page.contains("hl") && page.contains("/static/highlight.css") && out.join("static/highlight.css").is_file(), "{page}");
+    assert!(page.contains("hl") && page.contains("/highlight.css") && out.join("static/highlight.css").is_file(), "{page}");
     assert!(page.contains("class=\"source shell") || page.contains("class=\"source"), "the code block is colored: {page}");
     assert!(page.contains("Skip to content"), "{page}");
 
@@ -3494,8 +3525,28 @@ fn site_images_tree_code_and_404_with_real_rs_web() {
     let feed = std::fs::read_to_string(out.join("feed.xml")).unwrap();
     assert!(feed.contains("<title>[Stale] Squash fixups with autosquash</title>"), "{feed}");
     assert!(!feed.contains("atom:link href"), "no base_url, no self link: {feed}");
+    let hashed_css = |html: &str| html.split("/site.css").next().unwrap().rsplit("/static/v/").next().unwrap().to_string();
+    let first = hashed_css(&page);
+    let (v, code) = real(&["site", "init"]);
+    assert_eq!(code, Some(0), "{v}");
+    let css = env.kb().join("site/static/site.css");
+    std::fs::write(&css, format!("{}\n/* changed */\n", std::fs::read_to_string(&css).unwrap())).unwrap();
+    std::fs::write(env.kb().join("site/og.png"), png_with_gps()).unwrap();
+    let toml = env.kb().join("kb.toml");
+    std::fs::write(
+        &toml,
+        format!("{}\n[site]\nbase_url = \"https://kb.example.org\"\nimage = \"site/og.png\"\n", std::fs::read_to_string(&toml).unwrap()),
+    )
+    .unwrap();
+    let (v, code) = real(&["site", "build", "--out", out.to_str().unwrap()]);
+    assert_eq!(code, Some(0), "{v}");
+    let page = std::fs::read_to_string(dir.join("index.html")).unwrap();
+    assert_ne!(hashed_css(&page), first, "a changed stylesheet gets a new address");
+    assert!(page.contains("https://kb.example.org/static/og-site.png") && !page.contains("og:image:width"), "{page}");
+    let custom = std::fs::read(out.join("static/og-site.png")).unwrap();
+    assert!(!String::from_utf8_lossy(&custom).contains("GPS"), "the custom preview image loses its metadata");
     let missing = std::fs::read_to_string(out.join("404.html")).unwrap();
-    assert!(missing.contains("Page not found") && missing.contains("noindex") && missing.contains("/static/site.js"), "{missing}");
+    assert!(missing.contains("Page not found") && missing.contains("noindex") && missing.contains("/site.js"), "{missing}");
 }
 
 /// Runs only with `RKB_TEST_RS_WEB` set to an rs-web binary.

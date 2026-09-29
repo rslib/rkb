@@ -24,7 +24,7 @@ const ASSETS: [(&str, &str, &str, &str); 3] = [
     ("linux", "x86_64", "rs-web-linux-x86_64", "da5f75d0b5165329138f84743076ed28f735999124610fb9b2f83d9484c6db3f"),
 ];
 
-const TEMPLATE: [(&str, &[u8]); 20] = [
+const TEMPLATE: [(&str, &[u8]); 21] = [
     ("config.lua", include_bytes!("../site/config.lua")),
     ("templates/base.html", include_bytes!("../site/templates/base.html")),
     ("templates/home.html", include_bytes!("../site/templates/home.html")),
@@ -40,6 +40,7 @@ const TEMPLATE: [(&str, &[u8]); 20] = [
     ("static/site.js", include_bytes!("../site/static/site.js")),
     ("static/theme.js", include_bytes!("../site/static/theme.js")),
     ("static/highlight.css", include_bytes!("../site/static/highlight.css")),
+    ("static/og.png", include_bytes!("../site/static/og.png")),
     // hash-wasm 4.12.0, MIT (https://www.npmjs.com/package/hash-wasm): Argon2id in the browser.
     ("static/argon2.umd.min.js", include_bytes!("../site/static/argon2.umd.min.js")),
     ("static/hash-wasm.LICENSE", include_bytes!("../site/static/hash-wasm.LICENSE")),
@@ -308,7 +309,31 @@ fn stage(env: &Env, s: &site::Site, dir: &Path) -> Result<(), CliError> {
             put(&format!("{path}.b64"), rkb_core::image::base64(&data).as_bytes())?;
         }
     }
-    put("site.json", serde_json::to_string_pretty(&s.index).expect("the index serializes").as_bytes())
+    let mut index = s.index.clone();
+    // `[site] image`: staged next to the template's static files, its metadata removed.
+    if let Some(img) = kb_config(env).site.image {
+        let ext = img.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+        let fix = "set [site] image in kb.toml to a png or jpg file in the knowledge base (`rkb lint` checks it)";
+        let data = std::fs::read(env.root.join(&img)).map_err(|e| io_error(format!("[site] image {img}: {e}"), fix))?;
+        let data = rkb_core::image::strip(&ext, &data)
+            .map_err(|e| CliError::new(ErrorCode::Refused, format!("[site] image {img}: {e}; nothing was written"), fix))?;
+        let name = format!("og-site.{ext}");
+        put(&format!("static/{name}"), &data)?;
+        index["site"]["image"] = json!(name);
+    }
+    // Stylesheets and scripts also go under a content hash, so they can be cached for good.
+    let mut assets = serde_json::Map::new();
+    for e in std::fs::read_dir(dir.join("static")).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        // Vendored `.min.js` files keep their plain path: site.js loads the Argon2 build by name.
+        if e.path().is_file() && (name.ends_with(".css") || name.ends_with(".js")) && !name.ends_with(".min.js") {
+            let data = std::fs::read(e.path()).map_err(|e| io_error(e, fix))?;
+            let hash: String = Sha256::digest(&data).iter().take(6).map(|b| format!("{b:02x}")).collect();
+            assets.insert(name.replace('.', "_"), json!(format!("/static/v/{hash}/{name}")));
+        }
+    }
+    index["assets"] = Value::Object(assets);
+    put("site.json", serde_json::to_string_pretty(&index).expect("the index serializes").as_bytes())
 }
 
 /// A staged file as it may be published: a PNG, JPEG or WebP image without its metadata.
