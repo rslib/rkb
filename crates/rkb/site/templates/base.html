@@ -22,11 +22,13 @@
   <script>try{document.documentElement.dataset.theme=localStorage.getItem("rkb-theme")||"system"}catch(e){}</script>
   <link rel="preload" href="/static/fonts/Geist-Variable.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/static/site.css">
+  <link rel="stylesheet" href="/static/highlight.css">
   <link rel="alternate" type="application/rss+xml" title="{{ global.title }}" href="/feed.xml">
 </head>
 {% set open = page.data.open | default(value="") %}
 {% set current = page.data.current | default(value="") %}
 <body data-protected="{{ global.protected_count }}">
+<a class="skip" href="#main">Skip to content</a>
 <header class="top">
   <button type="button" class="icon-btn phone-only" id="menu-btn" aria-label="Open the lesson tree" aria-expanded="false" aria-controls="tree">
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h16"/></svg>
@@ -61,12 +63,14 @@
     {% if groups | length > 0 %}
     <div class="label"><a href="/{{ scope }}/">{% if scope == "general" %}General{% elif scope == "projects" %}Projects{% else %}Systems{% endif %}</a></div>
     {% for g in groups %}
-    <details{% if open == g.key %} open{% endif %}>
+    <details data-key="{{ g.key }}"{% if open == g.key %} open{% endif %}>
       <summary><span class="name">{{ g.name }}</span><span class="count">{{ g.count }}</span></summary>
       <a class="group-link" href="{{ g.url }}">All {{ g.count }} in {{ g.name }}</a>
-      {% for l in g.lessons %}
+      {% if open == g.key %}
+      {% for l in page.data.tree_lessons %}
       <a class="leaf" href="{{ l.url }}"{% if current == l.id %} aria-current="page"{% endif %}>{{ l.title_html | safe }}</a>
       {% endfor %}
+      {% endif %}
     </details>
     {% endfor %}
     {% endif %}
@@ -79,7 +83,7 @@
     {% endif %}
   </nav>
   <div class="scrim" id="scrim" hidden></div>
-  <main class="main" id="main">
+  <main class="main" id="main" tabindex="-1">
     {% block content %}{% endblock %}
   </main>
 </div>

@@ -13,6 +13,7 @@ pub mod facts;
 pub mod git;
 pub mod graph;
 pub mod hooks;
+pub mod image;
 pub mod import;
 pub mod init;
 pub mod install;

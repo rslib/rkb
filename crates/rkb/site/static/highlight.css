@@ -1,0 +1,25 @@
+/* Code colors for the syntect classes rs-web writes. Each color has at least 4.5:1 contrast with the
+   code background in its theme. */
+:root {
+  --hl-comment: #5F6473; --hl-string: #1E5A33; --hl-keyword: #6B3FA0; --hl-constant: #A3421B;
+  --hl-function: #2346A0; --hl-variable: #7A5200; --hl-tag: #2E6B3F;
+}
+:root[data-theme="dark"] {
+  --hl-comment: #969AA7; --hl-string: #8ED1A4; --hl-keyword: #BE9AEE; --hl-constant: #F0916A;
+  --hl-function: #8FAEF5; --hl-variable: #DDB84E; --hl-tag: #6CC892;
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] {
+    --hl-comment: #969AA7; --hl-string: #8ED1A4; --hl-keyword: #BE9AEE; --hl-constant: #F0916A;
+    --hl-function: #8FAEF5; --hl-variable: #DDB84E; --hl-tag: #6CC892;
+  }
+}
+.hl .comment { color: var(--hl-comment); font-style: italic; }
+.hl .string, .hl .markup.inserted { color: var(--hl-string); }
+.hl .keyword, .hl .storage { color: var(--hl-keyword); }
+.hl .constant, .hl .markup.deleted { color: var(--hl-constant); }
+.hl .entity.name, .hl .support.function, .hl .meta.function-call .variable.function { color: var(--hl-function); }
+.hl .variable.other, .hl .variable.parameter, .hl .support.type { color: var(--hl-variable); }
+.hl .entity.name.tag, .hl .entity.other.attribute-name { color: var(--hl-tag); }
+.hl .punctuation, .hl .keyword.operator { color: inherit; }
+.hl .comment .punctuation { color: var(--hl-comment); }

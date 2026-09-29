@@ -255,3 +255,21 @@ mark { background: var(--mark); color: var(--ink); padding: 0 2px; border-radius
   .logo { width: 24px; height: 24px; font-size: 11px; }
   .theme button { width: 26px; }
 }
+
+/* Reading helpers */
+.skip { position: absolute; left: 12px; top: -48px; z-index: 50; padding: 8px 14px; border-radius: 8px; background: var(--btn); color: var(--btn-ink); font-weight: 500; }
+.skip:focus { top: 12px; color: var(--btn-ink); text-decoration: none; }
+.main:focus { outline: none; }
+.stale-reason { margin: 0; padding: 10px 14px; border-radius: 10px; font-size: 15px; background: #FDF1D6; color: #5C3D00; border: 1px solid #EBD39A; }
+:root[data-theme="dark"] .stale-reason { background: #3A2E0E; color: #F0CF7A; border-color: #5C4A1A; }
+@media (prefers-color-scheme: dark) { :root[data-theme="system"] .stale-reason { background: #3A2E0E; color: #F0CF7A; border-color: #5C4A1A; } }
+@media print {
+  .top, .tree, .scrim, .search-panel, .skip, .code-bar .btn, .anchor, .prevnext, .unlocked { display: none !important; }
+  body { background: #FFFFFF; color: #000000; }
+  .frame { display: block; min-height: 0; }
+  .page, .lesson-page { display: block; padding: 0; max-width: none; }
+  .side { position: static; max-height: none; min-height: 0; margin: 24px 0 0; padding: 16px 0 0; border-left: 0; border-top: 1px solid #CCCCCC; }
+  .toc { display: none; }
+  .prose pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  a { color: inherit; }
+}

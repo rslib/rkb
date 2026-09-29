@@ -2802,7 +2802,7 @@ build)
   fi
   if [ -n "$FAKE_RS_WEB_EXTRA" ]; then
     mkdir -p "dist/$(dirname "$FAKE_RS_WEB_EXTRA")"
-    echo "$FAKE_RS_WEB_TEXT" > "dist/$FAKE_RS_WEB_EXTRA"
+    printf '%s' "$FAKE_RS_WEB_TEXT" > "dist/$FAKE_RS_WEB_EXTRA"
   fi
   ;;
 esac
@@ -3131,7 +3131,7 @@ fn site_init_keeps_user_edits_and_is_used() {
     let env = site_kb();
     let (v, code) = site(&env, &["site", "init"], &[]);
     assert_eq!(code, Some(0), "{v}");
-    assert_eq!(v["written"].as_array().unwrap().len(), 17, "{v}");
+    assert_eq!(v["written"].as_array().unwrap().len(), 19, "{v}");
     let log = stdout(&env.git(&["log", "-1", "--name-only", "--format=%s"]));
     assert!(log.starts_with("site: add the rs-web template") && log.contains("site/config.lua"), "{log}");
 
@@ -3147,6 +3147,87 @@ fn site_init_keeps_user_edits_and_is_used() {
     site_built(&env, env.dir.path().join("out").to_str().unwrap());
     let staged = std::fs::read_to_string(env.dir.path().join("cache/rkb/site/stage/config.lua")).unwrap();
     assert_eq!(staged, "-- mine\n", "the build uses the knowledge base's template");
+}
+
+/// A 1x1 PNG whose `eXIf` chunk holds a GPS position.
+fn png_with_gps() -> Vec<u8> {
+    let chunk = |kind: &[u8], data: &[u8]| {
+        let mut c = (data.len() as u32).to_be_bytes().to_vec();
+        c.extend_from_slice(kind);
+        c.extend_from_slice(data);
+        c.extend_from_slice(&[0; 4]);
+        c
+    };
+    let mut p = b"\x89PNG\r\n\x1a\n".to_vec();
+    p.extend(chunk(b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0]));
+    p.extend(chunk(b"eXIf", b"MM\0*GPSLatitude 41.8781"));
+    p.extend(chunk(b"IDAT", &[0x78, 0x9c, 0x63, 0x60, 0, 0, 0, 2, 0, 1]));
+    p.extend(chunk(b"IEND", &[]));
+    p
+}
+
+/// Links `layout.png` (with GPS EXIF) from the public autostash lesson and `diagram.svg` from the
+/// internal shallow-clones lesson.
+fn site_kb_with_images() -> Env {
+    let env = site_kb();
+    let dir = env.kb().join("general/git");
+    let link = |file: &str, img: &str| {
+        let p = dir.join(format!("{file}.md"));
+        let text = std::fs::read_to_string(&p).unwrap().replacen("\n## ", &format!("\n![img]({file}.assets/{img})\n\n## "), 1);
+        std::fs::write(p, text).unwrap();
+    };
+    std::fs::create_dir_all(dir.join("rebase-with-local-edits-using-autostash.assets")).unwrap();
+    std::fs::write(dir.join("rebase-with-local-edits-using-autostash.assets/layout.png"), png_with_gps()).unwrap();
+    link("rebase-with-local-edits-using-autostash", "layout.png");
+    std::fs::create_dir_all(dir.join("shallow-clones-break-git-describe.assets")).unwrap();
+    std::fs::write(
+        dir.join("shallow-clones-break-git-describe.assets/diagram.svg"),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><text>describe</text></svg>",
+    )
+    .unwrap();
+    link("shallow-clones-break-git-describe", "diagram.svg");
+    env
+}
+
+#[test]
+fn site_stages_images_without_metadata() {
+    let env = site_kb_with_images();
+    let out = env.dir.path().join("out");
+    let out_s = out.to_str().unwrap();
+    let pw = [("SITE_PASSWORD", PASSWORD), ("FAKE_RS_WEB_NO_INDEX", "1")];
+    let (v, _) = site(&env, &["site", "build", "--out", out_s], &pw);
+    let (v, code) = site(&env, &["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], &pw);
+    assert_eq!(code, Some(0), "{v}");
+    let stage = env.dir.path().join("cache/rkb/site/stage");
+    let png = std::fs::read(stage.join("lessons/general/git/rebase-with-local-edits-using-autostash.assets/layout.png")).unwrap();
+    assert!(png.starts_with(b"\x89PNG") && !String::from_utf8_lossy(&png).contains("GPS"), "the staged image holds no EXIF");
+    let svg = stage.join("protected/general/git/shallow-clones-break-git-describe.assets/diagram.svg");
+    let b64 = std::fs::read_to_string(svg.with_extension("svg.b64")).unwrap();
+    assert!(b64.starts_with("PHN2Zy"), "the protected image is staged as base64 to embed: {b64}");
+
+    let svg_bytes = std::fs::read(&svg).unwrap();
+    let (v, code) = site(
+        &env,
+        &["site", "build", "--out", out_s],
+        &[pw[0], pw[1], ("FAKE_RS_WEB_EXTRA", "img/diagram.svg"), ("FAKE_RS_WEB_TEXT", std::str::from_utf8(&svg_bytes).unwrap())],
+    );
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("an image of protected lesson `1a00000004` as a plain file"), "{v}");
+
+    let home = format!("<svg><text>{}/secret</text></svg>", env.dir.path().display());
+    let (v, code) = site(
+        &env,
+        &["site", "build", "--out", out_s],
+        &[pw[0], pw[1], ("FAKE_RS_WEB_EXTRA", "general/x.svg"), ("FAKE_RS_WEB_TEXT", &home)],
+    );
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("general/x.svg: "), "an SVG is scanned for leaks: {v}");
+
+    std::fs::write(env.kb().join("general/git/rebase-with-local-edits-using-autostash.assets/layout.png"), b"\x89PNG\r\n\x1a\nbroken")
+        .unwrap();
+    let (v, code) = site(&env, &["site", "build", "--out", out_s], &pw);
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("layout.png: truncated PNG"), "{v}");
 }
 
 /// Runs only with `RKB_TEST_RS_WEB` set to an rs-web binary.
@@ -3245,6 +3326,65 @@ fn site_builds_with_real_rs_web() {
         }
     }
     assert!(!all.contains("Shallow clones break git describe"), "a protected title is in plain text");
+}
+
+/// Runs only with `RKB_TEST_RS_WEB` set to an rs-web binary.
+#[test]
+fn site_images_tree_code_and_404_with_real_rs_web() {
+    let Ok(rs_web) = std::env::var("RKB_TEST_RS_WEB") else { return };
+    let env = site_kb_with_images();
+    let p = env.kb().join("general/git/squash-fixups-with-autosquash.md");
+    std::fs::write(
+        &p,
+        std::fs::read_to_string(&p).unwrap().replace("status: active", "status: stale\nstale_reason: newer git changed this"),
+    )
+    .unwrap();
+    let out = env.dir.path().join("out");
+    let real = |args: &[&str]| {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.env("RKB_RS_WEB", &rs_web).env("CLAUDECODE", "1").env("SITE_PASSWORD", PASSWORD);
+        let mut all = args.to_vec();
+        all.extend(["--format", "json"]);
+        let o = rkb_with(c, &all, "");
+        (serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o))), o.status.code())
+    };
+    let (v, code) = real(&["site", "build", "--out", out.to_str().unwrap()]);
+    assert_eq!(code, Some(3), "{v}");
+    let (v, code) = real(&["confirm", v["request"].as_str().unwrap(), "--choice", "publish"]);
+    assert_eq!(code, Some(0), "{v}");
+
+    let dir = out.join("general/git/rebase-with-local-edits-using-autostash");
+    let page = std::fs::read_to_string(dir.join("index.html")).unwrap();
+    let png = std::fs::read(dir.join("layout.png")).unwrap();
+    assert!(png.starts_with(b"\x89PNG") && !String::from_utf8_lossy(&png).contains("GPS"), "the image is published without EXIF");
+    assert!(page.contains("/general/git/rebase-with-local-edits-using-autostash/layout.png"), "the page shows the image: {page}");
+    assert!(page.contains("hl") && page.contains("/static/highlight.css") && out.join("static/highlight.css").is_file(), "{page}");
+    assert!(page.contains("class=\"source shell") || page.contains("class=\"source"), "the code block is colored: {page}");
+    assert!(page.contains("Skip to content"), "{page}");
+
+    let mut files = vec![];
+    let mut todo = vec![out.clone()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            if e.path().is_dir() { todo.push(e.path()) } else { files.push(e.path()) }
+        }
+    }
+    assert!(!files.iter().any(|f| f.extension().is_some_and(|x| x == "svg" || x == "b64")), "a protected image is a file: {files:?}");
+    let prot = std::fs::read_to_string(out.join("protected/1a00000004/index.html")).unwrap();
+    assert!(!prot.contains("data:image"), "the embedded image is inside the ciphertext");
+
+    let tree: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("tree.json")).unwrap()).unwrap();
+    let git: Vec<&str> = tree["general/git"].as_array().unwrap().iter().map(|e| e["url"].as_str().unwrap()).collect();
+    assert_eq!(git, ["/general/git/rebase-with-local-edits-using-autostash/", "/general/git/squash-fixups-with-autosquash/"]);
+    assert!(!tree.to_string().contains("1a00000004") && !tree.to_string().contains("protected"), "{tree}");
+
+    let home = std::fs::read_to_string(out.join("index.html")).unwrap();
+    assert!(!home.contains("leaf") && home.contains("data-key=general/git"), "the home page holds groups, not lessons: {home}");
+    assert_eq!(page.matches("class=leaf").count(), 2, "a lesson page holds its own group's lessons: {page}");
+    let stale = std::fs::read_to_string(out.join("general/git/squash-fixups-with-autosquash/index.html")).unwrap();
+    assert!(stale.contains("Stale") && stale.contains("newer git changed this"), "{stale}");
+    let missing = std::fs::read_to_string(out.join("404.html")).unwrap();
+    assert!(missing.contains("Page not found") && missing.contains("noindex") && missing.contains("/static/site.js"), "{missing}");
 }
 
 /// Runs only with `RKB_TEST_RS_WEB` set to an rs-web binary.

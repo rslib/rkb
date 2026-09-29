@@ -24,7 +24,7 @@ const ASSETS: [(&str, &str, &str, &str); 3] = [
     ("linux", "x86_64", "rs-web-linux-x86_64", "da5f75d0b5165329138f84743076ed28f735999124610fb9b2f83d9484c6db3f"),
 ];
 
-const TEMPLATE: [(&str, &[u8]); 17] = [
+const TEMPLATE: [(&str, &[u8]); 19] = [
     ("config.lua", include_bytes!("../site/config.lua")),
     ("templates/base.html", include_bytes!("../site/templates/base.html")),
     ("templates/home.html", include_bytes!("../site/templates/home.html")),
@@ -35,8 +35,10 @@ const TEMPLATE: [(&str, &[u8]); 17] = [
     ("templates/protected-index.html", include_bytes!("../site/templates/protected-index.html")),
     ("templates/unlock.html", include_bytes!("../site/templates/unlock.html")),
     ("templates/redirect.html", include_bytes!("../site/templates/redirect.html")),
+    ("templates/404.html", include_bytes!("../site/templates/404.html")),
     ("static/site.css", include_bytes!("../site/static/site.css")),
     ("static/site.js", include_bytes!("../site/static/site.js")),
+    ("static/highlight.css", include_bytes!("../site/static/highlight.css")),
     // hash-wasm 4.12.0, MIT (https://www.npmjs.com/package/hash-wasm): Argon2id in the browser.
     ("static/argon2.umd.min.js", include_bytes!("../site/static/argon2.umd.min.js")),
     ("static/hash-wasm.LICENSE", include_bytes!("../site/static/hash-wasm.LICENSE")),
@@ -46,7 +48,7 @@ const TEMPLATE: [(&str, &[u8]); 17] = [
     ("static/fonts/OFL.txt", include_bytes!("../site/static/fonts/OFL.txt")),
 ];
 
-const TEXT: [&str; 7] = ["html", "xml", "json", "js", "css", "txt", "md"];
+const TEXT: [&str; 8] = ["html", "xml", "json", "js", "css", "txt", "md", "svg"];
 
 fn io_error(what: impl std::fmt::Display, fix: &str) -> CliError {
     CliError::new(ErrorCode::Io, what.to_string(), fix)
@@ -298,9 +300,30 @@ fn stage(env: &Env, s: &site::Site, dir: &Path) -> Result<(), CliError> {
         }
     }
     for (path, data) in &s.files {
-        put(path, data)?;
+        let data = staged(path, data)?;
+        put(path, &data)?;
+        // The Lua cannot read binary files, so a protected image also goes in as text to embed.
+        if path.starts_with("protected/") && path.contains(".assets/") {
+            put(&format!("{path}.b64"), rkb_core::image::base64(&data).as_bytes())?;
+        }
     }
     put("site.json", serde_json::to_string_pretty(&s.index).expect("the index serializes").as_bytes())
+}
+
+/// A staged file as it may be published: a PNG, JPEG or WebP image without its metadata.
+fn staged(path: &str, data: &[u8]) -> Result<Vec<u8>, CliError> {
+    let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    if !path.contains(".assets/") || !["png", "jpg", "jpeg", "webp"].contains(&ext.as_str()) {
+        return Ok(data.to_vec());
+    }
+    let kb_path = path.split_once('/').map_or(path, |(_, p)| p);
+    rkb_core::image::strip(&ext, data).map_err(|e| {
+        CliError::new(
+            ErrorCode::Refused,
+            format!("{kb_path}: {e}; its metadata cannot be removed, so it is not published"),
+            "open the image and save it again as a plain PNG, JPEG or WebP; nothing was written",
+        )
+    })
 }
 
 /// Removes the values of the encrypted-content attributes and of the `ciphertext`, `salt` and `nonce`
@@ -340,6 +363,12 @@ fn check(env: &Env, dist: &Path, s: &site::Site) -> Vec<String> {
             (x.id.as_str(), words.into_iter().filter(|w| !public.contains(w)).collect())
         })
         .collect();
+    let hidden: Vec<(&str, Vec<u8>)> = s
+        .files
+        .iter()
+        .filter(|(p, _)| p.starts_with("protected/") && p.contains(".assets/"))
+        .flat_map(|(p, d)| [(p.as_str(), d.clone()), (p.as_str(), staged(p, d).unwrap_or_default())])
+        .collect();
     let mut out = vec![];
     for p in walk(dist) {
         let rel = p.strip_prefix(dist).expect("walk stays under the folder").to_string_lossy().into_owned();
@@ -359,6 +388,13 @@ fn check(env: &Env, dist: &Path, s: &site::Site) -> Vec<String> {
                     out.push(format!("{rel}: shows protected lesson `{id}` in plain text"));
                 }
             }
+        }
+        if !hidden.is_empty()
+            && let Ok(bytes) = std::fs::read(&p)
+            && let Some((img, _)) = hidden.iter().find(|(_, d)| !d.is_empty() && *d == bytes)
+        {
+            let id = s.secrets.iter().find(|x| img.contains(x.path.strip_suffix(".md").unwrap_or(&x.path))).map_or("?", |x| x.id.as_str());
+            out.push(format!("{rel}: an image of protected lesson `{id}` as a plain file"));
         }
         if let Some(x) = s.secrets.iter().find(|x| rel.starts_with(&format!("{}/", x.path.strip_suffix(".md").unwrap_or(&x.path)))) {
             out.push(format!("{rel}: a page at the path of protected lesson `{}`", x.id));

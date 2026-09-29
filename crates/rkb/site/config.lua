@@ -88,14 +88,45 @@ local function place(l)
   return "general/" .. l.topic
 end
 
--- The lesson's Markdown without frontmatter and title, with links to other lessons pointing at their pages.
+local MIME = { png = "image/png", jpg = "image/jpeg", jpeg = "image/jpeg", webp = "image/webp", svg = "image/svg+xml" }
+
+local function file_name(path)
+  return path:match("[^/]+$")
+end
+
+-- The lesson's Markdown without frontmatter and title, with links to other lessons pointing at their
+-- pages. A public lesson's images sit next to its page; a protected lesson's images are embedded, so
+-- they stay inside its ciphertext.
 local function body(l)
   local text = rs.data.load_frontmatter(l.path).content
   text = text:gsub("^%s*# [^\n]*\n", "", 1)
   for target, url in pairs(l.hrefs or {}) do
     text = text:gsub("%]%(" .. escape_pattern(target) .. "%)", "](" .. url .. ")")
   end
+  for target, staged in pairs(l.images or {}) do
+    local src
+    if l.url:find("^/protected/") then
+      local ext = staged:match("%.(%w+)$"):lower()
+      src = "data:" .. (MIME[ext] or "application/octet-stream") .. ";base64," .. rs.fs.read(staged .. ".b64")
+    else
+      src = l.url .. file_name(staged)
+    end
+    text = text:gsub("%]%(" .. escape_pattern(target) .. "%)", function()
+      return "](" .. src .. ")"
+    end)
+  end
   return text
+end
+
+local function unescape(s)
+  return (s:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&quot;", '"'):gsub("&#39;", "'"):gsub("&amp;", "&"))
+end
+
+-- Fenced code with a language gets syntect classes; `static/highlight.css` colors them in both themes.
+local function highlight(html)
+  return (html:gsub('<pre><code class="language%-([^"]+)">(.-)</code></pre>', function(lang, code)
+    return '<pre class="hl"><code class="language-' .. lang .. '">' .. rs.highlight.highlight_sync(unescape(code), lang) .. "</code></pre>"
+  end))
 end
 
 local function when_lines(l)
@@ -232,7 +263,7 @@ end
 -- whole, so nothing about them is outside the ciphertext.
 local function lesson_html(l, locked)
   local t = type_of(l)
-  local html = rs.markdown.render(body(l))
+  local html = highlight(rs.markdown.render(body(l)))
   local toc = {}
   html = html:gsub('<h2 id="([^"]+)">(.-)</h2>', function(id, text)
     table.insert(toc, '<a href="#' .. id .. '">' .. text .. "</a>")
@@ -259,10 +290,14 @@ local function lesson_html(l, locked)
       .. "</nav>"
   end
   local stale = l.status == "stale" and ' <span class="badge stale">Stale</span>' or ""
+  local stale_reason = (l.status == "stale" and l.stale_reason)
+      and ('<p class="stale-reason"><strong>Stale:</strong> ' .. esc(l.stale_reason) .. "</p>")
+    or ""
   local out = {
     '<article class="lesson t-' .. esc(l.type) .. '">',
     '<div class="lesson-head">' .. breadcrumb(l, locked),
     "<h1>" .. title_html(l.title) .. stale .. "</h1>",
+    stale_reason,
     '<div class="chips phone-only"><span class="chip type">' .. esc(t.name) .. '</span><span class="chip">Verified ' .. date(l.verified)
       .. '</span><span class="chip">Holds ' .. (#when > 0 and table.concat(when, ", ") or "anywhere") .. "</span></div>",
     "</div>",
@@ -313,12 +348,19 @@ local function entry(l)
   }
 end
 
--- ponytail: every page repeats the whole tree, so output grows with lessons squared; past a few
--- thousand lessons, write the tree to a JSON file and let site.js fill it.
+-- Pages carry the tree's groups and only their own group's lessons; `tree.json` has the rest.
+local tree_groups = {}
+for scope, list in pairs(tree) do
+  tree_groups[scope] = {}
+  for _, g in ipairs(list) do
+    table.insert(tree_groups[scope], { key = g.key, name = g.name, url = g.url, count = g.count })
+  end
+end
+
 local global = {
   title = title,
   count = #site.lessons,
-  tree = tree,
+  tree = tree_groups,
   protected_count = #protected,
   types = type_counts,
   base_url = base_url,
@@ -329,6 +371,7 @@ local indexed = {}
 
 -- `summary` describes the page in link previews; `noindex` keeps it out of search engines and the sitemap.
 local function page(path, template, page_title, data, summary_text, noindex)
+  data.tree_lessons = groups[data.open or ""] and groups[data.open].lessons or {}
   data.meta = {
     title = page_title,
     description = summary_text or description,
@@ -428,6 +471,7 @@ return {
       return a.name < b.name
     end)
     table.insert(pages, index_page("/tags/", "Tags", tag_list))
+    table.insert(pages, page("/404.html", "404.html", "Page not found", { open = "" }, nil, true))
     if #protected > 0 then
       for _, l in ipairs(protected) do
         table.insert(pages, page(l.url, "protected.html", "Protected lesson", {
@@ -446,6 +490,7 @@ return {
       for _, f in ipairs({
         "site.css",
         "site.js",
+        "highlight.css",
         "argon2.umd.min.js",
         "hash-wasm.LICENSE",
         "fonts/Geist-Variable.woff2",
@@ -457,7 +502,18 @@ return {
       local index = {}
       for _, l in ipairs(site.lessons) do
         table.insert(index, entry(l))
+        for _, staged in pairs(l.images or {}) do
+          rs.fs.copy(staged, out .. l.url .. file_name(staged))
+        end
       end
+      local tree_json = {}
+      for key, g in pairs(groups) do
+        tree_json[key] = {}
+        for _, c in ipairs(g.lessons) do
+          table.insert(tree_json[key], { title = c.title, url = c.url })
+        end
+      end
+      rs.fs.write(out .. "/tree.json", rs.data.to_json(tree_json))
       rs.fs.write(out .. "/search.json", rs.data.to_json(index))
       -- One encrypted list per password, so a password opens only its own lessons. The boxes follow
       -- the order of each password's first lesson and carry no group name.

@@ -1,5 +1,5 @@
-// The site's only script: theme switch, search, code copy buttons, the phone menu and the one unlock
-// for protected lessons. Decryption follows rs-web's rs.crypt: the key is Argon2id (hash-wasm, loaded
+// The site's only script: theme switch, search, code copy buttons, the lesson tree, section marking,
+// the phone menu and the one unlock for protected lessons. Decryption follows rs-web's rs.crypt: the key is Argon2id (hash-wasm, loaded
 // only when a password is used) over the salt, and the content is AES-256-GCM (Web Crypto) with its nonce.
 (function () {
   "use strict";
@@ -56,8 +56,39 @@
   if (menu) menu.addEventListener("click", () => setMenu(!document.body.classList.contains("menu-open")));
   $("#scrim").addEventListener("click", () => setMenu(false));
 
+  // Lesson tree: a page holds only its own group's lessons; the others come from tree.json when a
+  // group is opened. Without the script each group still links to its list page.
+  let treeData = null;
+  function fillGroup(d) {
+    if (!d.open || d.dataset.filled || $(".leaf", d)) return;
+    d.dataset.filled = "1";
+    treeData = treeData || fetch("/tree.json").then((r) => r.json());
+    treeData.then((t) => {
+      d.append(...arr(t[d.dataset.key]).map((e) => el("a", { class: "leaf", href: e.url }, titleNode(e.title))));
+    }).catch(() => { delete d.dataset.filled; treeData = null; });
+  }
+  $$("#tree details[data-key]").forEach((d) => d.addEventListener("toggle", () => fillGroup(d)));
+
+  // "On this page" marks the last section whose heading has passed the top bar, or the last one when
+  // the page is scrolled to its end.
+  function watchSections(root) {
+    const links = $$(".toc a", root);
+    const heads = links.map((a) => document.getElementById(decodeURIComponent(a.hash.slice(1)))).filter(Boolean);
+    if (!heads.length) return;
+    let queued = false;
+    const mark = () => {
+      queued = false;
+      const end = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
+      const top = end ? heads[heads.length - 1] : heads.filter((h) => h.getBoundingClientRect().top <= 96).pop() || heads[0];
+      links.forEach((a) => a.classList.toggle("active", a.hash.slice(1) === top.id));
+    };
+    window.addEventListener("scroll", () => { if (!queued) { queued = true; requestAnimationFrame(mark); } }, { passive: true });
+    mark();
+  }
+
   // Code blocks: a bar with the language and a copy button
   function enhance(root) {
+    watchSections(root);
     $$(".prose > pre", root).forEach((pre) => {
       const code = $("code", pre);
       const lang = code && (code.className.match(/language-(\S+)/) || [])[1];
@@ -87,10 +118,31 @@
   const words = (s) => String(s).toLowerCase().split(/[^\p{L}\p{N}_]+/u).filter(Boolean);
   const where = (e) => (e.place.startsWith("general/") ? "General" : e.place.split("/")[1]);
 
+  // One English suffix off when four letters stay, then a doubled last letter: rebasing, rebased and
+  // rebase all give rebas.
+  function stem(w) {
+    for (const suf of ["ing", "ed", "es", "ly", "s", "e"]) {
+      if (w.endsWith(suf) && w.length - suf.length >= 4) { w = w.slice(0, -suf.length); break; }
+    }
+    return w.length > 4 && w[w.length - 1] === w[w.length - 2] ? w.slice(0, -1) : w;
+  }
+
+  // Damerau-Levenshtein distance of at most 1: one letter changed, added, removed or two swapped.
+  function oneTypo(a, b) {
+    if (a === b || Math.abs(a.length - b.length) > 1) return false;
+    let i = 0;
+    while (i < a.length && a[i] === b[i]) i++;
+    if (a.length === b.length) {
+      return a.slice(i + 1) === b.slice(i + 1) || (a[i] === b[i + 1] && a[i + 1] === b[i] && a.slice(i + 2) === b.slice(i + 2));
+    }
+    return a.length > b.length ? a.slice(i + 1) === b.slice(i) : a.slice(i) === b.slice(i + 1);
+  }
+
   function prepare(e) {
-    e.tw = words(e.title);
-    e.mw = words(arr(e.tags).join(" ") + " " + e.topic);
-    e.xw = words(e.text);
+    e.fields = [words(e.title), words(arr(e.tags).join(" ") + " " + e.topic), words(e.text)].map((ws) => {
+      const uniq = [...new Set(ws)];
+      return { ws: uniq, stems: uniq.map(stem) };
+    });
     return e;
   }
 
@@ -102,22 +154,39 @@
     return index.concat(extra);
   }
 
-  // A word in the title scores 5, in the tags or topic 3, in the text 1; a prefix match half that.
+  // A word in the title scores 5, in the tags or topic 3, in the text 1, times 1 for the same word,
+  // 0.5 for a word start, 0.4 for another form of the word and 0.25 for one typo (query words of five
+  // or more letters). Returns the score and the index words to mark.
+  const PTS = [5, 3, 1];
   function score(e, q) {
     let total = 0;
+    const marks = new Set();
     for (const w of q) {
+      const ws = stem(w);
       let best = 0;
-      for (const [list, pts] of [[e.tw, 5], [e.mw, 3], [e.xw, 1]]) {
-        if (list.includes(w)) best = Math.max(best, pts);
-        else if (list.some((x) => x.startsWith(w))) best = Math.max(best, pts / 2);
-      }
-      if (!best) return 0;
+      let mark = null;
+      const take = (pts, word) => { if (pts > best) { best = pts; mark = word; } };
+      e.fields.forEach((f, k) => {
+        const p = PTS[k];
+        if (p <= best) return;
+        if (f.ws.includes(w)) return take(p, w);
+        if (p * 0.5 > best && f.ws.some((x) => x.startsWith(w))) return take(p * 0.5, w);
+        const j = f.stems.indexOf(ws);
+        if (j >= 0) return take(p * 0.4, f.ws[j]);
+        if (w.length >= 5 && p * 0.25 > best) {
+          const t = f.ws.find((x) => x.length >= 4 && oneTypo(w, x));
+          if (t) take(p * 0.25, t);
+        }
+      });
+      if (!best) return [0, marks];
+      marks.add(mark);
       total += best;
     }
-    return total;
+    return [total, marks];
   }
 
-  function snippet(text, q) {
+  function snippet(text, marks) {
+    const q = [...marks];
     const low = text.toLowerCase();
     let at = -1;
     for (const w of q) {
@@ -157,14 +226,12 @@
     const q = words(raw);
     const all = await load();
     if (input.value.trim() !== raw) return;
-    last = all.map((e) => [score(e, q), e]).filter(([s]) => s > 0)
-      .sort((a, b) => b[0] - a[0] || a[1].title.localeCompare(b[1].title)).map(([, e]) => e);
-    last.q = q;
+    last = all.map((e) => [score(e, q), e]).filter(([[s]]) => s > 0)
+      .sort((a, b) => b[0][0] - a[0][0] || a[1].title.localeCompare(b[1].title)).map(([[, m], e]) => Object.assign(e, { marks: m }));
     render(true);
   }
 
   function render(fresh) {
-    const q = last.q || [];
     const count = (f) => { const m = new Map(); last.forEach((e) => m.set(f(e), (m.get(f(e)) || 0) + 1)); return [...m]; };
     if (fresh) {
       filterBox("#f-type", "type", count((e) => e.type), (t) => {
@@ -186,7 +253,7 @@
           el("span", { "aria-hidden": "true" }, "·"), el("span", { class: "mono" }, e.place),
           e.locked ? el("span", null, "· protected") : null),
         el("span", { class: "result-title" }, titleNode(e.title)),
-        el("span", { class: "result-snip" }, snippet(e.text, q)))
+        el("span", { class: "result-snip" }, snippet(e.text, e.marks)))
     ));
     selected = -1;
     panel.hidden = false;

@@ -34,7 +34,8 @@ pub struct Secret {
 
 /// The lessons to publish, as unchanged files, and the index that describes them.
 pub struct Site {
-    /// `(path in the staging folder, file bytes)`: `lessons/<kb path>` or `protected/<kb path>`.
+    /// `(path in the staging folder, file bytes)`: `lessons/<kb path>` or `protected/<kb path>`, for
+    /// lessons and the images they link from their own `.assets/` folder.
     pub files: Vec<(String, Vec<u8>)>,
     /// Public lesson ids, in path order.
     pub ids: Vec<String>,
@@ -76,6 +77,23 @@ pub fn url(kind: Kind, id: &str, path: &str) -> String {
         Kind::Public => format!("/{}/", path.strip_suffix(".md").unwrap_or(path)),
         Kind::Protected => format!("/protected/{id}/"),
     }
+}
+
+/// `(link target, kb path)` of each image a lesson links from its own `<slug>.assets/` folder.
+fn images(l: &Lesson, files: &BTreeMap<String, Vec<u8>>) -> Vec<(String, String)> {
+    let own = format!("{}.assets/", l.path.strip_suffix(".md").unwrap_or(&l.path));
+    let mut out: Vec<(String, String)> = crate::body::scan(&l.body)
+        .links
+        .into_iter()
+        .filter(|k| k.image)
+        .filter_map(|k| {
+            let target = crate::lint::resolve(&l.path, &k.target)??;
+            (target.starts_with(&own) && files.contains_key(&target)).then_some((k.target, target))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn folder(kind: Kind) -> &'static str {
@@ -148,11 +166,17 @@ pub fn collect(root: &Path, usable: impl Fn(&str) -> bool) -> Result<Site> {
             ),
         });
     }
-    let index = index(&g, &kinds, &passwords, &kb.site);
+    let index = index(&g, &kinds, &passwords, &kb.site, &snap.files);
     let mut site = Site { files: vec![], ids: vec![], protected: vec![], groups: BTreeMap::new(), secrets: vec![], left_out, index };
     for ((l, kind), group) in g.lessons.iter().zip(&kinds).zip(&passwords) {
         let Some(kind) = *kind else { continue };
         site.files.push((format!("{}/{}", folder(kind), l.path), snap.files[&l.path].clone()));
+        for (_, path) in images(l, &snap.files) {
+            let staged = (format!("{}/{path}", folder(kind)), snap.files[&path].clone());
+            if !site.files.contains(&staged) {
+                site.files.push(staged);
+            }
+        }
         let id = l.frontmatter.id.clone();
         match kind {
             Kind::Public => site.ids.push(id),
@@ -172,7 +196,14 @@ pub fn collect(root: &Path, usable: impl Fn(&str) -> bool) -> Result<Site> {
 }
 
 /// A public row names public lessons only; a protected row also names lessons with its own password.
-fn row(g: &Graph, kinds: &[Option<Kind>], passwords: &[Option<String>], by_path: &BTreeMap<&str, usize>, i: usize) -> Value {
+fn row(
+    g: &Graph,
+    kinds: &[Option<Kind>],
+    passwords: &[Option<String>],
+    by_path: &BTreeMap<&str, usize>,
+    files: &BTreeMap<String, Vec<u8>>,
+    i: usize,
+) -> Value {
     let l: &Lesson = &g.lessons[i];
     let kind = kinds[i].expect("rows are for staged lessons");
     let shown = |j: usize| match kinds[j] {
@@ -213,7 +244,11 @@ fn row(g: &Graph, kinds: &[Option<Kind>], passwords: &[Option<String>], by_path:
         "backlinks": backlinks,
         "related": related,
         "hrefs": hrefs,
+        "images": images(l, files).into_iter().map(|(t, p)| (t, format!("{}/{p}", folder(kind)))).collect::<BTreeMap<_, _>>(),
     });
+    if let Some(r) = &fm.stale_reason {
+        row["stale_reason"] = json!(r);
+    }
     for (scope, key) in [("projects", "project"), ("systems", "system")] {
         if parts[0] == scope {
             row[key] = json!(parts[1]);
@@ -226,14 +261,14 @@ fn row(g: &Graph, kinds: &[Option<Kind>], passwords: &[Option<String>], by_path:
     row
 }
 
-fn index(g: &Graph, kinds: &[Option<Kind>], passwords: &[Option<String>], site: &SiteConfig) -> Value {
+fn index(g: &Graph, kinds: &[Option<Kind>], passwords: &[Option<String>], site: &SiteConfig, files: &BTreeMap<String, Vec<u8>>) -> Value {
     let by_path: BTreeMap<&str, usize> = g.lessons.iter().enumerate().map(|(j, l)| (l.path.as_str(), j)).collect();
     let mut groups: BTreeMap<&str, BTreeMap<String, Vec<String>>> = BTreeMap::new();
     let (mut public, mut protected) = (vec![], vec![]);
     for i in 0..g.lessons.len() {
         match kinds[i] {
             Some(Kind::Public) => {
-                let r = row(g, kinds, passwords, &by_path, i);
+                let r = row(g, kinds, passwords, &by_path, files, i);
                 let id = r["id"].as_str().unwrap_or_default().to_string();
                 groups.entry("topics").or_default().entry(r["topic"].as_str().unwrap_or_default().into()).or_default().push(id.clone());
                 for (key, group) in [("project", "projects"), ("system", "systems")] {
@@ -246,7 +281,7 @@ fn index(g: &Graph, kinds: &[Option<Kind>], passwords: &[Option<String>], site: 
                 }
                 public.push(r);
             }
-            Some(Kind::Protected) => protected.push(row(g, kinds, passwords, &by_path, i)),
+            Some(Kind::Protected) => protected.push(row(g, kinds, passwords, &by_path, files, i)),
             None => {}
         }
     }
@@ -316,6 +351,38 @@ mod tests {
         assert_eq!(a["url"], "/general/git/a/");
         assert_eq!(s.index["lessons"][1]["project"], "p");
         assert_eq!(s.index["projects"]["p"], json!(["0000000002"]));
+    }
+
+    #[test]
+    fn linked_images_and_stale_reasons_are_staged() {
+        let stale = lesson("0000000002", "Stale one", "public", "Old.")
+            .replace("status: active", "status: stale\nstale_reason: newer cmake changed this");
+        let dir = kb(&[
+            ("general/git/a.md", lesson("0000000001", "Public one", "public", "![p](a.assets/p.png) ![o](b.assets/o.png)")),
+            ("general/git/a.assets/p.png", "png".into()),
+            ("general/git/a.assets/unlinked.png", "x".into()),
+            ("general/git/b.md", stale),
+            ("general/git/b.assets/o.png", "other".into()),
+            ("general/git/c.md", lesson("0000000003", "Secret one", "", "![s](c.assets/s.svg)")),
+            ("general/git/c.assets/s.svg", "<svg/>".into()),
+        ]);
+        let s = collect(dir.path(), |_: &str| true).unwrap();
+        let staged: Vec<&str> = s.files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            staged,
+            [
+                "lessons/general/git/a.md",
+                "lessons/general/git/a.assets/p.png",
+                "lessons/general/git/b.md",
+                "protected/general/git/c.md",
+                "protected/general/git/c.assets/s.svg"
+            ]
+        );
+        let a = &s.index["lessons"][0];
+        assert_eq!(a["images"], json!({ "a.assets/p.png": "lessons/general/git/a.assets/p.png" }), "only its own folder");
+        assert!(a.get("stale_reason").is_none());
+        assert_eq!(s.index["lessons"][1]["stale_reason"], "newer cmake changed this");
+        assert_eq!(s.index["protected"][0]["images"], json!({ "c.assets/s.svg": "protected/general/git/c.assets/s.svg" }));
     }
 
     #[test]
