@@ -27,3 +27,10 @@ getrandom = "0.4"
 sha2 = "0.11"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 tempfile = "3"
+
+# Smaller and faster release binaries. Panics stay `unwind`: the hooks catch them so a bug never
+# breaks the agent's session.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
