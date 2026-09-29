@@ -19,7 +19,7 @@ rkb manages a git repository of Markdown lessons at `$RKB_HOME` (default `~/Pers
 - The `reranker:` line says what ordered the results. With `laya`, each result has a `relevance` from 0 to 1: above about 0.8 the lesson very likely fits the problem, below 0.5 it likely does not. A relevance says the lesson is about your problem, never that it is true; `applies` and the lesson's `Check` still decide that. With `bm25`, there is no relevance: read the summaries and judge.
 - A `reranker: bm25 (laya: ...)` line means the model was skipped for the reason given. When the reason says `rkb models fetch`, tell the user; do not download the model (about 850 MB) yourself.
 - Run `rkb find <rough name>` when you know roughly what a lesson is called.
-- When a search missed a lesson that exists, add the query and the lesson id to `$RKB_HOME/eval/queries.toml` as a `[[query]]` table (`text`, `expect`), so `rkb eval` keeps testing it.
+- When a search missed a lesson that exists, add the query and the lesson id to `$RKB_HOME/eval/queries.toml` as a `[[query]]` table (`text`, `expect`), so `rkb eval` keeps testing it. `rkb eval --self` asks for each lesson with the first line of its Symptom or Statement and names the lessons search does not find.
 - Run `rkb show <id>` to read one lesson in full. The id is the `id:` field in the lesson's frontmatter.
 - Run `rkb lint` after you change any file in the knowledge base. Fix every error before you commit. Add `--full` if a message is cut.
 - Run `rkb lint --fix` to rewrite flow-style frontmatter in block style. It does not commit.
@@ -35,7 +35,7 @@ Never write or change a lesson file with your own tools. rkb checks it, places i
 - Run `rkb show <id>` before you change a lesson. Pipe the whole new file with the hash it printed: `rkb edit <id> --base <hash> < lesson.md`. A `conflict` error means the lesson changed; read it again and merge.
 - Run `rkb flag <id> --reason "<what failed>"` when a lesson looks wrong and you cannot fix it now. Fix it or flag it; never leave it silently wrong.
 - Run `rkb supersede <id> --by <new id> --reason "<why>"` when a lesson is wrong and another lesson now says the right thing. Run `rkb archive <id or folder> --reason "<why>"` when a lesson is still true but no longer matters, such as for a retired system. Both hide lessons from search; they write at once, one commit each, so give a concrete reason. Archiving a whole folder asks the user. `rkb unarchive <id>` brings a lesson back.
-- Run `rkb review` when the user asks to clean up the knowledge base. It lists lessons that may no longer matter, with the reasons (including `failed_repeatedly` and `never_helped` from the use records), and changes nothing. `rkb review --signals` shows how often injected lessons then helped on this machine. Show the list; archive only the lessons the user agrees to.
+- `rkb review` lists lessons that may no longer matter, with the reasons (including `failed_repeatedly`, `never_helped` and `unused` from the use records), and changes nothing. `rkb review --signals` shows how often injected lessons then helped on this machine, and how often a mistake came back in a later session. To clean up, run the curate command (`/rkb:curate` in Claude Code, `/rkb-curate` in pi and omp): it merges, sharpens or archives up to 5 candidates, one rkb write each with a reason. `rkb changes` lists what rkb wrote lately, with the reasons, so the user can check it.
 - Every time you act on a lesson (from a search, `rkb show` or an rkb hook), report the outcome: `rkb used <id> --worked` (or the `rkb_used` tool) when the task then succeeded, `rkb used <id> --failed --reason "<why>"` when it did not; a failure also flags the lesson. These records live in the knowledge base, sync to every machine, rank lessons that help a little higher, and let `rkb review` find lessons that fail or never help. The tools `rkb_used`, `rkb_flag` and `rkb_edit` do what the commands do.
 - Run `rkb log <id>` for the history of a lesson.
 - `rkb show` lists up to 3 related lessons; `rkb related <id>` lists all of them with why (link, supersedes, similar words, shared tags). Read a related lesson when it may change what you do.
@@ -73,6 +73,7 @@ In Claude Code, pi and omp, rkb hooks can add short lines that start with `rkb:`
 - Every `rkb confirm` shows the user a permission prompt (a dialog in pi and omp) with the question and your choice. This is intended; do not try to avoid it.
 - In pi or omp print or json mode there is no dialog, so `rkb confirm` is blocked. Ask the user to run the command in their own terminal.
 - At session start, when the inbox has a high-priority item, is full, or is old: `rkb inbox: N items wait … run /rkb:distill`. At a natural pause in the work (not in the middle of the user's task), run the distill command for up to 3 items without waiting for the user, then tell them in one line what you added.
+- At session start, when 5 or more lessons or pairs wait for curation: `rkb curate: N … run /rkb:curate`. At a natural pause, run it without waiting for the user, then tell them in one line what changed.
 
 ## Inbox, retro and distill
 

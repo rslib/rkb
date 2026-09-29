@@ -100,6 +100,10 @@ fn session_start(p: &Value, state: &Path, harness: &str) -> Result<Option<String
     if let Some(line) = rkb_core::distill::nudge(state, request::now(), distill) {
         text.push_str(&format!("\n{line}"));
     }
+    let curate = if harness == "claude-code" { "/rkb:curate" } else { "/rkb-curate" };
+    if let Some(line) = rkb_core::review::curate_nudge(&root, state, curate) {
+        text.push_str(&format!("\n{line}"));
+    }
     Ok(Some(text))
 }
 

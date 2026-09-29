@@ -13,6 +13,7 @@ use crate::lesson::Status;
 use crate::{matching, usage};
 
 pub const DEFAULT_STALE_DAYS: i64 = 90;
+pub const UNUSED_DAYS: i64 = 180;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +24,7 @@ pub enum ReasonKind {
     MissingCommit,
     FailedRepeatedly,
     NeverHelped,
+    Unused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -105,6 +107,10 @@ pub struct Signals {
     pub injected: usize,
     pub injected_then_helped: usize,
     pub extracts: usize,
+    /// Failure signatures seen in 2 or more sessions: the same mistake made again.
+    pub repeated: usize,
+    /// Of those, how many had a lesson injected in the session that repeated it.
+    pub repeated_with_lesson: usize,
 }
 
 /// Reads this machine's session logs and use records. Changes nothing.
@@ -130,6 +136,22 @@ pub fn signals(root: &Path, state: &Path) -> Signals {
             out.injected_then_helped += usize::from(inferred || worked);
         }
     }
+    // Sessions in the order each signature showed up in them.
+    let mut seen: HashMap<String, Vec<String>> = HashMap::new();
+    for r in std::fs::read_to_string(state.join("signatures.jsonl")).unwrap_or_default().lines() {
+        let Ok(r) = serde_json::from_str::<serde_json::Value>(r) else { continue };
+        let (Some(sig), Some(session)) = (r["sig"].as_str(), r["session"].as_str()) else { continue };
+        let sessions = seen.entry(sig.to_string()).or_default();
+        if !sessions.iter().any(|s| s == session) {
+            sessions.push(session.to_string());
+        }
+    }
+    for sessions in seen.values().filter(|s| s.len() >= 2) {
+        out.repeated += 1;
+        let log = std::fs::read_to_string(state.join("sessions").join(format!("{}.jsonl", sessions[1]))).unwrap_or_default();
+        out.repeated_with_lesson +=
+            usize::from(log.lines().any(|l| serde_json::from_str::<serde_json::Value>(l).is_ok_and(|r| r["kind"] == "injected")));
+    }
     out
 }
 
@@ -148,6 +170,8 @@ pub fn review(root: &Path, state: &Path, folder: Option<&str>) -> Result<Vec<Can
     let retired = retired_scopes(&snap);
     let oldest = oldest_supported(&kb);
     let today = jiff::Zoned::now().date();
+    let unused_cutoff = today.saturating_sub(jiff::Span::new().days(UNUSED_DAYS));
+    let unused_since = unused_cutoff.to_string();
     let mut checkout_cache: HashMap<String, Option<PathBuf>> = HashMap::new();
 
     let (mut lessons, _) = snap.lessons();
@@ -204,6 +228,11 @@ pub fn review(root: &Path, state: &Path, folder: Option<&str>) -> Result<Vec<Can
             reasons
                 .push(Reason { kind: ReasonKind::NeverHelped, detail: format!("injected {} times, never reported to help", c.injected) });
         }
+        if l.frontmatter.verified < unused_cutoff
+            && !records.iter().any(|r| r.id == l.frontmatter.id && r.time.as_str() >= unused_since.as_str())
+        {
+            reasons.push(Reason { kind: ReasonKind::Unused, detail: format!("no use recorded since {unused_since}, verified {verified}") });
+        }
         if reasons.is_empty() {
             continue;
         }
@@ -219,4 +248,107 @@ pub fn review(root: &Path, state: &Path, folder: Option<&str>) -> Result<Vec<Can
         });
     }
     Ok(out)
+}
+
+/// One rkb commit in the knowledge base, for `rkb changes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Change {
+    pub commit: String,
+    pub date: String,
+    pub kind: String,
+    /// The lesson id; empty for a folder write such as an archive of a folder.
+    pub id: String,
+    pub folder: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The reason a flag, supersede or archive recorded in the lesson it wrote.
+fn reason_in(kind: &str, path: &str, text: &str) -> Option<String> {
+    let l = crate::lesson::parse(path, text).ok()?;
+    let first = |s: String| s.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string);
+    match kind {
+        "flag" => l.frontmatter.stale_reason,
+        "supersede" => crate::body::section_text(&l.body, "Why superseded").and_then(first),
+        "archive" => crate::body::section_text(&l.body, "Why archived").and_then(first),
+        _ => None,
+    }
+}
+
+/// rkb commits since `since` (a date git understands), newest first, without usage commits. Reads only.
+pub fn changes(root: &Path, since: &str) -> Result<Vec<Change>> {
+    let out = git::run(root, &["log", &format!("--since={since}"), "--format=%x1e%h%x1f%cs%x1f%s", "--name-only", "--no-renames"])?;
+    let subject = regex::Regex::new(r"^([a-z]+)\(([^)]*)\): (.*?)(?: \[([0-9a-f]{10})\])?$").expect("valid regex");
+    let mut rows = vec![];
+    for entry in String::from_utf8_lossy(&out).split('\x1e').filter(|e| !e.trim().is_empty()) {
+        let mut lines = entry.lines();
+        let mut head = lines.next().unwrap_or_default().split('\x1f');
+        let (Some(commit), Some(date), Some(s)) = (head.next(), head.next(), head.next()) else { continue };
+        let Some(m) = subject.captures(s) else { continue };
+        let kind = m[1].to_string();
+        let first_lesson = lines.map(str::trim).find(|p| p.ends_with(".md") && !p.ends_with("README.md")).map(str::to_string);
+        rows.push((
+            commit.to_string(),
+            date.to_string(),
+            kind,
+            m[2].to_string(),
+            m[3].to_string(),
+            m.get(4).map(|i| i.as_str().to_string()),
+            first_lesson,
+        ));
+    }
+    let wanted: Vec<String> = rows
+        .iter()
+        .filter(|r| matches!(r.2.as_str(), "flag" | "supersede" | "archive"))
+        .filter_map(|r| r.6.as_ref().map(|p| format!("{}:{p}", r.0)))
+        .collect();
+    let mut blobs = git::read_blobs(root, &wanted)?.into_iter();
+    Ok(rows
+        .into_iter()
+        .map(|(commit, date, kind, folder, title, id, path)| {
+            let reason = match (&path, matches!(kind.as_str(), "flag" | "supersede" | "archive")) {
+                (Some(p), true) => blobs.next().flatten().and_then(|b| reason_in(&kind, p, &String::from_utf8_lossy(&b))),
+                _ => None,
+            };
+            Change { commit, date, kind, id: id.unwrap_or_default(), folder, title, reason }
+        })
+        .collect())
+}
+
+/// How many things `/rkb:curate` would look at: review candidates, likely duplicate pairs and lessons with
+/// quality warnings. Counted at most once a day and kept in `curate.json` in the state folder, because
+/// review reads git history.
+pub fn curate_count(root: &Path, state: &Path) -> Result<usize> {
+    let today = jiff::Zoned::now().date().to_string();
+    let path = state.join("curate.json");
+    let cached: Option<serde_json::Value> = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok());
+    if let Some(c) = cached.filter(|c| c["date"] == today.as_str())
+        && let Some(n) = c["count"].as_u64()
+    {
+        return Ok(n as usize);
+    }
+    let candidates = review(root, state, None)?.len();
+    let pairs = crate::graph::Graph::load(root)?.dupes(crate::graph::min_similarity(root)).len();
+    let snap = Snapshot::from_dir(root)?;
+    let mut weak: Vec<String> = crate::lint::lint(&snap, &crate::lint::LintEnv::default(), None)
+        .into_iter()
+        .filter(|f| f.rule.starts_with("quality/"))
+        .map(|f| f.path)
+        .collect();
+    weak.sort();
+    weak.dedup();
+    let n = candidates + pairs + weak.len();
+    let _ = std::fs::write(&path, serde_json::json!({ "date": today, "count": n }).to_string());
+    Ok(n)
+}
+
+/// The session-start line asking the agent to curate, when 5 or more things wait.
+pub fn curate_nudge(root: &Path, state: &Path, command: &str) -> Option<String> {
+    let n = curate_count(root, state).ok()?;
+    (n >= 5).then(|| {
+        format!(
+            "rkb curate: {n} lessons or pairs may need a merge, a sharper text or archiving. At a natural pause in the work, run {command}, without waiting for the user."
+        )
+    })
 }

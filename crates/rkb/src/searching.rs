@@ -221,22 +221,33 @@ fn recall_thresholds(root: &std::path::Path) -> (f64, f64) {
     (get("recall_min_relevance", rkb_core::hooks::RECALL_MIN_RELEVANCE), get("recall_min_margin", rkb_core::hooks::RECALL_MIN_MARGIN))
 }
 
-pub fn eval(env: &Env, file: Option<String>, min_recall: Option<f64>, backend: &str, sweep: bool) -> Result<Output, CliError> {
-    let path = file.map(std::path::PathBuf::from).unwrap_or_else(|| env.root.join("eval/queries.toml"));
-    let text = std::fs::read_to_string(&path).map_err(|e| {
-        CliError::new(
-            ErrorCode::NotFound,
-            format!("cannot read {}: {e}", path.display()),
-            "create it with [[query]] tables (text, expect), or pass --queries <file>",
-        )
-    })?;
-    let queries = eval::parse(&text).map_err(|e| {
-        CliError::new(
-            ErrorCode::Usage,
-            format!("{}: {e}", path.display()),
-            "each [[query]] has text, expect and optionally mode, with, project, system",
-        )
-    })?;
+pub fn eval(
+    env: &Env,
+    file: Option<String>,
+    self_check: bool,
+    min_recall: Option<f64>,
+    backend: &str,
+    sweep: bool,
+) -> Result<Output, CliError> {
+    let queries = if self_check {
+        eval::self_queries(&env.root)?
+    } else {
+        let path = file.map(std::path::PathBuf::from).unwrap_or_else(|| env.root.join("eval/queries.toml"));
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            CliError::new(
+                ErrorCode::NotFound,
+                format!("cannot read {}: {e}", path.display()),
+                "create it with [[query]] tables (text, expect), pass --queries <file>, or run `rkb eval --self`",
+            )
+        })?;
+        eval::parse(&text).map_err(|e| {
+            CliError::new(
+                ErrorCode::Usage,
+                format!("{}: {e}", path.display()),
+                "each [[query]] has text, expect and optionally mode, with, project, system",
+            )
+        })?
+    };
     let mut settings = Settings::load(&env.root);
     settings.strict = true;
     let opener = crate::rerankers::opener(&settings);
@@ -296,6 +307,11 @@ pub fn eval(env: &Env, file: Option<String>, min_recall: Option<f64>, backend: &
     if let Some(m) = min_recall {
         human.push_str(&format!("  ({} the minimum {m:.2})", if pass { "meets" } else { "BELOW" }));
     }
+    let missed: Vec<&str> =
+        report.rows.iter().filter(|r| r.answerable() && !r.rank.is_some_and(|k| k <= 5)).map(|r| r.expect[0].as_str()).collect();
+    if !missed.is_empty() {
+        human.push_str(&format!("\nnot in the first 5: {}", missed.join(" ")));
+    }
     let totals = eval::tally(&report.rows, min, margin);
     match totals {
         Some([right, wrong, silent]) => {
@@ -334,6 +350,7 @@ pub fn eval(env: &Env, file: Option<String>, min_recall: Option<f64>, backend: &
         "mrr": (report.mrr * 1000.0).round() / 1000.0,
         "ranked_by": ranked_by,
         "rows": rows,
+        "missed": missed,
         "help": ["rank 0 means not in the first 10; add a missed search to the query file to keep it tested"],
     });
     if let Some([right, wrong, silent]) = totals {

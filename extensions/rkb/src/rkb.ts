@@ -19,6 +19,7 @@ const DECLINED = "The user declined this rkb confirm.";
 const SHUTDOWN_TIMEOUT_MS = 1800;
 const RETRO: string = "__RETRO__";
 const DISTILL: string = "__DISTILL__";
+const CURATE: string = "__CURATE__";
 const TOOLS_JSON: string = "__TOOLS__";
 // A tool runs a search or a write, which may load a model, so it gets longer than a hook.
 const TOOL_TIMEOUT_MS = 60000;
@@ -240,6 +241,7 @@ export default function rkb(pi: ExtensionAPI) {
   for (const [name, text, description] of [
     ["rkb-retro", RETRO, "Record the durable lessons of this session in rkb now"],
     ["rkb-distill", DISTILL, "Turn a few rkb inbox items into lessons"],
+    ["rkb-curate", CURATE, "Merge near-duplicate lessons, sharpen weak ones and archive ones that do not help"],
   ]) {
     pi.registerCommand(name, {
       description,

@@ -438,6 +438,37 @@ fn lint_lesson(out: &mut Out, kb: Option<&KbConfig>, l: &Lesson, b: &Body) {
     if lines > MAX_LESSON_LINES {
         out.warning(p, None, "size/lesson-lines", format!("{lines} lines; a lesson over {MAX_LESSON_LINES} lines is often two lessons"));
     }
+    quality(out, p, l, b);
+}
+
+/// Warnings, never errors, for a lesson too weak to act on: evidence with nothing concrete, a title too
+/// short to find, a fix too short to follow. A curate pass picks these up.
+fn quality(out: &mut Out, p: &str, l: &Lesson, b: &Body) {
+    let section = |h: &str| crate::body::section_text(&l.body, h).map(|t| t.trim().to_string());
+    if let Some(evidence) = section("Evidence")
+        && !evidence
+            .lines()
+            .any(|line| line.contains('`') || line.contains('/') || line.contains('"') || line.chars().any(|c| c.is_ascii_digit()))
+    {
+        out.warning(
+            p,
+            None,
+            "quality/evidence",
+            "Evidence names no command, path, number or quote; say what was run and what it showed".into(),
+        );
+    }
+    if let Some((_, title)) = b.h1.first()
+        && title.split_whitespace().count() < 4
+    {
+        out.warning(p, None, "quality/title", format!("the title `{title}` has fewer than 4 words; say what the lesson claims"));
+    }
+    for h in ["Fix", "Steps"] {
+        if let Some(t) = section(h)
+            && t.chars().count() < 20
+        {
+            out.warning(p, None, "quality/fix", format!("`## {h}` is too short to follow; give the exact command or change"));
+        }
+    }
 }
 
 fn lint_asset(out: &mut Out, path: &str, size: usize, linked: bool, focus: bool) {

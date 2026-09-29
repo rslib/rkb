@@ -6,10 +6,11 @@ use crate::error::{Error, Result, io};
 
 /// The rkb skill, built into the binary so an installed copy always matches it.
 pub const SKILL: &str = include_str!("../../../skills/rkb/SKILL.md");
-/// The `/rkb-retro` and `/rkb-distill` command prompts: file name and text with frontmatter.
-pub const COMMANDS: [(&str, &str); 2] = [
+/// The `/rkb-retro`, `/rkb-distill` and `/rkb-curate` command prompts: file name and text with frontmatter.
+pub const COMMANDS: [(&str, &str); 3] = [
     ("rkb-retro.md", include_str!("../../../skills/rkb/commands/rkb-retro.md")),
     ("rkb-distill.md", include_str!("../../../skills/rkb/commands/rkb-distill.md")),
+    ("rkb-curate.md", include_str!("../../../skills/rkb/commands/rkb-curate.md")),
 ];
 /// The line in every command file rkb writes; uninstall removes only files that have it.
 const COMMAND_MARKER: &str = "\ngenerated-by: rkb install";
@@ -65,6 +66,7 @@ pub fn plugin_files(bin: &str) -> (Vec<(String, String)>, String) {
         ("plugins/rkb/skills/rkb/SKILL.md".to_string(), SKILL.to_string()),
         ("plugins/rkb/commands/retro.md".to_string(), COMMANDS[0].1.to_string()),
         ("plugins/rkb/commands/distill.md".to_string(), COMMANDS[1].1.to_string()),
+        ("plugins/rkb/commands/curate.md".to_string(), COMMANDS[2].1.to_string()),
         ("plugins/rkb/hooks/hooks.json".to_string(), pretty(serde_json::json!({ "hooks": hooks }))),
         ("plugins/rkb/.mcp.json".to_string(), pretty(serde_json::json!({ "mcpServers": { "rkb": { "command": bin, "args": ["mcp"] } } }))),
     ];
@@ -212,6 +214,7 @@ impl Harness {
             .replace("__HARNESS__", self.trust_name())
             .replace("\"__RETRO__\"", &json(COMMANDS[0].1))
             .replace("\"__DISTILL__\"", &json(COMMANDS[1].1))
+            .replace("\"__CURATE__\"", &json(COMMANDS[2].1))
             .replace("\"__RKB__\"", &serde_json::to_string(&hook_binary()).expect("a string serializes"))
             .replace(
                 "\"__TOOLS__\"",

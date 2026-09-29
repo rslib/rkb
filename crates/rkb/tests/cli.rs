@@ -282,10 +282,13 @@ fn lint_reports_findings_and_cuts_long_messages() {
     assert!(!o.status.success());
     let json: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(json["errors"], 1);
-    let msg = json["findings"][0]["message"].as_str().unwrap();
+    let error = |v: &serde_json::Value| {
+        v["findings"].as_array().unwrap().iter().find(|f| f["severity"] == "error").unwrap()["message"].as_str().unwrap().to_string()
+    };
+    let msg = error(&json);
     assert!(msg.contains("rkb lint --full") && msg.len() < 300, "{msg}");
     let full: serde_json::Value = serde_json::from_slice(&env.rkb(&["lint", "--full", "--format", "json"]).stdout).unwrap();
-    assert!(full["findings"][0]["message"].as_str().unwrap().contains(&long));
+    assert!(error(&full).contains(&long));
 }
 
 #[test]
@@ -343,13 +346,16 @@ fn lint_fix_rewrites_flow_style() {
     env.write("general/demo/a.md", &lesson);
     env.write("general/demo/README.md", "---\nlabels: {sensitivity: public}\n---\n\n# Demo\n");
     let before: serde_json::Value = serde_json::from_slice(&env.rkb(&["lint", "--format", "json"]).stdout).unwrap();
-    assert_eq!(before["warnings"], 2);
+    let style = |v: &serde_json::Value| {
+        v["findings"].as_array().unwrap().iter().filter(|f| !f["rule"].as_str().unwrap().starts_with("quality/")).count()
+    };
+    assert_eq!(style(&before), 2, "{before}");
 
     let o = env.rkb(&["lint", "--fix", "--format", "json"]);
     assert!(o.status.success(), "{}", stdout(&o));
     let json: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(json["fixed"], serde_json::json!(["general/demo/README.md", "general/demo/a.md"]));
-    assert_eq!(json["warnings"], 0);
+    assert_eq!(style(&json), 0, "{json}");
     let a = std::fs::read_to_string(env.kb().join("general/demo/a.md")).unwrap();
     assert!(a.contains("tags:\n  - demo\n  - io\n"), "{a}");
     assert!(a.ends_with("It was seen.\n  trailing  \n"));
@@ -827,9 +833,19 @@ fn parallel_writers_and_appends() {
 #[test]
 fn review_reads_use_records() {
     let env = search_kb();
+    // Fixture dates age; move every lesson to today so only `unused` depends on the date.
+    let today = jiff::Zoned::now().date().to_string();
+    for f in stdout(&env.git(&["ls-files", "*.md"])).lines() {
+        let e = env.kb().join(f);
+        let text = std::fs::read_to_string(&e).unwrap();
+        std::fs::write(&e, text.replace("verified: 2026-09-25", &format!("verified: {today}"))).unwrap();
+    }
+    let old = env.kb().join("general/git/squash-fixups-with-autosquash.md");
+    let text = std::fs::read_to_string(&old).unwrap();
+    std::fs::write(&old, text.replace(&format!("verified: {today}"), "verified: 2020-01-01")).unwrap();
     let dir = env.kb().join(".rkb/usage");
     std::fs::create_dir_all(&dir).unwrap();
-    let line = |id: &str, event: &str| format!("{{\"time\":\"2026-09-28T00:00:00Z\",\"id\":\"{id}\",\"event\":\"{event}\"}}\n");
+    let line = |id: &str, event: &str| format!("{{\"time\":\"{today}T00:00:00Z\",\"id\":\"{id}\",\"event\":\"{event}\"}}\n");
     let mut text = line("1a00000012", "failed") + &line("1a00000012", "failed");
     for _ in 0..5 {
         text += &line("1a00000003", "injected");
@@ -849,7 +865,13 @@ fn review_reads_use_records() {
     };
     assert_eq!(reasons("1a00000012"), ["failed_repeatedly"], "{v}");
     assert_eq!(reasons("1a00000003"), ["never_helped"], "{v}");
-    assert!(reasons("1a00000005").is_empty(), "one injection is not enough: {v}");
+    assert!(reasons("1a00000005").is_empty(), "one injection is not enough, and a recent record counts as use: {v}");
+
+    std::fs::write(dir.join("other-0001.jsonl"), "").unwrap();
+    let (v, _) = env.json(&["review"], "");
+    let unused: Vec<_> =
+        v["candidates"].as_array().unwrap().iter().filter(|c| c["reasons"][0]["kind"] == "unused").map(|c| c["id"].clone()).collect();
+    assert_eq!(unused, [serde_json::json!("1a00000005")], "{v}");
 }
 
 /// Every use record in the knowledge base, over every machine's file.
@@ -1362,7 +1384,15 @@ fn search_fixture_meets_recall() {
     assert!(v["error"]["message"].as_str().unwrap().contains("0000000000"));
     let low = env.dir.path().join("low.toml");
     std::fs::write(&low, "[[query]]\ntext = \"nothing matches this\"\nexpect = [\"1a00000001\"]\n").unwrap();
+    let (v, _) = env.json(&["eval", "--queries", low.to_str().unwrap()], "");
+    assert_eq!(v["missed"], serde_json::json!(["1a00000001"]), "{v}");
     assert_eq!(env.rkb(&["eval", "--queries", low.to_str().unwrap(), "--min-recall", "0.5"]).status.code(), Some(1));
+
+    let (v, code) = env.json(&["eval", "--self"], "");
+    assert_eq!(code, Some(0), "{v}");
+    let lessons = stdout(&env.git(&["grep", "-l", "-e", "^## Symptom", "-e", "^## Statement", "--", "*.md"])).lines().count();
+    assert_eq!(v["queries"].as_u64().unwrap() as usize, lessons, "{v}");
+    assert!(v["recall_at_5"].as_f64().unwrap() >= 0.9, "{v}");
 }
 
 #[test]
@@ -2110,6 +2140,20 @@ fn hook_never_fails() {
 }
 
 #[test]
+fn hook_session_start_asks_to_curate() {
+    let env = search_kb();
+    let start = || hook(&env, "session-start", &serde_json::json!({ "session_id": "s", "source": "startup", "cwd": env.kb() }));
+    let out = start();
+    assert!(
+        out.contains("rkb curate: 10 ") && out.contains("run /rkb:curate, without waiting for the user"),
+        "10 vague Evidence sections: {out}"
+    );
+    let cache = env.dir.path().join("state/rkb/curate.json");
+    std::fs::write(&cache, std::fs::read_to_string(&cache).unwrap().replace("\"count\":10", "\"count\":4")).unwrap();
+    assert!(!start().contains("curate"), "counted once a day, and 4 is not enough");
+}
+
+#[test]
 fn hook_session_start_uses_the_payload_cwd() {
     let env = fixture_kb();
     let repo = project_repo(&env, "git@github.com:llnl/dftracer.git");
@@ -2232,6 +2276,13 @@ fn hook_full_session() {
     }
     let out = hook(&env, "pre-tool", &bash("s1", &cwd, "rkb confirm"));
     assert!(out.contains("\"ask\""), "{out}");
+
+    let (v, _) = env.json(&["review", "--signals"], "");
+    assert_eq!(v["signals"]["repeated"], 0, "{v}");
+    failed["session_id"] = "s2".into();
+    assert!(hook(&env, "tool-failed", &failed).contains("1a00000012"), "a new session gets the lesson again");
+    let (v, _) = env.json(&["review", "--signals"], "");
+    assert_eq!((v["signals"]["repeated"].as_u64(), v["signals"]["repeated_with_lesson"].as_u64()), (Some(1), Some(1)), "{v}");
     assert_eq!(std::fs::read_to_string(home.join("state/rkb/hook-errors.log")).unwrap_or_default(), "");
 }
 
@@ -2736,6 +2787,16 @@ fn supersede_archive_unarchive() {
     let cmake = env.kb().join("projects/dftracer/cmake/cmake-needs-hdf5-root.md");
     assert!(std::fs::read_to_string(&cmake).unwrap().contains("status: archived\n"));
     assert!(std::fs::read_to_string(&cmake).unwrap().contains("## Why archived\nthe project moved on"));
+    let (v, _) = env.json(&["changes"], "");
+    let rows: Vec<_> = v["changes"].as_array().unwrap().iter().map(|c| (c["kind"].clone(), c["id"].clone(), c["reason"].clone())).collect();
+    assert_eq!(
+        rows,
+        [
+            (serde_json::json!("archive"), serde_json::json!(""), serde_json::json!("the project moved on")),
+            (serde_json::json!("supersede"), serde_json::json!("5d2e8a1c90"), serde_json::json!("the regex advice is wrong now")),
+        ],
+        "newest first, fixture commit is not an rkb commit: {v}"
+    );
     let (v, code) = env.json(&["archive", "projects/dftracer", "--reason", "again"], "");
     assert_eq!((v["error"]["code"].as_str(), code), (Some("refused"), Some(1)), "{v}");
 

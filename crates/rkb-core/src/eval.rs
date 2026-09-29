@@ -112,6 +112,31 @@ pub fn parse(text: &str) -> std::result::Result<Vec<Query>, String> {
     toml::from_str::<File>(text).map(|f| f.query).map_err(|e| e.message().to_string())
 }
 
+/// For `rkb eval --self`: one query per current lesson with a Symptom or Statement section, the first line of it,
+/// expecting that lesson, from the lesson's own project or system.
+pub fn self_queries(root: &Path) -> Result<Vec<Query>> {
+    let snap = Snapshot::from_dir_where(root, |p| classify(p) == FileKind::Lesson)?;
+    let (mut lessons, _) = snap.lessons();
+    lessons.sort_by(|a, b| a.path.cmp(&b.path));
+    let scope = |prefix: &str, path: &str| path.strip_prefix(prefix).and_then(|p| p.split('/').next()).map(str::to_string);
+    Ok(lessons
+        .iter()
+        .filter(|l| l.frontmatter.status.is_current())
+        .filter_map(|l| {
+            let section = ["Symptom", "Statement"].iter().find_map(|h| crate::body::section_text(&l.body, h))?;
+            let text = section.lines().map(str::trim).find(|t| !t.is_empty() && !t.starts_with("```"))?.to_string();
+            Some(Query {
+                text,
+                expect: vec![l.frontmatter.id.clone()],
+                mode: QueryMode::Search,
+                with: BTreeMap::new(),
+                project: scope("projects/", &l.path),
+                system: scope("systems/", &l.path),
+            })
+        })
+        .collect())
+}
+
 /// Recall at 5 and mean reciprocal rank over the rows that have an answer.
 pub fn score(rows: &[Row]) -> (f64, f64) {
     let rows: Vec<&Row> = rows.iter().filter(|r| r.answerable()).collect();

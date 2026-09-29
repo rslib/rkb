@@ -76,7 +76,7 @@ impl Note {
             Note::Unarchived(p) => format!("{p} is active again and back in search"),
             Note::ProjectNote { path, remote } => format!("wrote {path} with the remote {remote}"),
             Note::Similar { id, title, path } => format!(
-                "looks like {id} \"{title}\" ({path}); merge them with `rkb show {id}` and `rkb edit {id} --base <hash>` if they say the same"
+                "looks like {id} \"{title}\" ({path}); if they say the same, merge the new text into it with `rkb edit {id} --base <hash>`, then `rkb supersede <new id> --by {id} --reason \"merged\"`"
             ),
             Note::CloseTopic { folder, close } => format!(
                 "{folder} is new and its name is close to {}; if the lesson belongs there, run `rkb move <id> <folder>`",

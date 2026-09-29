@@ -170,7 +170,7 @@ fn doctor_human(c: bool, checks: &[Check], failed: usize, warned: usize) -> Stri
 pub fn signals(s: &rkb_core::review::Signals, c: bool) -> Output {
     let share = |n: usize, of: usize| (n * 100).checked_div(of).map_or_else(|| "-".to_string(), |p| format!("{p}%"));
     let human = format!(
-        "{}\n  {} sessions: {} with a failed command, {} with a fix, {} with a correction, {} with \"remember\"\n  {} lessons injected, {} then helped ({})\n  {} extracts saved to the inbox",
+        "{}\n  {} sessions: {} with a failed command, {} with a fix, {} with a correction, {} with \"remember\"\n  {} lessons injected, {} then helped ({})\n  {} extracts saved to the inbox\n  {} mistakes repeated in a later session, {} of them with a lesson injected",
         paint(c, "1", "Signals on this machine"),
         s.sessions,
         s.with_failed,
@@ -180,7 +180,9 @@ pub fn signals(s: &rkb_core::review::Signals, c: bool) -> Output {
         s.injected,
         s.injected_then_helped,
         share(s.injected_then_helped, s.injected),
-        s.extracts
+        s.extracts,
+        s.repeated,
+        s.repeated_with_lesson
     );
     Output { data: json!({ "signals": s }), human, exit: 0, raw: false }
 }
@@ -214,6 +216,30 @@ pub fn review(candidates: &[rkb_core::review::Candidate], c: bool) -> Output {
         "help": ["For each candidate: fix it with `rkb edit`, merge it with `rkb supersede`, archive it with `rkb archive <id> --reason \"<why>\"`, or leave it; tell the user what you did"],
     });
     Output { data, human, exit: 0, raw: false }
+}
+
+/// `rkb changes`: one line per rkb commit, with the reason under it when there is one.
+pub fn changes(rows: &[rkb_core::review::Change], since: &str, c: bool) -> Output {
+    let mut human = String::new();
+    for r in rows {
+        let what = if r.id.is_empty() { r.folder.clone() } else { format!("{}  {}", r.id, r.folder) };
+        human.push_str(&format!(
+            "{}  {}  {}  {}\n",
+            paint(c, "2", &r.date),
+            paint(c, "33", &format!("{:<9}", r.kind)),
+            r.title,
+            paint(c, "2", &what)
+        ));
+        if let Some(reason) = &r.reason {
+            human.push_str(&format!("    {}\n", paint(c, "2", reason)));
+        }
+    }
+    if rows.is_empty() {
+        human = format!("rkb wrote nothing since {since}.");
+    } else {
+        human.push_str(&format!("{} since {since}; see one with `rkb show <id>` or `git show <commit>`", plural(rows.len(), "change")));
+    }
+    Output { data: json!({ "since": since, "changes": rows }), human, exit: 0, raw: false }
 }
 
 /// `rkb verify --auto`: counts, then the ids of each group that is not empty.

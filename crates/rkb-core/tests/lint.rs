@@ -11,12 +11,28 @@ fn env() -> LintEnv {
     LintEnv { user: Some("fixtureuser".into()), home: Some("/home/fixtureuser".into()) }
 }
 
-fn run(files: &[(&str, &str)]) -> Vec<Finding> {
+fn run_all(files: &[(&str, &str)]) -> Vec<Finding> {
     let mut snap = Snapshot::from_dir(&fixture()).unwrap();
     for (p, t) in files {
         snap.files.insert(p.to_string(), t.as_bytes().to_vec());
     }
     lint(&snap, &env(), None)
+}
+
+/// Findings without the `quality/` warnings, which the short test lessons all get.
+fn run(files: &[(&str, &str)]) -> Vec<Finding> {
+    run_all(files).into_iter().filter(|f| !f.rule.starts_with("quality/")).collect()
+}
+
+#[test]
+fn quality_warnings() {
+    let quality = |text: &str| -> Vec<&'static str> {
+        run_all(&[(P, text)]).into_iter().filter(|f| f.path == P && f.rule.starts_with("quality/")).map(|f| f.rule).collect()
+    };
+    assert_eq!(quality(FACT), ["quality/evidence", "quality/title"]);
+    let good = fact("# A fact\n", "# The demo fact holds on every run\n").replace("It was seen.", "`demo --check` printed 1.");
+    assert_eq!(quality(&good), Vec::<&str>::new());
+    assert!(run_all(&[(P, &good)]).iter().all(|f| f.severity != Severity::Error));
 }
 
 fn rules(files: &[(&str, &str)]) -> Vec<&'static str> {

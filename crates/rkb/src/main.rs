@@ -151,6 +151,9 @@ enum Cmd {
         /// Default: $RKB_HOME/eval/queries.toml.
         #[arg(long)]
         queries: Option<String>,
+        /// Instead of a query file, ask for each lesson with the first line of its Symptom or Statement.
+        #[arg(long = "self", conflicts_with = "queries")]
+        self_check: bool,
         /// Exit non-zero when recall at 5 is below this.
         #[arg(long)]
         min_recall: Option<f64>,
@@ -240,6 +243,13 @@ enum Cmd {
         /// Instead, summarize this machine's sessions: signals, injections and whether they helped.
         #[arg(long)]
         signals: bool,
+    },
+    /// List what rkb wrote to the knowledge base lately, with reasons: adds, edits, flags, merges, archives. Changes nothing.
+    #[command(after_help = "Example:\n  rkb changes\n  rkb changes --since 2026-09-01")]
+    Changes {
+        /// A date or a git date such as "2 weeks ago". Default: 7 days ago.
+        #[arg(long, default_value = "7 days ago")]
+        since: String,
     },
     /// Mark a wrong lesson as replaced by another. Asks the user, because search then hides it.
     #[command(after_help = "Example:\n  rkb supersede 7f3a9c2b41 --by 0a1b2c3d4e --reason \"the flag is wrong on 1.14\"")]
@@ -630,9 +640,9 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             kb::open(&root)?;
             searching::find(&env, &words.join(" "), limit)
         }
-        Cmd::Eval { queries, min_recall, rerank, recall_sweep } => {
+        Cmd::Eval { queries, self_check, min_recall, rerank, recall_sweep } => {
             kb::open(&root)?;
-            searching::eval(&env, queries, min_recall, &rerank, recall_sweep)
+            searching::eval(&env, queries, self_check, min_recall, &rerank, recall_sweep)
         }
         Cmd::Dupes { min } => {
             kb::open(&root)?;
@@ -675,6 +685,10 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             }
             let c = rkb_core::review::review(&root, &env.state, folder.as_deref())?;
             Ok(session::review(&c, colored))
+        }
+        Cmd::Changes { since } => {
+            kb::open(&root)?;
+            Ok(session::changes(&rkb_core::review::changes(&root, &since)?, &since, colored))
         }
         Cmd::Supersede { id, by, reason } => writes::lifecycle(&env, rkb_core::request::Action::Supersede { id, by, reason }),
         Cmd::Archive { target, reason } => writes::lifecycle(&env, rkb_core::request::Action::Archive { target, reason }),

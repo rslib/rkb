@@ -113,7 +113,7 @@ if (harness === "omp") {
 }
 
 // The two commands send their prompts as user messages.
-assert.deepEqual(Object.keys(commands).sort(), ["rkb-distill", "rkb-retro"]);
+assert.deepEqual(Object.keys(commands).sort(), ["rkb-curate", "rkb-distill", "rkb-retro"]);
 await commands["rkb-retro"].handler("the cmake part", ctx());
 assert.match(sent.at(-1), /^Review the work of this session/);
 assert.match(sent.at(-1), /Focus from the user, if any: the cmake part/);
