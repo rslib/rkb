@@ -653,7 +653,7 @@ fn show_first_id(env: &Env) -> String {
     let dir = env.kb().join("general/cmake");
     let file = std::fs::read_dir(dir).unwrap().flatten().find(|e| e.file_name() != "README.md").unwrap();
     let text = std::fs::read_to_string(file.path()).unwrap();
-    text.lines().find_map(|l| l.strip_prefix("id: ")).unwrap().to_string()
+    text.lines().find_map(|l| l.strip_prefix("id: ")).unwrap().trim_matches('"').to_string()
 }
 
 #[test]
@@ -1565,7 +1565,7 @@ fn rkb_add_builds_the_lesson() {
     let (out, code) = tool(&env, "rkb_add", &pitfall);
     assert_eq!(code, Some(0), "{out}");
     assert!(out.contains("status: written") && out.contains("general/cmake/"), "{out}");
-    let id = out.lines().find_map(|l| l.strip_prefix("id: ")).unwrap().to_string();
+    let id = out.lines().find_map(|l| l.strip_prefix("id: ")).unwrap().trim_matches('"').to_string();
     let (v, _) = env.json(&["show", &id], "");
     let body = v["body"].as_str().unwrap_or_else(|| panic!("show {id}: {v}\nadd said: {out}"));
     let heads: Vec<&str> = body.lines().filter_map(|l| l.strip_prefix("## ")).collect();
