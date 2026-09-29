@@ -362,3 +362,128 @@ pub fn eval(
     }
     Ok(Output { data, human, exit: u8::from(!pass), raw: false })
 }
+
+/// `rkb eval --replay`: reruns this machine's logged failure queries with the failure hook's own rule.
+/// Ground truth is a heuristic: a lesson written in a session (its `meta.source.session`) most likely
+/// fixes one of that session's failures.
+pub fn replay(env: &Env, days: u64, min_recall: Option<f64>, backend: Option<&str>) -> Result<Output, CliError> {
+    use rkb_core::hooks;
+    use rkb_core::matching::{Matched, Place, Rule};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    let log = hooks::replays(&env.state, days);
+    if log.is_empty() {
+        let human = format!("nothing to replay: no failure logged in the last {days} days");
+        return Ok(Output { data: json!({ "failures": 0, "help": [human] }), human, exit: 0, raw: false });
+    }
+    let snap = rkb_core::kb::Snapshot::from_dir(&env.root)?;
+    let (lessons, _) = snap.lessons();
+    let by_id: HashMap<&str, &rkb_core::lesson::Lesson> = lessons.iter().map(|l| (l.frontmatter.id.as_str(), l)).collect();
+    let mut written: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for l in &lessons {
+        let Some(session) = l.frontmatter.meta.get("source").and_then(|s| s.get("session")).and_then(|s| s.as_str()) else { continue };
+        let mut now = l;
+        for _ in 0..10 {
+            match (now.frontmatter.status, now.frontmatter.superseded_by.as_deref().and_then(|n| by_id.get(n))) {
+                (Status::Superseded, Some(next)) => now = next,
+                _ => break,
+            }
+        }
+        if now.frontmatter.status.is_current() {
+            written.entry(session.to_string()).or_default().insert(now.frontmatter.id.clone());
+        }
+    }
+    let irrelevant: BTreeSet<(String, String)> = rkb_core::usage::records(&env.root)
+        .into_iter()
+        .filter(|r| r.event == "irrelevant")
+        .filter_map(|r| Some((r.session?, r.id)))
+        .collect();
+
+    let settings = Settings::load(&env.root);
+    let cfg = crate::hook::hooks_config(&env.root);
+    let strength = hooks::Strength::from_config(&cfg);
+    let hook_ms = cfg.get("hook_timeout_ms").and_then(toml::Value::as_integer).map_or(hooks::DEFAULT_HOOK_TIMEOUT_MS, |v| v.max(0) as u64);
+    let timeout = std::time::Duration::from_millis(if backend.is_some() { 120_000 } else { hook_ms });
+    let mut ranked_by = BM25.to_string();
+    let (mut found, mut would, mut would_irrelevant) = (BTreeSet::new(), 0, 0);
+    let mut uncovered: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    for r in &log {
+        let matched = |name: &Option<String>| name.as_ref().map(|n| Matched { name: n.clone(), rule: Rule::Flag });
+        let place = Place { project: matched(&r.project), system: matched(&r.system), repo: None, dir: None };
+        let facts = Facts::gather(&env.root, &place, &[]);
+        let opts = Options { all: false, every_status: false, limit: settings.top.max(1), probes: search::ProbeMode::Cached };
+        let mut res = search::search(&env.root, &place, &facts, &Mode::Ranked(r.query.clone()), &opts)?;
+        let items = search::rerank_items(&env.root, &res.hits);
+        let ranked = crate::rerankers::run(&settings, backend, &r.query, &items, timeout)?;
+        if let Some(scores) = &ranked.scores {
+            search::apply_relevance(&mut res.hits, scores);
+        }
+        ranked_by = ranked.describe();
+        let expect = written.get(&r.session);
+        if expect.is_some_and(|e| res.hits.iter().take(5).any(|h| e.contains(&h.id))) {
+            found.insert(r.session.clone());
+        }
+        let text_of = |id: &str| rkb_core::kb::find(&env.root, id).map(|(_, t)| t).unwrap_or_default();
+        match hooks::would_inject(&res.hits, text_of, &r.query, &strength) {
+            Some(h) => {
+                would += 1;
+                would_irrelevant += usize::from(irrelevant.contains(&(r.session.clone(), h.id.clone())));
+            }
+            None if expect.is_none() => {
+                let program = r.query.split_whitespace().next().unwrap_or("?").to_string();
+                let e = uncovered.entry(program).or_insert((0, r.query.clone()));
+                e.0 += 1;
+            }
+            None => {}
+        }
+    }
+    let with_lesson: BTreeSet<&String> = log.iter().map(|r| &r.session).filter(|s| written.contains_key(*s)).collect();
+    let recall = (!with_lesson.is_empty()).then(|| found.len() as f64 / with_lesson.len() as f64);
+    let pass = match (min_recall, recall) {
+        (Some(m), Some(r)) => r + 1e-9 >= m,
+        _ => true,
+    };
+    let sessions: BTreeSet<&String> = log.iter().map(|r| &r.session).collect();
+    let mut uncovered: Vec<(String, usize, String)> = uncovered.into_iter().map(|(p, (n, q))| (p, n, q)).collect();
+    uncovered.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+    let c = env.colored;
+    let mut human =
+        format!("{}\n", paint(c, "1", &format!("Replay of {} failures from {} sessions, last {days} days", log.len(), sessions.len())));
+    match recall {
+        Some(x) => human.push_str(&format!(
+            "  recall@5 {x:.2}: {} of {} sessions that wrote a lesson find it in the first 5",
+            found.len(),
+            with_lesson.len()
+        )),
+        None => human.push_str("  recall@5 -: no logged session wrote a lesson yet"),
+    }
+    if let (Some(m), Some(_)) = (min_recall, recall) {
+        human.push_str(&format!("  ({} the minimum {m:.2})", if pass { "meets" } else { "BELOW" }));
+    }
+    human.push_str(&format!(
+        "\n  the failure hook would now add a lesson for {would} of {} failures; {would_irrelevant} of those were marked irrelevant in that session",
+        log.len()
+    ));
+    if !uncovered.is_empty() {
+        human.push_str("\n  uncovered (no strong lesson, and the session wrote none):");
+        for (p, n, q) in &uncovered {
+            human.push_str(&format!("\n    {p:<12} {n:>3}  {}", paint(c, "2", &crate::output::cut(q, 80, ""))));
+        }
+    }
+    human.push_str(&format!("\n  ranked by: {ranked_by}"));
+    human.push_str("\n  a session counts as found when a lesson written in it ranks in the first 5 for one of its failures");
+    let data = json!({
+        "failures": log.len(),
+        "sessions": sessions.len(),
+        "sessions_with_lesson": with_lesson.len(),
+        "found": found.len(),
+        "recall_at_5": recall.map(|x| (x * 1000.0).round() / 1000.0),
+        "would_inject": would,
+        "irrelevant": would_irrelevant,
+        "uncovered": uncovered.iter().map(|(p, n, q)| json!({ "program": p, "count": n, "example": q })).collect::<Vec<_>>(),
+        "ranked_by": ranked_by,
+        "help": ["a session counts as found when a lesson written in it ranks in the first 5 for one of its failures"],
+    });
+    Ok(Output { data, human, exit: u8::from(!pass), raw: false })
+}

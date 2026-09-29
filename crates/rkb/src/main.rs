@@ -145,7 +145,7 @@ enum Cmd {
     },
     /// Measure search on a query file: recall at 5 and mean reciprocal rank.
     #[command(
-        after_help = "Example:\n  rkb eval\n  rkb eval --queries tests/fixtures/search/queries.toml --min-recall 0.9\n  rkb eval --rerank laya --recall-sweep"
+        after_help = "Example:\n  rkb eval\n  rkb eval --queries tests/fixtures/search/queries.toml --min-recall 0.9\n  rkb eval --rerank laya --recall-sweep\n  rkb eval --replay --days 30"
     )]
     Eval {
         /// Default: $RKB_HOME/eval/queries.toml.
@@ -158,11 +158,18 @@ enum Cmd {
         #[arg(long)]
         min_recall: Option<f64>,
         /// Rerank with this backend; the eval fails if it cannot run, so a report never mixes backends.
-        #[arg(long, default_value = "bm25")]
-        rerank: String,
-        /// With a model, also count what recall would add over a grid of thresholds and margins.
+        /// Default: bm25, or with --replay the chain within the hook's time limit, as the hook runs it.
         #[arg(long)]
+        rerank: Option<String>,
+        /// With a model, also count what recall would add over a grid of thresholds and margins.
+        #[arg(long, conflicts_with = "replay")]
         recall_sweep: bool,
+        /// Rerun the failures the failure hook logged on this machine, with the hook's own rule.
+        #[arg(long, conflicts_with_all = ["queries", "self_check"])]
+        replay: bool,
+        /// With --replay: only failures from the last N days.
+        #[arg(long, requires = "replay", default_value_t = 90)]
+        days: u64,
     },
     /// Put the rkb skill, hooks and confirm gate into Claude Code, pi and omp.
     #[command(after_help = "Example:\n  rkb install\n  rkb install --list\n  rkb install claude --uninstall")]
@@ -652,9 +659,13 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             kb::open(&root)?;
             searching::find(&env, &words.join(" "), limit)
         }
-        Cmd::Eval { queries, self_check, min_recall, rerank, recall_sweep } => {
+        Cmd::Eval { queries, self_check, min_recall, rerank, recall_sweep, replay, days } => {
             kb::open(&root)?;
-            searching::eval(&env, queries, self_check, min_recall, &rerank, recall_sweep)
+            if replay {
+                searching::replay(&env, days, min_recall, rerank.as_deref())
+            } else {
+                searching::eval(&env, queries, self_check, min_recall, rerank.as_deref().unwrap_or(rkb_core::rerank::BM25), recall_sweep)
+            }
         }
         Cmd::Dupes { min } => {
             kb::open(&root)?;

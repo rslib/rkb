@@ -2,10 +2,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rkb_core::conditions::{Facts, Verdict};
-use rkb_core::hooks::{
-    self, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_MIN_COVERAGE, DEFAULT_MIN_MARGIN, DEFAULT_MIN_RELEVANCE, DEFAULT_RECORD_SCORE, MAX_NUDGES,
-    RECALL_MIN_MARGIN, RECALL_MIN_RELEVANCE,
-};
+use rkb_core::hooks::{self, DEFAULT_HOOK_TIMEOUT_MS, DEFAULT_RECORD_SCORE, MAX_NUDGES, RECALL_MIN_MARGIN, RECALL_MIN_RELEVANCE};
 use rkb_core::matching::{Hints, Place};
 use rkb_core::search::{Mode, Options};
 use rkb_core::{config, kb, lock, paths, request, rerank, search, state, usage};
@@ -75,7 +72,7 @@ fn bash_command(p: &Value) -> Option<&str> {
     (p["tool_name"] == "Bash").then(|| p["tool_input"]["command"].as_str()).flatten()
 }
 
-fn hooks_config(root: &Path) -> toml::Table {
+pub(crate) fn hooks_config(root: &Path) -> toml::Table {
     std::fs::read_to_string(root.join("kb.toml"))
         .ok()
         .and_then(|t| config::parse::<config::KbConfig>(&t).ok())
@@ -210,29 +207,35 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
     let query = hooks::error_query(command, error);
     let cfg = hooks_config(&root);
     let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, &query)?;
-    let next = hits.get(1).and_then(|h| h.relevance).map_or(0.0, f64::from);
-    let Some(hit) = hits.into_iter().next() else {
-        once("nohit")?;
-        return Ok(None);
-    };
-    if hit.applies == Verdict::No {
-        once("nohit")?;
-        return Ok(None);
+    let chosen = hooks::would_inject(
+        &hits,
+        |id| kb::find(&root, id).map(|(_, t)| t).unwrap_or_default(),
+        error,
+        &hooks::Strength::from_config(&cfg),
+    );
+    let seen = chosen.is_some_and(|h| hooks::read(state, session).iter().any(|r| r["kind"] == "injected" && r["id"] == h.id.as_str()));
+    let hit = chosen.filter(|_| !seen).cloned();
+    if cfg.get("replay_log").and_then(toml::Value::as_bool) != Some(false) {
+        let name = |m: &Option<rkb_core::matching::Matched>| m.as_ref().map(|m| m.name.clone());
+        hooks::log_replay(
+            state,
+            &hooks::Replay {
+                time: rkb_core::request::now(),
+                session: session.to_string(),
+                project: name(&place.project),
+                system: name(&place.system),
+                query: query.clone(),
+                injected: hit.as_ref().map(|h| h.id.clone()),
+            },
+        )?;
     }
-    if hooks::read(state, session).iter().any(|r| r["kind"] == "injected" && r["id"] == hit.id.as_str()) {
+    let Some(hit) = hit else {
+        if !seen {
+            once("nohit")?;
+        }
         return Ok(None);
-    }
-    let get = |k: &str, default: f64| cfg.get(k).and_then(toml::Value::as_float).unwrap_or(default);
-    let t = hooks::Strength {
-        min_relevance: get("min_relevance", DEFAULT_MIN_RELEVANCE),
-        min_margin: get("min_margin", DEFAULT_MIN_MARGIN),
-        min_coverage: get("min_coverage", DEFAULT_MIN_COVERAGE),
     };
     let (_, text) = kb::find(&root, &hit.id)?;
-    if !hooks::strong_enough(hit.relevance, next, || hooks::coverage(error, &text), &t) {
-        once("nohit")?;
-        return Ok(None);
-    }
     hooks::append(state, session, &json!({ "kind": "injected", "id": hit.id }))?;
     record_use(&root, state, &hit.id, "injected", session, Some(format!("tool-failed, {}", ranked.describe())))?;
     let context = hooks::render(&[injected(&hit, missing_note(&place, &hit.path, &text))]);

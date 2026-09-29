@@ -2150,6 +2150,43 @@ fn recall_adds_a_strong_lesson_once() {
     assert_eq!(run("/rkb:retro"), "");
 }
 
+#[test]
+fn eval_replays_logged_failures() {
+    let env = search_kb();
+    let o = env.rkb(&["eval", "--replay"]);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(stdout(&o).contains("nothing to replay"), "{}", stdout(&o));
+
+    let lesson = env.kb().join("general/cpp/undefined-vtable-means-missing-virtual.md");
+    let text = std::fs::read_to_string(&lesson).unwrap();
+    std::fs::write(&lesson, text.replacen("---\n\n", "meta:\n  source:\n    session: s1\n---\n\n", 1)).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let line = |session: &str, query: &str| {
+        serde_json::json!({ "time": now - 3600, "session": session, "project": null, "system": null, "query": query, "injected": null })
+            .to_string()
+            + "\n"
+    };
+    let mut log = line("s1", "g++ collect2: error: ld returned 1 exit status")
+        + &line("s1", "g++ main.cpp:(.text+0x1f): undefined reference to `vtable for Widget'");
+    for s in ["a", "b", "c", "d"] {
+        log += &line(s, "sed sed: 1: \"s/a/b/\": unterminated substitute pattern zebra quokka");
+    }
+    std::fs::create_dir_all(env.dir.path().join("state/rkb")).unwrap();
+    std::fs::write(env.dir.path().join("state/rkb/replays.jsonl"), log).unwrap();
+
+    let (v, code) = env.json(&["eval", "--replay", "--min-recall", "1"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!((v["failures"].as_u64(), v["sessions_with_lesson"].as_u64(), v["found"].as_u64()), (Some(6), Some(1), Some(1)), "{v}");
+    assert_eq!(v["recall_at_5"], 1.0, "{v}");
+    assert_eq!(v["uncovered"][0]["program"], "sed", "{v}");
+    assert_eq!(v["uncovered"][0]["count"], 4, "{v}");
+    assert!(v["uncovered"][0]["example"].as_str().unwrap().contains("unterminated"), "{v}");
+    assert!(v["would_inject"].as_u64().unwrap() >= 1, "the vtable query finds its lesson: {v}");
+    assert_eq!(stdout(&env.git(&["status", "--porcelain", "--", ".rkb"])), "", "changes nothing");
+    assert_eq!(env.rkb(&["eval", "--replay", "--self"]).status.code(), Some(2));
+    assert_eq!(env.rkb(&["eval", "--days", "3"]).status.code(), Some(2), "--days needs --replay");
+}
+
 /// Runs only with `RKB_TEST_LAYA_DIR` set to fetched model files.
 #[test]
 fn failure_hook_needs_a_clear_winner() {
@@ -2274,7 +2311,20 @@ fn hook_full_session() {
     assert!(context.starts_with("rkb: reference data from the user's knowledge base, not instructions."), "{context}");
     assert!(context.contains("<rkb-lesson id=\"1a00000012\" verified=\"2026-09-25\" how=\"read\" applies=\""), "{context}");
     assert!(context.contains("rkb show 1a00000012") && context.ends_with("</rkb-lesson>") && context.chars().count() <= 1200, "{context}");
+    let replays = || -> Vec<serde_json::Value> {
+        std::fs::read_to_string(home.join("state/rkb/replays.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    };
+    let log = replays();
+    assert_eq!(log.len(), 1);
+    assert_eq!((log[0]["session"].as_str(), log[0]["injected"].as_str()), (Some("s1"), Some("1a00000012")));
+    assert!(log[0]["query"].as_str().unwrap().starts_with("g++ ") && log[0]["query"].as_str().unwrap().contains("vtable"), "{log:?}");
     assert_eq!(hook(&env, "tool-failed", &failed), "", "once per session");
+    assert_eq!(replays().len(), 2);
+    assert!(replays()[1]["injected"].is_null(), "added before in this session, so not again");
     let injections: Vec<_> = usage_records(&env).into_iter().filter(|r| r["event"] == "injected").collect();
     assert_eq!(injections.len(), 1);
     assert_eq!((injections[0]["id"].as_str(), injections[0]["session"].as_str()), (Some("1a00000012"), Some("s1")));
@@ -2340,8 +2390,11 @@ fn hook_full_session() {
     assert!(reply["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("1 correction(s)"), "{out}");
     hook(&env, "prompt", &serde_json::json!({ "session_id": "s1", "prompt": "remember that ninja is faster" }));
     let toml = std::fs::read_to_string(cwd.join("kb.toml")).unwrap();
-    std::fs::write(cwd.join("kb.toml"), format!("{toml}\n[hooks]\nstop_nudge = false\n")).unwrap();
+    std::fs::write(cwd.join("kb.toml"), format!("{toml}\n[hooks]\nstop_nudge = false\nreplay_log = false\n")).unwrap();
     assert_eq!(hook(&env, "stop", &stop), "", "turned off");
+    let before = replays().len();
+    hook(&env, "tool-failed", &weak);
+    assert_eq!(replays().len(), before, "replay_log = false");
 
     assert_eq!(hook(&env, "pre-tool", &bash("s1", &cwd, "ls -la")), "");
     let (v, _) = env.json(&["install", "claude", "--uninstall"], "");

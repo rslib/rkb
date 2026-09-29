@@ -5,7 +5,11 @@ use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::conditions::Verdict;
+use crate::search::Hit;
 
 use crate::error::{Result, io};
 use crate::lock;
@@ -50,6 +54,7 @@ pub fn read(state: &Path, session: &str) -> Vec<Value> {
 
 /// Deletes session files not modified for `SESSION_DAYS` days.
 pub fn cleanup(state: &Path) {
+    prune_replays(state);
     let Ok(entries) = std::fs::read_dir(sessions_dir(state)) else { return };
     let limit = Duration::from_secs(SESSION_DAYS * 24 * 3600);
     for e in entries.flatten() {
@@ -207,6 +212,73 @@ pub struct Strength {
     pub min_relevance: f64,
     pub min_margin: f64,
     pub min_coverage: f64,
+}
+
+impl Strength {
+    /// From `[hooks]` in `kb.toml`; a missing key keeps its default.
+    pub fn from_config(cfg: &toml::Table) -> Self {
+        let get = |k: &str, default: f64| cfg.get(k).and_then(toml::Value::as_float).unwrap_or(default);
+        Strength {
+            min_relevance: get("min_relevance", DEFAULT_MIN_RELEVANCE),
+            min_margin: get("min_margin", DEFAULT_MIN_MARGIN),
+            min_coverage: get("min_coverage", DEFAULT_MIN_COVERAGE),
+        }
+    }
+}
+
+/// The lesson the failed-command hook adds for these ranked hits, if any: the top hit, unless it does
+/// not apply here or is not strong enough. `text_of` reads a lesson's text for the coverage rule. The
+/// hook and `rkb eval --replay` both decide here, so they cannot drift.
+pub fn would_inject<'a>(hits: &'a [Hit], text_of: impl FnOnce(&str) -> String, error: &str, t: &Strength) -> Option<&'a Hit> {
+    let top = hits.first().filter(|h| h.applies != Verdict::No)?;
+    let next = hits.get(1).and_then(|h| h.relevance).map_or(0.0, f64::from);
+    strong_enough(top.relevance, next, || coverage(error, &text_of(&top.id)), t).then_some(top)
+}
+
+pub const REPLAYS: &str = "replays.jsonl";
+const REPLAY_DAYS: u64 = 90;
+
+/// One failure the hook searched for, kept on this machine for `rkb eval --replay`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Replay {
+    pub time: u64,
+    pub session: String,
+    pub project: Option<String>,
+    pub system: Option<String>,
+    pub query: String,
+    pub injected: Option<String>,
+}
+
+pub fn log_replay(state: &Path, r: &Replay) -> Result<()> {
+    lock::append_line(&state.join(REPLAYS), &serde_json::to_string(r).expect("replay serializes"))
+}
+
+/// The logged failures of the last `days` days, oldest first. Malformed lines are skipped.
+pub fn replays(state: &Path, days: u64) -> Vec<Replay> {
+    let cutoff = crate::request::now().saturating_sub(days * 86400);
+    std::fs::read_to_string(state.join(REPLAYS))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Replay>(l).ok())
+        .filter(|r| r.time >= cutoff)
+        .collect()
+}
+
+/// Drops log lines older than 90 days. Reads only the first line when nothing is that old.
+fn prune_replays(state: &Path) {
+    let path = state.join(REPLAYS);
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let cutoff = crate::request::now().saturating_sub(REPLAY_DAYS * 86400);
+    let old = |l: &str| serde_json::from_str::<Value>(l).ok().and_then(|v| v["time"].as_u64()).is_none_or(|t| t < cutoff);
+    if !text.lines().next().is_some_and(old) {
+        return;
+    }
+    // ponytail: a line appended between the read and the rename is lost; one replay line is cheap to lose.
+    let kept: String = text.lines().filter(|l| !old(l)).map(|l| format!("{l}\n")).collect();
+    let tmp = state.join(".replays.tmp");
+    if std::fs::write(&tmp, kept).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// Whether a failed-command hook adds its top result: when a model ranked it, its relevance and its
@@ -507,6 +579,30 @@ mod tests {
             confirm_call("rkb show x && rkb  confirm r-abcdef --choice cancel"),
             Some((Some("r-abcdef".into()), Some("cancel".into())))
         );
+    }
+
+    #[test]
+    fn replays_are_pruned_after_90_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = crate::request::now();
+        let r = |time: u64, q: &str| Replay {
+            time,
+            session: "s".into(),
+            project: None,
+            system: Some("hpc1".into()),
+            query: q.into(),
+            injected: None,
+        };
+        log_replay(dir.path(), &r(now - 91 * 86400, "old")).unwrap();
+        log_replay(dir.path(), &r(now - 10 * 86400, "recent")).unwrap();
+        assert_eq!(replays(dir.path(), 5).len(), 0);
+        assert_eq!(replays(dir.path(), 365).len(), 2, "pruning waits for cleanup");
+        cleanup(dir.path());
+        let left = replays(dir.path(), 365);
+        assert_eq!(left.iter().map(|r| r.query.as_str()).collect::<Vec<_>>(), ["recent"]);
+        assert_eq!(left[0].system.as_deref(), Some("hpc1"));
+        cleanup(dir.path());
+        assert_eq!(replays(dir.path(), 365).len(), 1);
     }
 
     #[test]
