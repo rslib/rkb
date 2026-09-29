@@ -903,6 +903,8 @@ fn held_lock_gives_locked_error() {
     assert_eq!(v["error"]["code"], "locked", "{v}");
     env.write(".git/rkb.lock", &format!("{host} 999999 {now}"));
     add_ok(&env, "cmake", PITFALL);
+    let (v, _) = env.json(&["add", "--topic", "general/cmake/"], &PITFALL.replace("# CMake cannot", "# Again, CMake cannot"));
+    assert!(v["path"].as_str().unwrap().starts_with("general/cmake/"), "the whole folder works as a topic: {v}");
 }
 
 #[test]

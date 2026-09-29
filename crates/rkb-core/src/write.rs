@@ -607,6 +607,9 @@ fn project_note_text(scope: &str, remotes: &[String], root_commit: Option<&str>)
 }
 
 fn resolve_topic(snap: &Snapshot, scope: &str, topic: &str) -> String {
+    // Agents often give the whole folder, such as `general/rust`.
+    let prefix = format!("{scope}/");
+    let topic = topic.trim_end_matches('/').strip_prefix(&prefix).unwrap_or(topic);
     for (path, data) in snap.of_kind(FileKind::FolderNote) {
         if note_role(path) != NoteRole::Topic || !path.starts_with(&format!("{scope}/")) {
             continue;
