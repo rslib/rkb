@@ -190,6 +190,7 @@ pub fn add(
     template: bool,
     given: Option<String>,
     assets: Vec<String>,
+    inbox: Option<String>,
 ) -> Result<Output, CliError> {
     let kind: Option<LessonType> = kind.map(|k| LessonType::from_name(&k).expect("clap checks the type"));
     if template {
@@ -214,7 +215,7 @@ pub fn add(
     } else {
         read_stdin()?
     };
-    let o = write::apply(&env.ctx(), &Action::Add { text, topic, assets: absolute(assets) }, &[])?;
+    let o = write::apply(&env.ctx(), &Action::Add { text, topic, assets: absolute(assets), inbox }, &[])?;
     Ok(outcome(env, o))
 }
 

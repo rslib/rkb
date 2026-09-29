@@ -19,6 +19,9 @@ pub enum Action {
         /// Image files to copy into the lesson's `.assets` folder, by absolute path.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         assets: Vec<String>,
+        /// The inbox item the lesson was distilled from, for its provenance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inbox: Option<String>,
     },
     Edit {
         id: String,

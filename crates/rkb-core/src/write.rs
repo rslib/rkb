@@ -254,7 +254,7 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
     }
     let snap = Snapshot::from_dir(ctx.root)?;
     let prepared = match action {
-        Action::Add { text, topic, assets } => add(ctx, &kb, &snap, action, approved, text, topic, assets)?,
+        Action::Add { text, topic, assets, inbox } => add(ctx, &kb, &snap, action, approved, text, topic, assets, inbox.as_deref())?,
         Action::Edit { id, text, base, assets } => edit(&kb, &snap, action, approved, id, text, base, assets)?,
         Action::Flag { id, reason } => flag(&snap, id, reason)?,
         Action::Supersede { id, by, reason } => supersede(&snap, id, by, reason)?,
@@ -367,6 +367,7 @@ pub(crate) fn add(
     text: &str,
     topic: &str,
     assets: &[String],
+    inbox: Option<&str>,
 ) -> Result<Step> {
     let images = read_assets(assets)?;
     let (fm_text, body_text, _) = lesson::split(text).map_err(|e| refused(e.message))?;
@@ -394,6 +395,7 @@ pub(crate) fn add(
     if !map.contains_key("verified") {
         map.insert("verified".into(), ctx.today.to_string().into());
     }
+    set_meta(&mut map, "source", origin(ctx.today, inbox));
     let fm: Frontmatter = serde_norway::from_value(Value::Mapping(map)).map_err(|e| refused(format!("frontmatter: {e}")))?;
 
     let scope = scope_of(&fm.when);
@@ -500,6 +502,37 @@ pub(crate) fn add(
         extra.push((format!("{folder}/{stem}.assets/{name}"), data));
     }
     Ok(Ok(Prepared { kind: "add", id, path, title, text: lesson::write(&fm, &body_text), extra, notes, message: None }))
+}
+
+/// Where a write comes from: the harness, its session and the date, and the inbox item when given.
+fn origin(date: Date, inbox: Option<&str>) -> Mapping {
+    let mut m = Mapping::new();
+    let harness = if std::env::var("CLAUDECODE").is_ok_and(|v| v == "1") {
+        Some("claude-code".to_string())
+    } else {
+        std::env::var("RKB_HARNESS").ok().filter(|v| !v.is_empty())
+    };
+    if let Some(h) = harness {
+        m.insert("harness".into(), h.into());
+    }
+    if let Some(s) = crate::usage::env_session() {
+        m.insert("session".into(), s.into());
+    }
+    m.insert("date".into(), date.to_string().into());
+    if let Some(i) = inbox {
+        m.insert("inbox".into(), i.into());
+    }
+    m
+}
+
+/// Sets `meta.<key>` in a frontmatter mapping, keeping the other `meta` keys and a value the author gave.
+fn set_meta(map: &mut Mapping, key: &str, value: Mapping) {
+    let meta = map.entry("meta".into()).or_insert_with(|| Value::Mapping(Mapping::new()));
+    if let Value::Mapping(m) = meta
+        && !m.contains_key(key)
+    {
+        m.insert(key.into(), Value::Mapping(value));
+    }
 }
 
 /// Each `--asset` file as `(file name, bytes)`: an image, with its metadata removed when it is a
@@ -673,6 +706,8 @@ fn edit(
     if out.as_bytes() == snap.files[&old.path].as_slice() && same_images {
         return Ok(Err(Outcome::Unchanged { id: id.to_string(), path: old.path.clone() }));
     }
+    new.frontmatter.meta.insert("edited_by".into(), Value::Mapping(origin(jiff::Zoned::now().date(), None)));
+    let out = lesson::write(&new.frontmatter, &new.body);
     if let Some(step) = check_labels(kb, snap, action, approved, &old.path, &o.labels, &new.frontmatter.labels)? {
         return Ok(Err(step));
     }

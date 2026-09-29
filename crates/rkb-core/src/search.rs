@@ -140,6 +140,9 @@ pub struct Hit {
     pub line: Option<(usize, String)>,
     /// How well the lesson fits the query, when a rerank model scored it.
     pub relevance: Option<f32>,
+    /// The `verified` date (`YYYY-MM-DD`) and how (`ran`, `read`, `told` or `checked`).
+    pub verified: String,
+    pub verified_how: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -208,6 +211,8 @@ fn hit(l: &Lesson, score: f64, line: Option<(usize, String)>) -> Hit {
         score,
         line,
         relevance: None,
+        verified: fm.verified.to_string(),
+        verified_how: serde_json::to_value(fm.verified_how).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default(),
     }
 }
 

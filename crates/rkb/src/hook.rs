@@ -150,6 +150,19 @@ fn tool_ok(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// A search hit as an injected lesson block.
+fn injected(h: &search::Hit, notes: Vec<String>) -> hooks::Injected<'_> {
+    hooks::Injected {
+        id: &h.id,
+        title: &h.title,
+        summary: &h.summary,
+        verified: &h.verified,
+        how: &h.verified_how,
+        applies: h.applies.as_str(),
+        notes,
+    }
+}
+
 /// Appends a use record for a hook event to this machine's usage file in the knowledge base.
 fn record_use(root: &Path, state: &Path, id: &str, event: &str, session: &str, reason: Option<String>) -> Result<()> {
     let session = (!session.is_empty()).then(|| session.to_string());
@@ -187,11 +200,7 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
     }
     hooks::append(state, session, &json!({ "kind": "injected", "id": hit.id }))?;
     record_use(&root, state, &hit.id, "injected", session, Some(format!("tool-failed, {}", ranked.describe())))?;
-    let summary = if hit.summary.is_empty() { String::new() } else { format!(" - {}", hit.summary) };
-    let context = format!(
-        "rkb: lesson {} may explain this failure: {}{summary}\nRead it with `rkb show {}` and check that it applies before acting on it.",
-        hit.id, hit.title, hit.id
-    );
+    let context = hooks::render(&[injected(&hit, vec![])]);
     Ok(Some(reply("PostToolUseFailure", "additionalContext", json!(context))))
 }
 
@@ -260,14 +269,13 @@ fn recall(p: &Value, state: &Path, session: &str, text: &str) -> Result<Option<S
     if strong.is_empty() {
         return Ok(None);
     }
-    let mut lines = vec!["rkb: a lesson that may help with this message; check that it applies before acting on it:".to_string()];
+    let mut blocks = vec![];
     for h in &strong {
         hooks::append(state, session, &json!({ "kind": "injected", "id": h.id }))?;
         record_use(&root, state, &h.id, "injected", session, Some(format!("recall, {}", ranked.describe())))?;
-        let summary = if h.summary.is_empty() { String::new() } else { format!(" - {}", h.summary) };
-        lines.push(format!("- {} {}{summary} (`rkb show {}`)", h.id, h.title, h.id));
+        blocks.push(injected(h, vec![]));
     }
-    Ok(Some(reply("UserPromptSubmit", "additionalContext", json!(lines.join("\n")))))
+    Ok(Some(reply("UserPromptSubmit", "additionalContext", json!(hooks::render(&blocks)))))
 }
 
 fn stop(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {
