@@ -1201,6 +1201,27 @@ fn doctor_healthy_then_problems() {
 }
 
 #[test]
+fn doctor_warns_on_a_mode_that_never_prompts() {
+    let env = Env::new();
+    env.init();
+    let home = env.dir.path();
+    std::fs::create_dir_all(home.join(".claude/plugins")).unwrap();
+    std::fs::write(home.join(".claude/plugins/installed_plugins.json"), r#"{"version":2,"plugins":{"rkb@rkb":[{"version":"x"}]}}"#)
+        .unwrap();
+    let finding = |env: &Env| {
+        let (v, code) = env.json(&["doctor"], "");
+        (v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "claude permissions").cloned(), code)
+    };
+    std::fs::write(home.join(".claude/settings.json"), r#"{"permissions":{"allow":[]}}"#).unwrap();
+    assert_eq!(finding(&env).0, None);
+    std::fs::write(home.join(".claude/settings.json"), r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#).unwrap();
+    let (c, code) = finding(&env);
+    let c = c.expect("permission check");
+    assert_eq!((c["status"].as_str(), code), (Some("warn"), Some(0)), "{c}");
+    assert!(c["detail"].as_str().unwrap().contains("bypassPermissions") && c["fix"].as_str().unwrap().contains("rkb confirm"), "{c}");
+}
+
+#[test]
 fn doctor_reports_missing_root_commit() {
     let env = fixture_kb();
     let repo = project_repo(&env, "https://github.com/llnl/dftracer");
@@ -2280,6 +2301,27 @@ fn hook_full_session() {
     }
     let out = hook(&env, "pre-tool", &bash("s1", &cwd, "rkb confirm"));
     assert!(out.contains("\"ask\""), "{out}");
+    let in_mode = |mode: &str, command: &str| {
+        let mut p = bash("s1", &cwd, command);
+        p["permission_mode"] = mode.into();
+        hook(&env, "pre-tool", &p)
+    };
+    let command = format!("rkb confirm {req} --choice uninstall");
+    for mode in ["bypassPermissions", "dontAsk"] {
+        let out = in_mode(mode, &command);
+        let reply: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert_eq!(reply["hookSpecificOutput"]["permissionDecision"], "deny", "{mode}");
+        let reason = reply["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
+        assert!(
+            reason.contains(question)
+                && reason.contains(&format!("run: rkb confirm {req} --choice \"uninstall\""))
+                && reason.contains(mode),
+            "{reason}"
+        );
+    }
+    assert!(in_mode("auto", &command).contains("\"ask\""));
+    assert!(in_mode("acceptEdits", &command).contains("\"ask\""));
+    assert_eq!(in_mode("bypassPermissions", "ls -la"), "");
 
     let (v, _) = env.json(&["review", "--signals"], "");
     assert_eq!(v["signals"]["repeated"], 0, "{v}");

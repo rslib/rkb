@@ -97,7 +97,22 @@ pub fn run(root: &Path, place: &Place, state_dir: &Path, config_dir: &Path, env:
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
     out.extend(skill_checks(&home));
     out.extend(hook_checks(&home, state_dir));
+    out.extend(permission_check(&home));
     out
+}
+
+/// A warning when Claude Code's default permission mode never shows the `rkb confirm` question to a person.
+pub fn permission_check(home: &Path) -> Option<Check> {
+    crate::install::installed_plugin_version(home)?;
+    let text = std::fs::read_to_string(home.join(".claude/settings.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let mode = v["permissions"]["defaultMode"].as_str().filter(|m| crate::hooks::mode_skips_prompts(Some(m)))?;
+    Some(check(
+        "claude permissions",
+        Level::Warn,
+        format!("Claude Code's default mode is {mode}, so the agent is denied `rkb confirm`"),
+        Some("the user runs each `rkb confirm` the agent shows, in a separate terminal window".into()),
+    ))
 }
 
 /// For each harness with rkb's hooks installed: whether they match this rkb, and when the harness last called one.

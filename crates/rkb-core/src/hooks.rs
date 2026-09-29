@@ -177,6 +177,29 @@ pub fn confirm_call(command: &str) -> Option<(Option<String>, Option<String>)> {
     Some((id, choice))
 }
 
+/// Claude Code permission modes in which a hook's `ask` never reaches a person.
+pub fn mode_skips_prompts(mode: Option<&str>) -> bool {
+    matches!(mode, Some("bypassPermissions" | "dontAsk"))
+}
+
+/// The deny reason for `rkb confirm` in a mode that does not prompt: the question and the command a person must run.
+pub fn confirm_deny_reason(mode: &str, id: Option<&str>, question: Option<&str>, choice: Option<&str>) -> String {
+    let mut command = format!("rkb confirm {}", id.unwrap_or("<request id>"));
+    if let Some(c) = choice {
+        command.push_str(&format!(" --choice \"{}\"", c.replace('"', "\\\"")));
+    }
+    let mut out = format!(
+        "rkb confirm needs a person, and Claude Code does not ask in {mode} mode. Show the user this question and ask them to run: {command} in a separate terminal window"
+    );
+    if let Some(q) = question {
+        out.push_str(&format!(" -- question: {q}"));
+    }
+    if let Some(c) = choice {
+        out.push_str(&format!(" -- choice: {c}"));
+    }
+    out
+}
+
 /// Whether a failed-command hook adds its top result: a model's relevance decides when a model
 /// ranked it, and the coverage rule decides for BM25.
 pub fn strong_enough(relevance: Option<f32>, coverage: impl FnOnce() -> f64, min_relevance: f64, min_coverage: f64) -> bool {
@@ -475,6 +498,17 @@ mod tests {
             confirm_call("rkb show x && rkb  confirm r-abcdef --choice cancel"),
             Some((Some("r-abcdef".into()), Some("cancel".into())))
         );
+    }
+
+    #[test]
+    fn confirm_deny_reasons() {
+        assert!(mode_skips_prompts(Some("bypassPermissions")) && mode_skips_prompts(Some("dontAsk")));
+        assert!(!mode_skips_prompts(Some("auto")) && !mode_skips_prompts(Some("default")) && !mode_skips_prompts(None));
+        assert_eq!(
+            confirm_deny_reason("bypassPermissions", Some("r-4f2a9c"), Some("Create general/cmak?"), Some("continue")),
+            "rkb confirm needs a person, and Claude Code does not ask in bypassPermissions mode. Show the user this question and ask them to run: rkb confirm r-4f2a9c --choice \"continue\" in a separate terminal window -- question: Create general/cmak? -- choice: continue"
+        );
+        assert!(confirm_deny_reason("dontAsk", None, None, None).contains("run: rkb confirm <request id> in a separate"));
     }
 
     #[test]

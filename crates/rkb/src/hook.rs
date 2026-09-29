@@ -113,7 +113,13 @@ fn pre_tool(p: &Value, state: &Path) -> Result<Option<String>> {
         return Ok(None);
     }
     let Some((id, choice)) = hooks::confirm_call(command) else { return Ok(None) };
-    let question = id.and_then(|id| request::load(&state.join("requests"), &id).ok()).map(|r| r.question);
+    let question = id.as_ref().and_then(|id| request::load(&state.join("requests"), id).ok()).map(|r| r.question);
+    let mode = p["permission_mode"].as_str();
+    if hooks::mode_skips_prompts(mode) {
+        let reason = hooks::confirm_deny_reason(mode.unwrap_or_default(), id.as_deref(), question.as_deref(), choice.as_deref());
+        let out = json!({ "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason });
+        return Ok(Some(json!({ "hookSpecificOutput": out }).to_string()));
+    }
     let reason = match (question, choice) {
         (Some(q), Some(c)) => format!("rkb confirm: {q} -- choice: {c}"),
         (Some(q), None) => format!("rkb confirm: {q}"),

@@ -51,7 +51,7 @@ You may write, edit, merge, supersede and archive single lessons without asking:
 
 1. Show the question and the options to the user. Do not choose for them.
 2. Wait for their answer.
-3. Run `rkb confirm <request> --choice "<option they chose>"`. When it returns `needs_terminal`, tell the user to run the command in a separate terminal window (the `fix` line has it). You cannot answer the terminal prompt yourself, and Claude Code's `!` prefix has no terminal either, so do not suggest `! rkb confirm`.
+3. Run `rkb confirm <request> --choice "<option they chose>"`. When it returns `needs_terminal`, tell the user to run the command in a separate terminal window (the `fix` line has it). You cannot answer the terminal prompt yourself, and Claude Code's `!` prefix has no terminal either, so do not suggest `! rkb confirm`. When Claude Code refuses `rkb confirm` and says a person must run it, show the user the question and that exact command, and wait until they say it is done.
 
 A request expires after one hour. Run the original command again after that.
 
