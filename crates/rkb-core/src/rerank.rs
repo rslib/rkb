@@ -66,8 +66,9 @@ impl Settings {
 pub struct Ranked {
     pub backend: String,
     pub device: Option<String>,
-    /// One relevance per item from a model; `None` when BM25 ranked them.
-    pub scores: Option<Vec<f32>>,
+    /// One relevance per item from a model; `None` when BM25 ranked them. An item the model was not
+    /// allowed to see has no relevance.
+    pub scores: Option<Vec<Option<f32>>>,
     /// Backends tried before, with the reason each was skipped.
     pub skipped: Vec<(String, String)>,
 }
@@ -119,7 +120,9 @@ pub fn run(
         let reason = match blocked.get(&name) {
             Some(reason) => reason.clone(),
             None => match ask(&name, opener, query, items, timeout) {
-                Ok((scores, device)) => return Ok(Ranked { backend: name, device, scores: Some(scores), skipped }),
+                Ok((scores, device)) => {
+                    return Ok(Ranked { backend: name, device, scores: Some(scores.into_iter().map(Some).collect()), skipped });
+                }
                 Err(reason) => reason,
             },
         };
@@ -210,7 +213,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.backend, "fast");
-        assert_eq!(r.scores.as_deref(), Some(&[0.0, 0.1, 0.2][..]));
+        assert_eq!(r.scores.as_deref(), Some(&[Some(0.0), Some(0.1), Some(0.2)][..]));
         assert_eq!(r.describe(), "fast (cpu) (missing: not configured; broken: model crashed)");
     }
 

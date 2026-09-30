@@ -229,21 +229,27 @@ const CLOSE_INHERITED_THEN_WARM: &str =
 
 const JEV: &str = "jev";
 
-/// Why Jev may not see this query, when it may not: a candidate `[sinks.jev]` does not allow (or no
-/// such sink), or the leak scan matches the query, which holds a hook's error lines, or a candidate.
-fn jev_block(root: &Path, query: &str, hits: &[Hit], items: &[String]) -> Option<String> {
+/// Which candidates Jev may see: those `[sinks.jev]` allows and the leak scan passes. An error names
+/// why Jev may see nothing: no `[sinks.jev]`, the leak scan matches the query (which holds a hook's
+/// error lines), or no candidate is allowed.
+fn jev_allowed(root: &Path, query: &str, hits: &[Hit], items: &[String]) -> Result<Vec<bool>, String> {
     let kb: KbConfig = std::fs::read_to_string(root.join("kb.toml")).ok().and_then(|t| config::parse(&t).ok()).unwrap_or_default();
-    let Some(sink) = kb.sinks.get(JEV) else { return Some("kb.toml has no [sinks.jev]".into()) };
-    let Ok(snap) = Snapshot::from_dir(root) else { return Some("the lessons' labels could not be read".into()) };
-    if hits.iter().any(|h| !config::sink_allows(&sink.allow, &rkb_core::write::effective_at(&snap, &h.path))) {
-        return Some("a candidate is not allowed by sinks.jev".into());
-    }
+    let Some(sink) = kb.sinks.get(JEV) else { return Err("kb.toml has no [sinks.jev]".into()) };
+    let Ok(snap) = Snapshot::from_dir(root) else { return Err("the lessons' labels could not be read".into()) };
     let env = rkb_core::lint::LintEnv::from_process();
     let scanner = LeakScanner::new(&kb.leak, env.user.as_deref(), env.home.as_deref());
-    if !scanner.scan(query).is_empty() || items.iter().any(|t| !scanner.scan(t).is_empty()) {
-        return Some("the leak scan matched the query or a candidate".into());
+    if !scanner.scan(query).is_empty() {
+        return Err("the leak scan matched the query".into());
     }
-    None
+    let allowed: Vec<bool> = hits
+        .iter()
+        .zip(items)
+        .map(|(h, t)| config::sink_allows(&sink.allow, &rkb_core::write::effective_at(&snap, &h.path)) && scanner.scan(t).is_empty())
+        .collect();
+    if !allowed.contains(&true) && !hits.is_empty() {
+        return Err("no candidate is allowed by sinks.jev or passes the leak scan".into());
+    }
+    Ok(allowed)
 }
 
 /// The rerank chain with this build's backends. A laya GPU call that ran out of time was most likely
@@ -260,8 +266,31 @@ pub fn run(
 ) -> rkb_core::error::Result<Ranked> {
     let items = search::rerank_items(root, hits);
     let wants_jev = only.map_or_else(|| settings.chain.iter().any(|b| b == JEV), |o| o == JEV);
-    let blocked: BTreeMap<String, String> =
-        if wants_jev { jev_block(root, query, hits, &items).map(|r| (JEV.to_string(), r)).into_iter().collect() } else { BTreeMap::new() };
+    let mut blocked = BTreeMap::new();
+    if wants_jev {
+        match jev_allowed(root, query, hits, &items) {
+            Err(reason) => {
+                blocked.insert(JEV.to_string(), reason);
+            }
+            // Behind another backend Jev must not run first, so it sees all candidates or none.
+            Ok(allowed) if allowed.contains(&false) && only != Some(JEV) && settings.chain.first().is_none_or(|b| b != JEV) => {
+                blocked.insert(JEV.to_string(), "a candidate is not allowed by sinks.jev".into());
+            }
+            // Jev rates the lessons it may see; the others keep their BM25 place with no relevance.
+            Ok(allowed) if allowed.contains(&false) => {
+                let seen: Vec<String> = items.iter().zip(&allowed).filter(|(_, a)| **a).map(|(t, _)| t.clone()).collect();
+                let r = rerank::run(settings, Some(JEV), &opener(settings), query, &seen, timeout, &BTreeMap::new())?;
+                if r.backend == JEV {
+                    let mut rated = r.scores.clone().unwrap_or_default().into_iter();
+                    let scores = allowed.iter().map(|a| if *a { rated.next().flatten() } else { None }).collect();
+                    return Ok(Ranked { scores: Some(scores), ..r });
+                }
+                let reason = r.skipped.into_iter().find(|(b, _)| b == JEV).map_or_else(|| "did not answer".into(), |(_, r)| r);
+                blocked.insert(JEV.to_string(), reason);
+            }
+            Ok(_) => {}
+        }
+    }
     let ranked = rerank::run(settings, only, &opener(settings), query, &items, timeout, &blocked)?;
     #[cfg(feature = "laya")]
     if cfg!(target_os = "macos") && ranked.skipped.iter().any(|(b, r)| b == "laya" && r.starts_with("timeout")) && !cpu_forced(settings) {

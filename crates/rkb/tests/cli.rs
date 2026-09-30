@@ -4511,7 +4511,7 @@ fn jev_falls_back_and_sends_nothing_it_may_not() {
         ),
     );
     let (v, _) = jev_search(&env, &url, "git rebase", &[]);
-    assert_eq!(v["ranked_by"], "bm25 (jev: a candidate is not allowed by sinks.jev)", "{v}");
+    assert_eq!(v["ranked_by"], "bm25 (jev: no candidate is allowed by sinks.jev or passes the leak scan)", "{v}");
     assert_eq!(log.lock().unwrap().len(), 1, "nothing sent");
 
     env.write("kb.toml", &toml);
@@ -4707,4 +4707,40 @@ fn hooks_do_nothing_inside_an_observer_run() {
     }
     assert!(inbox_items(&env).is_empty());
     assert!(!env.dir.path().join("state/rkb/heartbeat").exists());
+}
+
+#[test]
+fn jev_rates_only_the_candidates_it_may_see() {
+    let env = search_kb();
+    set_chain(&env, "chain = [\"jev\", \"bm25\"]");
+    jev_config(&env, "[jev]\napi_key = \"k\"\n", 0o600);
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    let public_only = toml.replace(
+        "[sinks.jev]\nallow = { sensitivity = [\"public\", \"internal\"] }",
+        "[sinks.jev]\nallow = { sensitivity = [\"public\"] }",
+    );
+    env.write("kb.toml", &public_only);
+    let path = "general/git/squash-fixups-with-autosquash.md";
+    let text = std::fs::read_to_string(env.kb().join(path)).unwrap();
+    env.write(path, &text.replacen("tags:", "labels:\n  sensitivity: public\ntags:", 1));
+    let (bm25, _) = env.json(&["search", "git rebase", "--no-model"], "");
+    let (url, log) = fake_jev(|_| (200, serde_json::json!({ "answers": { "lesson_0": { "type": "noul", "noul": 0.9 } } }).to_string()));
+    let (v, _) = jev_search(&env, &url, "git rebase", &[]);
+    assert_eq!(v["ranked_by"], "jev", "{v}");
+    let body = log.lock().unwrap()[0].1.clone();
+    let state = body["state"].as_str().unwrap();
+    assert!(state.contains("Squash fixups") && !state.contains("autostash") && !state.contains("[1]"), "only the public lesson: {state}");
+    let rows = |v: &serde_json::Value| v["results"].as_array().unwrap().clone();
+    let (b, j) = (rows(&bm25), rows(&v));
+    assert_eq!(b.len(), j.len());
+    for (x, y) in b.iter().zip(&j) {
+        assert_eq!(x["id"], y["id"], "one rated lesson keeps every place: {b:?} {j:?}");
+        let public = y["path"].as_str().unwrap() == path;
+        assert_eq!(y["relevance"].is_null(), !public, "{y}");
+    }
+
+    set_chain(&env, "chain = [\"laya\", \"jev\", \"bm25\"]");
+    let (v, _) = jev_search(&env, &url, "git rebase", &[("RKB_LAYA_DIR", "/nonexistent")]);
+    assert!(v["ranked_by"].as_str().unwrap().contains("jev: a candidate is not allowed by sinks.jev"), "behind laya: {v}");
+    assert_eq!(log.lock().unwrap().len(), 1, "nothing more sent");
 }

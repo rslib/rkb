@@ -237,12 +237,19 @@ pub fn rerank_items(root: &Path, hits: &[Hit]) -> Vec<String> {
 }
 
 /// Gives the first `scores.len()` hits their relevance and sorts them by it; the rest keep their BM25 order.
-pub fn apply_relevance(hits: &mut [Hit], scores: &[f32]) {
+/// Sets each hit's relevance and sorts the rated hits among their own places, highest first. A hit
+/// the model did not rate keeps its BM25 place and has no relevance.
+pub fn apply_relevance(hits: &mut [Hit], scores: &[Option<f32>]) {
     let n = scores.len().min(hits.len());
     for (h, s) in hits.iter_mut().zip(scores) {
-        h.relevance = Some(*s);
+        h.relevance = *s;
     }
-    hits[..n].sort_by(|a, b| b.relevance.unwrap_or(0.0).total_cmp(&a.relevance.unwrap_or(0.0)));
+    let places: Vec<usize> = (0..n).filter(|&i| hits[i].relevance.is_some()).collect();
+    let mut rated: Vec<Hit> = places.iter().map(|&i| hits[i].clone()).collect();
+    rated.sort_by(|a, b| b.relevance.unwrap_or(0.0).total_cmp(&a.relevance.unwrap_or(0.0)));
+    for (i, h) in places.into_iter().zip(rated) {
+        hits[i] = h;
+    }
 }
 
 fn when_text(v: &Value) -> String {
@@ -660,5 +667,28 @@ mod tests {
         assert_eq!(find(r, "shallwo clone", 10).unwrap()[0].id, "0000000002");
         assert_eq!(find(r, "0000000002", 10).unwrap()[0].id, "0000000002");
         assert!(find(r, "zzzz qqqq", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unrated_hits_keep_their_place() {
+        let h = |id: &str| Hit {
+            id: id.into(),
+            kind: crate::lesson::LessonType::Fact,
+            title: String::new(),
+            path: String::new(),
+            status: crate::lesson::Status::Active,
+            applies: Verdict::Yes,
+            summary: String::new(),
+            score: 0.0,
+            line: None,
+            relevance: None,
+            verified: String::new(),
+            verified_how: String::new(),
+        };
+        let mut hits = vec![h("a"), h("b"), h("c"), h("d")];
+        apply_relevance(&mut hits, &[Some(0.2), None, Some(0.9)]);
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["c", "b", "a", "d"], "b keeps place 2, and d was never rated");
+        assert_eq!(hits.iter().map(|h| h.relevance).collect::<Vec<_>>(), [Some(0.9), None, Some(0.2), None]);
     }
 }
