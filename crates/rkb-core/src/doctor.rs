@@ -95,6 +95,7 @@ pub fn run(root: &Path, place: &Place, state_dir: &Path, config_dir: &Path, env:
     }
     out.push(trust_check(config_dir));
     out.push(observer_check(config_dir, state_dir));
+    out.extend(recall_check(root, state_dir));
     for (session, g) in crate::write::graces(state_dir) {
         let until =
             jiff::Timestamp::from_second(g.until as i64).map(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string());
@@ -371,6 +372,47 @@ fn root_commit_missing(root: &Path, place: &Place) -> Option<Check> {
     })
 }
 
+/// How the hooks' rankings went in the last 7 days: a warning when more than a quarter fell back
+/// from a backend, with the time the model rankings took, so the hook time limit can be tuned.
+pub fn recall_check(root: &Path, state_dir: &Path) -> Option<Check> {
+    let lines = crate::hooks::rankings(state_dir, 7);
+    if lines.is_empty() {
+        return None;
+    }
+    let skipped = |l: &serde_json::Value| l["skipped"].as_array().is_some_and(|a| !a.is_empty());
+    let timed_out = |l: &serde_json::Value| {
+        l["skipped"].as_array().is_some_and(|a| a.iter().any(|r| r.as_str().is_some_and(|r| r.contains(": timeout"))))
+    };
+    let total = lines.len();
+    let fallbacks = lines.iter().filter(|l| skipped(l)).count();
+    let timeouts = lines.iter().filter(|l| timed_out(l)).count();
+    let mut ms: Vec<u64> = lines.iter().filter(|l| l["backend"] != crate::rerank::BM25).filter_map(|l| l["ms"].as_u64()).collect();
+    ms.sort_unstable();
+    let pct = |p: usize| ms.get((ms.len() * p / 100).min(ms.len().saturating_sub(1))).copied();
+    let limit = std::fs::read_to_string(root.join("kb.toml"))
+        .ok()
+        .and_then(|t| config::parse::<config::KbConfig>(&t).ok())
+        .and_then(|c| c.hooks)
+        .and_then(|h| h.get("hook_timeout_ms").and_then(toml::Value::as_integer))
+        .map_or(crate::hooks::DEFAULT_HOOK_TIMEOUT_MS, |v| v.max(0) as u64);
+    let times = match (pct(50), pct(90)) {
+        (Some(a), Some(b)) => format!("; model rankings took {a} ms (median), {b} ms (90th percentile)"),
+        _ => String::new(),
+    };
+    let detail =
+        format!("{total} hook searches in 7 days, {fallbacks} fell back from a backend ({timeouts} after the {limit} ms limit){times}");
+    if total >= 10 && fallbacks * 4 > total {
+        let fix = if timeouts * 2 >= fallbacks {
+            let to = pct(90).map_or(limit * 2, |p| (p + 200).max(limit + 100));
+            format!("set hook_timeout_ms = {to} under [hooks] in kb.toml")
+        } else {
+            format!("see the skipped reasons in {}", state_dir.join(crate::hooks::RANKINGS).display())
+        };
+        return Some(check("hook rankings", Level::Warn, detail, Some(fix)));
+    }
+    Some(check("hook rankings", Level::Ok, detail, None))
+}
+
 /// The observer: off without a command, a warning when it is not approved or its last 3 runs failed.
 pub fn observer_check(config_dir: &Path, state_dir: &Path) -> Check {
     use crate::observer;
@@ -543,5 +585,35 @@ mod tests {
         .unwrap();
         let c = observer_check(&config, &state);
         assert!(c.detail.contains("last run 2026-") && c.detail.ends_with("via haiku (sonnet: exit 1)"), "{}", c.detail);
+    }
+
+    #[test]
+    fn hook_rankings_warn_on_timeouts() {
+        let d = tempfile::tempdir().unwrap();
+        let (root, state) = (d.path().join("kb"), d.path().join("state"));
+        std::fs::create_dir_all(&state).unwrap();
+        assert_eq!(recall_check(&root, &state), None, "no log, no line");
+        let now = crate::request::now();
+        let line = |backend: &str, skipped: &str, ms: u64| {
+            format!("{{\"time\":{now},\"hook\":\"recall\",\"backend\":\"{backend}\",\"skipped\":[{skipped}],\"ms\":{ms}}}\n")
+        };
+        let mut log = String::new();
+        for i in 0..8 {
+            log += &line("jev", "", 200 + i * 10);
+        }
+        log += &line("bm25", "\"jev: timeout after 500 ms\"", 501);
+        let c = recall_check(&root, &state);
+        assert!(c.is_none(), "the log file is not written yet");
+        std::fs::write(state.join(crate::hooks::RANKINGS), &log).unwrap();
+        let c = recall_check(&root, &state).unwrap();
+        assert_eq!(c.level, Level::Ok, "{}", c.detail);
+        for _ in 0..4 {
+            log += &line("bm25", "\"jev: timeout after 500 ms\"", 501);
+        }
+        std::fs::write(state.join(crate::hooks::RANKINGS), &log).unwrap();
+        let c = recall_check(&root, &state).unwrap();
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.detail.starts_with("13 hook searches in 7 days, 5 fell back from a backend (5 after the 500 ms limit)"), "{}", c.detail);
+        assert_eq!(c.fix.as_deref(), Some("set hook_timeout_ms = 600 under [hooks] in kb.toml"), "90th percentile 270 + 200, at least 600");
     }
 }

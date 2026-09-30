@@ -214,7 +214,7 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
     kb::open(&root)?;
     let query = hooks::error_query(command, error);
     let cfg = hooks_config(&root);
-    let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, &query)?;
+    let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, &query, "failure")?;
     let chosen = hooks::would_inject(
         &hits,
         |id| kb::find(&root, id).map(|(_, t)| t).unwrap_or_default(),
@@ -284,6 +284,7 @@ fn ranked_search(
     state: &Path,
     cfg: &toml::Table,
     query: &str,
+    hook: &str,
 ) -> Result<(Vec<search::Hit>, rerank::Ranked, Place)> {
     let place = state::locate(root, &cwd(p), &Hints::default(), state)?;
     let facts = Facts::gather(root, &place, &[]);
@@ -291,7 +292,11 @@ fn ranked_search(
     let opts = Options { all: false, every_status: false, limit: settings.top.max(1), probes: rkb_core::search::ProbeMode::Cached };
     let mut found = search::search(root, &place, &facts, &Mode::Ranked(query.to_string()), &opts)?;
     let timeout = cfg.get("hook_timeout_ms").and_then(toml::Value::as_integer).map_or(DEFAULT_HOOK_TIMEOUT_MS, |v| v.max(0) as u64);
+    let start = std::time::Instant::now();
     let ranked = crate::rerankers::run(root, &settings, None, query, &found.hits, std::time::Duration::from_millis(timeout))?;
+    if settings.chain.iter().any(|b| b != rerank::BM25) && !found.hits.is_empty() {
+        hooks::log_ranking(state, hook, &ranked, start.elapsed().as_millis() as u64);
+    }
     if let Some(scores) = &ranked.scores {
         search::apply_relevance(&mut found.hits, scores);
     }
@@ -299,7 +304,8 @@ fn ranked_search(
 }
 
 fn prompt(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {
-    let text = p["prompt"].as_str().unwrap_or("");
+    let text = hooks::typed_text(p["prompt"].as_str().unwrap_or(""));
+    let text = text.as_str();
     let (correction, remember) = hooks::prompt_signals(text);
     if correction {
         hooks::append(state, session, &json!({ "kind": "correction" }))?;
@@ -321,7 +327,7 @@ fn recall(p: &Value, state: &Path, session: &str, text: &str) -> Result<Option<S
     if cfg.get("recall").and_then(toml::Value::as_bool) == Some(false) {
         return Ok(None);
     }
-    let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, text)?;
+    let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, text, "recall")?;
     let (min_default, margin_default) = hooks::recall_defaults(&ranked.backend);
     let min = cfg.get("recall_min_relevance").and_then(toml::Value::as_float).unwrap_or(min_default);
     let margin = cfg.get("recall_min_margin").and_then(toml::Value::as_float).unwrap_or(margin_default);

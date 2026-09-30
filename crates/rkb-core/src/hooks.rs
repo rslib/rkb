@@ -54,7 +54,8 @@ pub fn read(state: &Path, session: &str) -> Vec<Value> {
 
 /// Deletes session files not modified for `SESSION_DAYS` days.
 pub fn cleanup(state: &Path) {
-    prune_replays(state);
+    prune_log(state, REPLAYS);
+    prune_log(state, RANKINGS);
     let Ok(entries) = std::fs::read_dir(sessions_dir(state)) else { return };
     let limit = Duration::from_secs(SESSION_DAYS * 24 * 3600);
     for e in entries.flatten() {
@@ -143,6 +144,66 @@ fn line_coverage(line: &str, text: &HashSet<String>) -> f64 {
         return 0.0;
     }
     q.iter().filter(|w| text.contains(*w)).count() as f64 / q.len() as f64
+}
+
+/// Tags of blocks a harness writes into the prompt text: agent hand-backs, task notifications, shell
+/// output, slash-command markup, reminders and pasted text. None of it is what the user typed.
+const HARNESS_TAGS: [&str; 13] = [
+    "agent-message",
+    "task-notification",
+    "system-reminder",
+    "bash-input",
+    "bash-stdout",
+    "bash-stderr",
+    "command-message",
+    "command-name",
+    "command-args",
+    "local-command-stdout",
+    "local-command-stderr",
+    "local-command-caveat",
+    "pasted_content",
+];
+
+static HARNESS_BLOCKS: LazyLock<Vec<Regex>> =
+    LazyLock::new(|| HARNESS_TAGS.iter().map(|t| Regex::new(&format!(r"(?s)<{t}\b[^>]*>.*?</{t}\b[^>]*>")).unwrap()).collect());
+static HARNESS_LINES: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*(Another Claude session sent a message:.*|\[Request interrupted by user.*|\[SYSTEM NOTIFICATION.*)$").unwrap()
+});
+
+/// The part of a prompt the user typed: harness-written blocks and notices removed. Signals and
+/// recall look only at this, so a sub-agent's report or a task notice is never read as the user's words.
+pub fn typed_text(prompt: &str) -> String {
+    let mut text = prompt.to_string();
+    for re in HARNESS_BLOCKS.iter() {
+        text = re.replace_all(&text, "").into_owned();
+    }
+    HARNESS_LINES.replace_all(&text, "").trim().to_string()
+}
+
+/// Rankings the hooks asked for, one line each, for `rkb doctor`.
+pub const RANKINGS: &str = "rankings.jsonl";
+
+/// Logs one hook ranking: which backend ranked, which were skipped and why, and how long it took.
+pub fn log_ranking(state: &Path, hook: &str, ranked: &crate::rerank::Ranked, ms: u64) {
+    let line = serde_json::json!({
+        "time": crate::request::now(),
+        "hook": hook,
+        "backend": ranked.backend,
+        "skipped": ranked.skipped.iter().map(|(b, r)| format!("{b}: {r}")).collect::<Vec<_>>(),
+        "ms": ms,
+    });
+    let _ = lock::append_line(&state.join(RANKINGS), &line.to_string());
+}
+
+/// The logged hook rankings of the last `days` days.
+pub fn rankings(state: &Path, days: u64) -> Vec<Value> {
+    let cutoff = crate::request::now().saturating_sub(days * 86400);
+    std::fs::read_to_string(state.join(RANKINGS))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["time"].as_u64().is_some_and(|t| t >= cutoff))
+        .collect()
 }
 
 static CORRECTION: LazyLock<Regex> = LazyLock::new(|| {
@@ -267,8 +328,8 @@ pub fn replays(state: &Path, days: u64) -> Vec<Replay> {
 }
 
 /// Drops log lines older than 90 days. Reads only the first line when nothing is that old.
-fn prune_replays(state: &Path) {
-    let path = state.join(REPLAYS);
+fn prune_log(state: &Path, name: &str) {
+    let path = state.join(name);
     let Ok(text) = std::fs::read_to_string(&path) else { return };
     let cutoff = crate::request::now().saturating_sub(REPLAY_DAYS * 86400);
     let old = |l: &str| serde_json::from_str::<Value>(l).ok().and_then(|v| v["time"].as_u64()).is_none_or(|t| t < cutoff);
@@ -277,7 +338,7 @@ fn prune_replays(state: &Path) {
     }
     // ponytail: a line appended between the read and the rename is lost; one replay line is cheap to lose.
     let kept: String = text.lines().filter(|l| !old(l)).map(|l| format!("{l}\n")).collect();
-    let tmp = state.join(".replays.tmp");
+    let tmp = state.join(format!(".{name}.tmp"));
     if std::fs::write(&tmp, kept).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
     }
@@ -653,5 +714,18 @@ mod tests {
         assert!(!clear_winner(0.86, 0.83, 0.85, 0.05), "wrong lesson on top, no clear lead");
         assert!(!clear_winner(0.88, 0.86, 0.85, 0.05), "two close lessons");
         assert!(!clear_winner(0.77, 0.66, 0.85, 0.05), "a question no lesson answers");
+    }
+
+    #[test]
+    fn typed_text_drops_harness_blocks() {
+        let handback = "Another Claude session sent a message:\n<agent-message from=\"a79\">\n  The hooks record correction/remember signals.\n</agent-message>";
+        assert_eq!(typed_text(handback), "");
+        assert_eq!(prompt_signals(&typed_text(handback)), (false, false));
+        let notice = "<task-notification>\n<task-id>x</task-id>\n<summary>remember this</summary>\n</task-notification>\nplease remember to run clippy";
+        assert_eq!(typed_text(notice), "please remember to run clippy");
+        let pasted = "why is this not in config.toml?\n\n<pasted_content id=\"37f5\">\nnote that x\n</pasted_content id=\"37f5\">";
+        assert_eq!(typed_text(pasted), "why is this not in config.toml?");
+        assert_eq!(typed_text("<bash-input> rkb approve observer</bash-input>"), "");
+        assert_eq!(typed_text("remember: cmake needs ZLIB_ROOT"), "remember: cmake needs ZLIB_ROOT");
     }
 }

@@ -4778,3 +4778,26 @@ fn jev_rates_only_the_candidates_it_may_see() {
     assert!(v["ranked_by"].as_str().unwrap().contains("jev: a candidate is not allowed by sinks.jev"), "behind laya: {v}");
     assert_eq!(log.lock().unwrap().len(), 1, "nothing more sent");
 }
+
+#[test]
+fn prompt_hook_reads_only_what_the_user_typed_and_logs_rankings() {
+    let env = search_kb();
+    set_chain(&env, "chain = [\"laya\", \"bm25\"]");
+    let sessions = env.dir.path().join("state/rkb/sessions/h1.jsonl");
+    let send = |prompt: &str| hook(&env, "prompt", &serde_json::json!({ "session_id": "h1", "cwd": env.dir.path(), "prompt": prompt }));
+    send(
+        "Another Claude session sent a message:\n<agent-message from=\"a1\">\n  The hooks record correction/remember signals for cmake builds.\n</agent-message>",
+    );
+    send("<task-notification>\n<summary>remember this</summary>\n</task-notification>");
+    assert!(!sessions.exists(), "no signal from harness text");
+    let rankings = env.dir.path().join("state/rkb/rankings.jsonl");
+    assert!(!rankings.exists(), "no search for harness text");
+    send("please remember that cmake keeps a failed find_package result");
+    assert!(std::fs::read_to_string(&sessions).unwrap().contains("remember"));
+    let log = std::fs::read_to_string(&rankings).unwrap();
+    let v: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    assert_eq!((v["hook"].as_str(), v["backend"].as_str()), (Some("recall"), Some("bm25")), "{v}");
+    assert!(v["skipped"][0].as_str().unwrap().starts_with("laya: "), "{v}");
+    let (d, _) = env.json(&["doctor"], "");
+    assert!(d["checks"].as_array().unwrap().iter().any(|c| c["check"] == "hook rankings"), "{d}");
+}
