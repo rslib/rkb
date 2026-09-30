@@ -172,6 +172,48 @@ pub fn effective_labels(lesson: &Mapping, folders: &[&BTreeMap<String, String>])
     out
 }
 
+/// The per-machine `config.toml` in the config folder, never synced: its path and its tables, empty
+/// when the file does not exist.
+pub fn machine(config_dir: &std::path::Path) -> Result<(std::path::PathBuf, toml::Table), String> {
+    let path = config_dir.join("config.toml");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            toml::from_str(&text).map(|t| (path.clone(), t)).map_err(|e| format!("{} does not parse: {}", path.display(), e.message()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((path, toml::Table::new())),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// `[observer]` in the per-machine `config.toml`. Without `cmd` the observer is off.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ObserverConfig {
+    pub cmd: Option<String>,
+    pub timeout_secs: u64,
+    pub min_prompts: usize,
+}
+
+impl Default for ObserverConfig {
+    fn default() -> Self {
+        ObserverConfig { cmd: None, timeout_secs: 600, min_prompts: 3 }
+    }
+}
+
+impl ObserverConfig {
+    pub fn from_table(machine: &toml::Table) -> Result<ObserverConfig, String> {
+        match machine.get("observer") {
+            None => Ok(ObserverConfig::default()),
+            Some(v) => v.clone().try_into().map_err(|e: toml::de::Error| format!("[observer]: {}", e.message())),
+        }
+    }
+
+    /// The command, when one is set and not blank.
+    pub fn command(&self) -> Option<&str> {
+        self.cmd.as_deref().map(str::trim).filter(|c| !c.is_empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +266,29 @@ mod tests {
         let mut own = Mapping::new();
         own.insert("sensitivity".into(), "internal".into());
         assert_eq!(effective_labels(&own, &[&topic, &project])["sensitivity"], "internal");
+    }
+
+    #[test]
+    fn observer_table() {
+        let t: toml::Table = toml::from_str("[observer]\ncmd = \"claude -p\"\nmin_prompts = 5\n").unwrap();
+        let o = ObserverConfig::from_table(&t).unwrap();
+        assert_eq!(o.command(), Some("claude -p"));
+        assert_eq!((o.timeout_secs, o.min_prompts), (600, 5));
+        let off = ObserverConfig::from_table(&toml::Table::new()).unwrap();
+        assert_eq!(off, ObserverConfig::default());
+        assert_eq!(off.command(), None);
+        let blank: toml::Table = toml::from_str("[observer]\ncmd = \"  \"\n").unwrap();
+        assert_eq!(ObserverConfig::from_table(&blank).unwrap().command(), None);
+        let bad: toml::Table = toml::from_str("[observer]\ncommand = \"x\"\n").unwrap();
+        assert!(ObserverConfig::from_table(&bad).is_err());
+    }
+
+    #[test]
+    fn machine_config_missing_is_empty() {
+        let d = tempfile::tempdir().unwrap();
+        let (path, t) = machine(d.path()).unwrap();
+        assert!(t.is_empty() && path.ends_with("config.toml"));
+        std::fs::write(d.path().join("config.toml"), "[jev\n").unwrap();
+        assert!(machine(d.path()).is_err());
     }
 }

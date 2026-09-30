@@ -102,10 +102,8 @@ fn jev_key_from() -> Result<(String, &'static str), String> {
     if let Some(k) = std::env::var("RKB_JEV_API_KEY").ok().filter(|k| !k.trim().is_empty()) {
         return Ok((k.trim().to_string(), "RKB_JEV_API_KEY"));
     }
-    let path = rkb_core::paths::config_dir().join("config.toml");
+    let (path, table) = rkb_core::config::machine(&rkb_core::paths::config_dir())?;
     let not_configured = || format!("not configured: set RKB_JEV_API_KEY or [jev] api_key in {}", path.display());
-    let Ok(text) = std::fs::read_to_string(&path) else { return Err(not_configured()) };
-    let table: toml::Table = toml::from_str(&text).map_err(|e| format!("{} does not parse: {}", path.display(), e.message()))?;
     let Some(jev) = table.get("jev").and_then(|v| v.as_table()) else { return Err(not_configured()) };
     if let Some(k) = jev.get("api_key").and_then(|v| v.as_str()) {
         use std::os::unix::fs::PermissionsExt;
