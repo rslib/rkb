@@ -94,6 +94,7 @@ pub fn run(root: &Path, place: &Place, state_dir: &Path, config_dir: &Path, env:
         kb_checks(root, place, state_dir, env, &mut out);
     }
     out.push(trust_check(config_dir));
+    out.push(observer_check(config_dir, state_dir));
     for (session, g) in crate::write::graces(state_dir) {
         let until =
             jiff::Timestamp::from_second(g.until as i64).map(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string());
@@ -370,6 +371,31 @@ fn root_commit_missing(root: &Path, place: &Place) -> Option<Check> {
     })
 }
 
+/// The observer: off without a command, a warning when it is not approved or its last 3 runs failed.
+pub fn observer_check(config_dir: &Path, state_dir: &Path) -> Check {
+    use crate::observer;
+    let cfg = match observer::load(config_dir) {
+        Ok(c) => c,
+        Err(e) => return check("observer", Level::Warn, e, Some("fix [observer] in config.toml".into())),
+    };
+    let Some(cmd) = cfg.command() else { return check("observer", Level::Ok, "off; no [observer] cmd", None) };
+    if !observer::approved(config_dir, cmd) {
+        return check("observer", Level::Warn, "the command is not approved here", Some("run `rkb approve observer`".into()));
+    }
+    let runs: Vec<serde_json::Value> = observer::log(state_dir).into_iter().filter(|r| r["outcome"] != "skipped").collect();
+    let last3 = &runs[runs.len().saturating_sub(3)..];
+    if last3.len() == 3 && last3.iter().all(|r| r["outcome"] == "failed") {
+        let reason = last3[2]["detail"].as_str().unwrap_or("").to_string();
+        return check("observer", Level::Warn, format!("the last 3 runs failed: {reason}"), Some("check `[observer] cmd` by hand".into()));
+    }
+    let last = runs.last().and_then(|r| r["time"].as_i64()).and_then(|t| jiff::Timestamp::from_second(t).ok());
+    let detail = match last {
+        Some(t) => format!("on; last run {}", t.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M")),
+        None => "on; no run yet".to_string(),
+    };
+    check("observer", Level::Ok, detail, None)
+}
+
 fn trust_check(config_dir: &Path) -> Check {
     let path = config_dir.join("trust.toml");
     let harness = request::trusted_harness(config_dir);
@@ -462,5 +488,47 @@ mod tests {
         assert_eq!(c[1].fix.as_deref(), Some("run `rkb install pi` in a terminal"));
         std::fs::write(home.join(".pi/agent/skills/rkb/SKILL.md"), crate::install::SKILL).unwrap();
         assert_eq!(skill_checks(home)[1].level, Level::Ok);
+    }
+
+    #[test]
+    fn observer_states() {
+        let d = tempfile::tempdir().unwrap();
+        let (config, state) = (d.path().join("config"), d.path().join("state"));
+        let c = observer_check(&config, &state);
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.detail.starts_with("off"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.toml"), "[observer]\ncmd = \"claude -p\"\n").unwrap();
+        let c = observer_check(&config, &state);
+        assert_eq!((c.level, c.fix.as_deref()), (Level::Warn, Some("run `rkb approve observer`")));
+        crate::approval::add(
+            &config,
+            crate::approval::Approval {
+                sha256: crate::script::hash("claude -p"),
+                system: crate::observer::system(),
+                lesson: "observer".into(),
+                kind: "observer".into(),
+                date: "2026-09-29".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(observer_check(&config, &state).detail, "on; no run yet");
+        std::fs::create_dir_all(&state).unwrap();
+        let line =
+            |o: &str, d: &str| format!("{{\"time\":1790000000,\"session\":\"s\",\"parts\":1,\"outcome\":\"{o}\",\"detail\":\"{d}\"}}\n");
+        let log = [
+            line("added", "2 notes"),
+            line("failed", "timeout"),
+            line("failed", "timeout"),
+            line("skipped", "busy"),
+            line("failed", "timeout"),
+        ]
+        .concat();
+        std::fs::write(state.join("observer.jsonl"), log).unwrap();
+        let c = observer_check(&config, &state);
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.detail.contains("timeout"));
+        std::fs::write(state.join("observer.jsonl"), line("failed", "exit 1") + &line("added", "1 notes")).unwrap();
+        assert!(observer_check(&config, &state).detail.starts_with("on; last run 2026-"));
     }
 }

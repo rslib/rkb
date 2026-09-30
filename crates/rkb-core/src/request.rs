@@ -75,6 +75,11 @@ pub enum Action {
         sha256: String,
         system: String,
     },
+    /// Approve the `[observer] cmd` of this machine's `config.toml`.
+    ApproveObserver {
+        sha256: String,
+        system: String,
+    },
     BreakLock {
         path: String,
         holder: String,

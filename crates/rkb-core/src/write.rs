@@ -439,6 +439,7 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
         | Action::Import { .. }
         | Action::Approve { .. }
         | Action::ApproveFact { .. }
+        | Action::ApproveObserver { .. }
         | Action::Publish { .. } => {
             unreachable!("confirm handles these itself")
         }
@@ -569,6 +570,9 @@ pub fn confirm(ctx: &Ctx, req: &Request, choice: &str) -> Result<Outcome> {
     let Some(decision) = &c.decision else { return Ok(Outcome::Cancelled) };
     if let Action::ApproveFact { key, sha256, system } = &req.action {
         return crate::verify::approve_fact(ctx, key, sha256, system);
+    }
+    if let Action::ApproveObserver { sha256, system } = &req.action {
+        return crate::observer::approve(ctx, sha256, system);
     }
     if let Action::Approve { id, script, sha256, system, then_verify } = &req.action {
         return crate::verify::approve(ctx, id, *script, sha256, system, *then_verify);

@@ -119,3 +119,47 @@ pub fn done(env: &Env, ids: &[String]) -> Result<Output, CliError> {
     let exit = u8::from(rows.iter().any(|r| r["removed"] == false));
     Ok(Output { data: json!({ "items": rows }), human: human.trim_end().to_string(), exit, raw: false })
 }
+
+/// `rkb observe`: runs the approved observer command over the new part of one session.
+pub fn observe(env: &Env, session: &str, transcript: &std::path::Path, harness: &str, cwd: Option<&str>) -> Result<Output, CliError> {
+    use rkb_core::observer::{self, Observed};
+    let config = rkb_core::paths::config_dir();
+    let cfg = observer::load(&config).map_err(|e| CliError::new(ErrorCode::Usage, e, "fix [observer] in config.toml"))?;
+    let Some(cmd) = cfg.command() else {
+        return Err(CliError::new(
+            ErrorCode::Usage,
+            "no observer command is set",
+            "set `cmd` under [observer] in ~/.config/rkb/config.toml",
+        ));
+    };
+    if !observer::approved(&config, cmd) {
+        return Err(CliError::new(ErrorCode::Usage, "the observer command is not approved here", "run `rkb approve observer`"));
+    }
+    rkb_core::kb::open(&env.root)?;
+    let here = cwd.map(std::path::PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let place = rkb_core::state::locate(&env.root, &here, &rkb_core::matching::Hints::default(), &env.state)?;
+    let name = |m: &Option<rkb_core::matching::Matched>| m.as_ref().map(|m| m.name.clone());
+    let titles = observer::titles(&env.root, name(&place.project).as_deref(), name(&place.system).as_deref())?;
+    let job = observer::Job { session, transcript, harness, cwd, titles };
+    let (human, data) = match observer::observe(&env.state, &cfg, cmd, &job)? {
+        Observed::Added { item, dropped } => {
+            let n = item.body.lines().count();
+            (
+                format!("observed {n} notes into inbox item {}; {dropped} other lines dropped", item.id),
+                json!({ "id": item.id, "notes": n, "dropped": dropped }),
+            )
+        }
+        Observed::NoNotes { dropped } => {
+            (format!("no durable notes; {dropped} other lines dropped"), json!({ "id": null, "notes": 0, "dropped": dropped }))
+        }
+        Observed::Skipped(r) => (format!("skipped: {r}"), json!({ "id": null, "skipped": r })),
+        Observed::Failed(r) => {
+            return Err(CliError::new(
+                ErrorCode::Refused,
+                format!("the observer command failed: {r}"),
+                "check `[observer] cmd`; see `rkb doctor`",
+            ));
+        }
+    };
+    Ok(Output { data, human, exit: 0, raw: false })
+}

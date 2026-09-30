@@ -17,6 +17,7 @@ pub const EXPIRY_DAYS: u64 = 30;
 pub enum Kind {
     Note,
     Transcript,
+    Observed,
 }
 
 impl Kind {
@@ -24,6 +25,7 @@ impl Kind {
         match self {
             Kind::Note => "note",
             Kind::Transcript => "transcript",
+            Kind::Observed => "observed",
         }
     }
 }
@@ -159,7 +161,35 @@ const MAX_ERROR_LINES: usize = 20;
 pub enum Step {
     Prompt(String),
     Text(String),
-    Command { command: String, ok: bool, output: String },
+    Command {
+        command: String,
+        ok: bool,
+        output: String,
+    },
+    /// A call of a tool other than bash, with its main argument.
+    Tool {
+        name: String,
+        arg: String,
+    },
+    /// The time of the entries that follow, `YYYY-MM-DD HH:MM` in UTC; only when it changes.
+    Time(String),
+}
+
+/// The main argument of a tool call, for a one-line mention.
+fn tool_arg(input: &serde_json::Value) -> String {
+    ["command", "file_path", "path", "pattern", "url", "query", "description", "prompt"]
+        .iter()
+        .find_map(|k| input[*k].as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn push_time(steps: &mut Vec<Step>, v: &serde_json::Value) {
+    let Some(t) = v["timestamp"].as_str().filter(|t| t.len() >= 16) else { return };
+    let t = t[..16].replace('T', " ");
+    if !steps.iter().rev().find_map(|s| if let Step::Time(x) = s { Some(x == &t) } else { None }).unwrap_or(false) {
+        steps.push(Step::Time(t));
+    }
 }
 
 fn content_text(v: &serde_json::Value) -> String {
@@ -179,6 +209,9 @@ pub fn read_claude(lines: &[&str]) -> Vec<Step> {
     for line in lines {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
         let content = &v["message"]["content"];
+        if matches!(v["type"].as_str(), Some("user" | "assistant")) {
+            push_time(&mut steps, &v);
+        }
         match v["type"].as_str() {
             Some("user") if v["isMeta"] != true => {
                 if let Some(text) = content.as_str() {
@@ -205,6 +238,9 @@ pub fn read_claude(lines: &[&str]) -> Vec<Step> {
                                 calls.insert(id.to_string(), cmd.to_string());
                             }
                         }
+                        Some("tool_use") => {
+                            steps.push(Step::Tool { name: b["name"].as_str().unwrap_or("").to_lowercase(), arg: tool_arg(&b["input"]) })
+                        }
                         _ => {}
                     }
                 }
@@ -224,6 +260,7 @@ pub fn read_pi(lines: &[&str]) -> Vec<Step> {
         if v["type"] != "message" {
             continue;
         }
+        push_time(&mut steps, &v);
         let m = &v["message"];
         match m["role"].as_str() {
             Some("user") => steps.push(Step::Prompt(content_text(&m["content"]))),
@@ -235,6 +272,9 @@ pub fn read_pi(lines: &[&str]) -> Vec<Step> {
                             if let (Some(id), Some(cmd)) = (b["id"].as_str(), b["arguments"]["command"].as_str()) {
                                 calls.insert(id.to_string(), cmd.to_string());
                             }
+                        }
+                        Some("toolCall") => {
+                            steps.push(Step::Tool { name: b["name"].as_str().unwrap_or("").to_lowercase(), arg: tool_arg(&b["arguments"]) })
                         }
                         _ => {}
                     }
@@ -292,7 +332,7 @@ pub fn extract(steps: &[Step]) -> String {
     let mut failed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for s in steps {
         match s {
-            Step::Prompt(t) => out.extend(labeled("user", t)),
+            Step::Prompt(t) => out.extend(labeled("user", &strip_reminders(t))),
             Step::Text(t) => out.extend(labeled("agent", t)),
             Step::Command { command, ok: false, output } => {
                 let head = match exit_code(output) {
@@ -311,6 +351,7 @@ pub fn extract(steps: &[Step]) -> String {
                     out.extend(labeled("command worked", command));
                 }
             }
+            Step::Tool { .. } | Step::Time(_) => {}
         }
     }
     // Repeated identical output lines (a warning printed per file, say) collapse to one with a count.
@@ -328,6 +369,94 @@ pub fn extract(steps: &[Step]) -> String {
         out.insert(0, format!("[{cut} earlier lines cut]"));
     }
     out.join("\n")
+}
+
+/// Characters of one digest part at most; a longer digest is split at entry boundaries.
+pub const DIGEST_PART: usize = 60000;
+/// Characters of a tool call's argument kept in a digest.
+const TOOL_ARG: usize = 160;
+
+/// What the observer reads of a session: its parts, in order, and how many user prompts it holds.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Digest {
+    pub parts: Vec<String>,
+    pub prompts: usize,
+}
+
+fn cut(s: &str, max: usize) -> &str {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
+fn strip_reminders(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<system-reminder>") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("</system-reminder>") {
+            Some(end) => rest = &rest[start + end + "</system-reminder>".len()..],
+            None => rest = "",
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// The digest of `steps`: timed user prompts, agent text, one line per tool call, and failed commands
+/// with their key error lines. Output of successful calls, file contents, thinking and harness
+/// reminders are left out.
+pub fn digest(steps: &[Step]) -> Digest {
+    let mut entries: Vec<String> = vec![];
+    let mut prompts = 0;
+    for s in steps {
+        let lines = match s {
+            Step::Time(t) => vec![format!("[{t}]")],
+            Step::Prompt(t) => {
+                let t = strip_reminders(t);
+                if t.is_empty() {
+                    continue;
+                }
+                prompts += 1;
+                labeled("user", &t)
+            }
+            Step::Text(t) => labeled("agent", t),
+            Step::Tool { name, arg } => vec![format!("[tool] {name}: {}", cut(arg.lines().next().unwrap_or(""), TOOL_ARG))],
+            Step::Command { command, ok: true, .. } => {
+                vec![format!("[tool] bash: {}", cut(command.lines().next().unwrap_or(""), TOOL_ARG))]
+            }
+            Step::Command { command, ok: false, output } => {
+                let head = match exit_code(output) {
+                    Some(code) => format!("command failed, exit {code}"),
+                    None => "command failed".to_string(),
+                };
+                let mut l = labeled(&head, cut(command, TOOL_ARG * 4));
+                l.push("[tool output]".to_string());
+                l.extend(error_lines(output).into_iter().map(|e| format!("  {e}")));
+                l
+            }
+        };
+        if !lines.is_empty() {
+            entries.push(lines.join("\n"));
+        }
+    }
+    let mut parts: Vec<String> = vec![];
+    let mut cur = String::new();
+    for e in entries {
+        let e = cut(&e, DIGEST_PART - 1);
+        if !cur.is_empty() && cur.chars().count() + 1 + e.chars().count() > DIGEST_PART {
+            parts.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push('\n');
+        }
+        cur.push_str(e);
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    Digest { parts, prompts }
 }
 
 /// The session-start line, only when the inbox holds at least 5 items or its oldest is over 7 days old.
@@ -350,8 +479,24 @@ const CAPTURE_SIGNALS: [&str; 3] = ["fixed", "correction", "remember"];
 
 /// Saves an extract of the part of `transcript` after the last extract of `session`, when the session
 /// recorded a signal since then. Returns the new item, or `None` when there was no signal or nothing new.
-pub fn capture(state: &Path, harness: &str, session: &str, transcript: &Path, cwd: Option<&str>) -> Result<Option<Item>> {
+/// The steps of the whole lines of `transcript` after byte `from` (all of it when `from` is past its end),
+/// and the byte offset where they end.
+pub fn read_from(transcript: &Path, harness: &str, from: Option<u64>) -> Result<(Vec<Step>, u64)> {
     use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(transcript).map_err(io(transcript))?;
+    let len = f.metadata().map_err(io(transcript))?.len();
+    let from = from.filter(|&o| o <= len).unwrap_or(0);
+    f.seek(SeekFrom::Start(from)).map_err(io(transcript))?;
+    let mut bytes = vec![];
+    f.read_to_end(&mut bytes).map_err(io(transcript))?;
+    let whole = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let text = String::from_utf8_lossy(&bytes[..whole]);
+    let lines: Vec<&str> = text.lines().collect();
+    let steps = if harness == "claude-code" { read_claude(&lines) } else { read_pi(&lines) };
+    Ok((steps, from + whole as u64))
+}
+
+pub fn capture(state: &Path, harness: &str, session: &str, transcript: &Path, cwd: Option<&str>) -> Result<Option<Item>> {
     expire(state, crate::request::now());
     let records = crate::hooks::read(state, session);
     let last = records.iter().rposition(|r| r["kind"] == "extracted");
@@ -367,16 +512,7 @@ pub fn capture(state: &Path, harness: &str, session: &str, transcript: &Path, cw
     if signals.is_empty() {
         return Ok(None);
     }
-    let mut f = std::fs::File::open(transcript).map_err(io(transcript))?;
-    let len = f.metadata().map_err(io(transcript))?.len();
-    let from = last.and_then(|i| records[i]["offset"].as_u64()).filter(|&o| o <= len).unwrap_or(0);
-    f.seek(SeekFrom::Start(from)).map_err(io(transcript))?;
-    let mut bytes = vec![];
-    f.read_to_end(&mut bytes).map_err(io(transcript))?;
-    let whole = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-    let text = String::from_utf8_lossy(&bytes[..whole]);
-    let lines: Vec<&str> = text.lines().collect();
-    let steps = if harness == "claude-code" { read_claude(&lines) } else { read_pi(&lines) };
+    let (steps, end) = read_from(transcript, harness, last.and_then(|i| records[i]["offset"].as_u64()))?;
     let body = extract(&steps);
     let item = if body.is_empty() {
         None
@@ -393,7 +529,7 @@ pub fn capture(state: &Path, harness: &str, session: &str, transcript: &Path, cw
         };
         Some(add(state, meta, &body)?)
     };
-    crate::hooks::append(state, session, &serde_json::json!({ "kind": "extracted", "offset": from + whole as u64 }))?;
+    crate::hooks::append(state, session, &serde_json::json!({ "kind": "extracted", "offset": end }))?;
     Ok(item)
 }
 
@@ -563,6 +699,45 @@ mod tests {
 [agent] Configured. ZLIB_ROOT tells find_package where to look."
         );
         assert!(!a.contains("must not appear"));
+    }
+
+    #[test]
+    fn both_formats_give_the_same_digest() {
+        let claude = fixture("claude.jsonl");
+        let pi = fixture("pi.jsonl");
+        let a = digest(&read_claude(&claude.lines().collect::<Vec<_>>()));
+        let b = digest(&read_pi(&pi.lines().collect::<Vec<_>>()));
+        assert_eq!(a, b);
+        assert_eq!(a.prompts, 1, "the reminder is no prompt");
+        assert_eq!(
+            a.parts,
+            ["[2026-09-20 10:00]
+[user] The configure step fails, can you fix it?
+[command failed, exit 1] cmake -B build
+[tool output]
+  CMake Error at CMakeLists.txt:5 (find_package):
+  Could NOT find ZLIB (missing: ZLIB_LIBRARY ZLIB_INCLUDE_DIR)
+  -- Configuring incomplete, errors occurred!
+[2026-09-20 10:01]
+[tool] read: /work/demo/CMakeLists.txt
+[agent] ZLIB is installed under /opt/zlib. Point CMake at it with ZLIB_ROOT.
+[tool] bash: cmake -B build -DZLIB_ROOT=/opt/zlib
+[agent] Configured. ZLIB_ROOT tells find_package where to look."]
+        );
+        assert!(!a.parts[0].contains("must not appear"));
+    }
+
+    #[test]
+    fn long_digest_splits_at_entries() {
+        let entry = "x".repeat(DIGEST_PART / 3);
+        let steps: Vec<Step> = (0..4).map(|_| Step::Prompt(entry.clone())).collect();
+        let d = digest(&steps);
+        assert_eq!((d.parts.len(), d.prompts), (2, 4));
+        assert!(d.parts.iter().all(|p| p.chars().count() <= DIGEST_PART));
+        assert_eq!(d.parts[0].lines().count(), 2, "an entry is never split across parts");
+        let huge = digest(&[Step::Text("y".repeat(DIGEST_PART * 2))]);
+        assert_eq!(huge.parts.len(), 1);
+        assert!(huge.parts[0].chars().count() < DIGEST_PART);
     }
 
     #[test]

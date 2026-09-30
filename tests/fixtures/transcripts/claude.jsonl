@@ -1,13 +1,14 @@
 {"type":"system","subtype":"init","sessionId":"demo-claude-1"}
-{"type":"user","sessionId":"demo-claude-1","cwd":"/work/demo","message":{"role":"user","content":"The configure step fails, can you fix it?"}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"PRIVATE REASONING that must not appear"}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cmake -B build"}}]}}
-{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Exit code 1\n-- The C compiler identification is GNU 13.2.0\nCMake Error at CMakeLists.txt:5 (find_package):\n  Could NOT find ZLIB (missing: ZLIB_LIBRARY ZLIB_INCLUDE_DIR)\n-- Configuring incomplete, errors occurred!"}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"/work/demo/CMakeLists.txt"}}]}}
-{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"FILE CONTENT that must not appear"}]}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ZLIB is installed under /opt/zlib. Point CMake at it with ZLIB_ROOT."}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"cmake -B build -DZLIB_ROOT=/opt/zlib"}}]}}
-{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t3","content":"-- Configuring done\n-- Generating done\nSUCCESS OUTPUT that must not appear"}]}}
+{"type":"user","sessionId":"demo-claude-1","cwd":"/work/demo","message":{"role":"user","content":"The configure step fails, can you fix it?"},"timestamp":"2026-09-20T10:00:00.000Z"}
+{"type":"user","timestamp":"2026-09-20T10:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>HARNESS REMINDER that must not appear</system-reminder>"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"PRIVATE REASONING that must not appear"}]},"timestamp":"2026-09-20T10:00:00.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cmake -B build"}}]},"timestamp":"2026-09-20T10:00:00.000Z"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"Exit code 1\n-- The C compiler identification is GNU 13.2.0\nCMake Error at CMakeLists.txt:5 (find_package):\n  Could NOT find ZLIB (missing: ZLIB_LIBRARY ZLIB_INCLUDE_DIR)\n-- Configuring incomplete, errors occurred!"}]},"timestamp":"2026-09-20T10:00:00.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"/work/demo/CMakeLists.txt"}}]},"timestamp":"2026-09-20T10:01:00.000Z"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"FILE CONTENT that must not appear"}]}]},"timestamp":"2026-09-20T10:01:00.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ZLIB is installed under /opt/zlib. Point CMake at it with ZLIB_ROOT."}]},"timestamp":"2026-09-20T10:01:00.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"cmake -B build -DZLIB_ROOT=/opt/zlib"}}]},"timestamp":"2026-09-20T10:01:00.000Z"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t3","content":"-- Configuring done\n-- Generating done\nSUCCESS OUTPUT that must not appear"}]},"timestamp":"2026-09-20T10:01:00.000Z"}
 {"type":"file-history-snapshot","snapshot":{}}
 {"type":"attachment","attachment":{"kind":"unknown"}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Configured. ZLIB_ROOT tells find_package where to look."}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Configured. ZLIB_ROOT tells find_package where to look."}]},"timestamp":"2026-09-20T10:01:00.000Z"}

@@ -293,9 +293,9 @@ enum Cmd {
         slug: String,
     },
     /// Approve a lesson's Check or Probe script to run on this machine. Asks the user and shows the whole script.
-    #[command(after_help = "Example:\n  rkb approve 7f3a9c2b41 check\n  rkb approve facts.hdf5")]
+    #[command(after_help = "Example:\n  rkb approve 7f3a9c2b41 check\n  rkb approve facts.hdf5\n  rkb approve observer")]
     Approve {
-        /// A lesson id, or `facts.<key>` for a fact command in kb.toml.
+        /// A lesson id, `facts.<key>` for a fact command in kb.toml, or `observer` for the observer command.
         id: String,
         /// For a lesson: check or probe.
         #[arg(value_parser = ["check", "probe"])]
@@ -399,6 +399,23 @@ enum Cmd {
     Inbox {
         #[command(subcommand)]
         action: Option<InboxCmd>,
+    },
+    /// Have the approved observer command read a session and save its durable notes to the inbox.
+    /// The session-end hook starts it in the background; it runs only with `[observer] cmd` approved.
+    #[command(
+        after_help = "Example:\n  rkb observe --session 3f2a --transcript ~/.claude/projects/p/3f2a.jsonl --harness claude-code --cwd ~/code/p"
+    )]
+    Observe {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        transcript: std::path::PathBuf,
+        /// claude-code, pi or omp.
+        #[arg(long, default_value = "claude-code")]
+        harness: String,
+        /// The session's working directory; picks the project and system for the lesson titles.
+        #[arg(long)]
+        cwd: Option<String>,
     },
     /// Download or check model files for reranking.
     #[command(after_help = "Example:\n  rkb models fetch")]
@@ -731,7 +748,12 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Rename { id, slug } => writes::lifecycle(&env, rkb_core::request::Action::Rename { id, slug }),
         Cmd::Approve { id, kind } => {
             kb::open(&root)?;
-            let o = if let Some(key) = id.strip_prefix("facts.") {
+            let o = if id == "observer" {
+                match rkb_core::observer::approve_request(&env.ctx())? {
+                    Some(req) => rkb_core::write::Outcome::NeedsUser(req),
+                    None => rkb_core::write::Outcome::Info("The observer command is already approved here".into()),
+                }
+            } else if let Some(key) = id.strip_prefix("facts.") {
                 match rkb_core::verify::approve_fact_request(&env.ctx(), key)? {
                     Some(req) => rkb_core::write::Outcome::NeedsUser(req),
                     None => rkb_core::write::Outcome::Info(format!("The fact command {id} is already approved here")),
@@ -781,6 +803,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Note { words, priority } => inbox::note(&env, words, priority),
         Cmd::Tools => Ok(agent::list()),
         Cmd::Tool { .. } | Cmd::Mcp => unreachable!("main runs tools and the MCP server first"),
+        Cmd::Observe { session, transcript, harness, cwd } => inbox::observe(&env, &session, &transcript, &harness, cwd.as_deref()),
         Cmd::Inbox { action: None } => inbox::list(&env),
         Cmd::Inbox { action: Some(InboxCmd::Show { id }) } => inbox::show(&env, &id),
         Cmd::Inbox { action: Some(InboxCmd::Done { ids }) } => inbox::done(&env, &ids),

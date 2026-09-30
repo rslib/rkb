@@ -12,6 +12,9 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Runs one Claude Code hook event. Never fails: errors go to `hook-errors.log` and nothing is printed.
 pub fn run(event: &str, harness: &str) {
+    if rkb_core::observer::active() {
+        return;
+    }
     let state = paths::state_dir();
     // A panic, also in a search thread, is logged like any hook error instead of printed, so it never
     // reaches the harness as a failed hook.
@@ -59,7 +62,12 @@ fn handle(event: &str, p: &Value, state: &Path, harness: &str) -> Result<Option<
         "tool-failed" => tool_failed(p, state, session),
         "prompt" => prompt(p, state, session),
         "stop" => stop(p, state, session, harness),
-        "pre-compact" | "session-end" => capture(p, state, session, harness),
+        "pre-compact" => capture(p, state, session, harness),
+        "session-end" => {
+            let captured = capture(p, state, session, harness);
+            start_observer(p, session, harness)?;
+            captured
+        }
         _ => Err(format!("unknown hook event `{event}`").into()),
     }
 }
@@ -246,6 +254,24 @@ fn capture(p: &Value, state: &Path, session: &str, harness: &str) -> Result<Opti
     let transcript = p["transcript_path"].as_str().ok_or("the payload has no transcript_path")?;
     rkb_core::distill::capture(state, harness, session, Path::new(transcript), p["cwd"].as_str())?;
     Ok(None)
+}
+
+/// Starts `rkb observe` for the session in the background when the observer is set up and approved
+/// here, and returns at once.
+fn start_observer(p: &Value, session: &str, harness: &str) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let Some(transcript) = p["transcript_path"].as_str() else { return Ok(()) };
+    if rkb_core::observer::ready(&paths::config_dir()).is_none() {
+        return Ok(());
+    }
+    let mut c = Command::new(std::env::current_exe()?);
+    c.args(["observe", "--session", session, "--transcript", transcript, "--harness", harness]);
+    if let Some(cwd) = p["cwd"].as_str() {
+        c.args(["--cwd", cwd]);
+    }
+    c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0).spawn()?;
+    Ok(())
 }
 
 /// The hits for `query` from the current place, reranked by the chain within the hook time limit.

@@ -4595,3 +4595,116 @@ fn recall_uses_jev_thresholds_when_jev_ranked() {
     assert_eq!(run("j2"), "", "a kb.toml value wins over Jev's default");
     assert_eq!(std::fs::read_to_string(env.dir.path().join("state/rkb/hook-errors.log")).unwrap_or_default(), "", "no hook error");
 }
+
+fn observer_env(script: &str) -> Env {
+    let env = search_kb();
+    let fake = env.dir.path().join("fake/observer.sh");
+    env.write_abs(&fake, &format!("#!/bin/sh\n{script}\n"));
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    env.write_abs(
+        &env.dir.path().join("config/rkb/config.toml"),
+        &format!("[observer]\ncmd = \"{}\"\nmin_prompts = 1\ntimeout_secs = 20\n", fake.display()),
+    );
+    env
+}
+
+fn approve_observer(env: &Env) {
+    let (v, code) = env.json(&["approve", "observer"], "");
+    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{v}");
+    assert!(v["question"].as_str().unwrap().contains("fake/observer.sh"), "{v}");
+    assert!(v["question"].as_str().unwrap().contains("sends it the session's text"), "{v}");
+    env.trust_claude();
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("CLAUDECODE", "1");
+    let o = rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", "approve observer", "--format", "json"], "");
+    assert!(o.status.success(), "{}", stdout(&o));
+    assert_eq!(env.json(&["approve", "observer"], "").1, Some(0), "already approved");
+}
+
+fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !done() {
+        assert!(start.elapsed() < std::time::Duration::from_secs(20), "timed out waiting for {what}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+const OBSERVED_NOTE: &str = "- 2026-09-20 [high] (pitfall; general) CMake finds ZLIB under /opt/zlib only with -DZLIB_ROOT=/opt/zlib.";
+
+#[test]
+fn observe_needs_approval_and_saves_notes() {
+    let env = observer_env(&format!(
+        "cat > \"$FAKE_CLAUDE_HOME/prompt.txt\"\necho \"$RKB_OBSERVER\" > \"$FAKE_CLAUDE_HOME/env.txt\"\necho 'Notes:'\necho '{OBSERVED_NOTE}'"
+    ));
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/claude.jsonl");
+    let args = ["observe", "--session", "s1", "--transcript", fixture.to_str().unwrap(), "--harness", "claude-code"];
+    let (v, code) = env.json(&args, "");
+    assert_eq!((v["error"]["fix"].as_str(), code), (Some("run `rkb approve observer`"), Some(2)), "{v}");
+    let doctor = env.json(&["doctor"], "").0;
+    let obs = doctor["checks"].as_array().unwrap().iter().find(|c| c["check"] == "observer").unwrap().clone();
+    assert_eq!((obs["status"].as_str(), obs["fix"].as_str()), (Some("warn"), Some("run `rkb approve observer`")), "{obs}");
+
+    approve_observer(&env);
+    let (v, code) = env.json(&args, "");
+    assert_eq!((v["notes"].as_u64(), v["dropped"].as_u64(), code), (Some(1), Some(1), Some(0)), "{v}");
+    let prompt = std::fs::read_to_string(env.dir.path().join("prompt.txt")).unwrap();
+    assert!(prompt.contains("CMake keeps a failed find_package result in the cache"), "a general lesson title");
+    assert!(prompt.contains("[user] The configure step fails") && !prompt.contains("must not appear"));
+    assert_eq!(std::fs::read_to_string(env.dir.path().join("env.txt")).unwrap(), "1\n");
+    let items = inbox_items(&env);
+    assert_eq!((items.len(), items[0]["kind"].as_str(), items[0]["priority"].as_u64()), (1, Some("observed"), Some(3)));
+    let (show, _) = env.json(&["inbox", "show", items[0]["id"].as_str().unwrap()], "");
+    assert_eq!((show["meta"]["session"].as_str(), show["body"].as_str()), (Some("s1"), Some(OBSERVED_NOTE)));
+
+    let (v, _) = env.json(&args, "");
+    assert!(v["skipped"].as_str().unwrap().contains("0 prompts"), "only new entries: {v}");
+    assert!(env.json(&["doctor"], "").0["checks"].as_array().unwrap().iter().any(|c| c["check"] == "observer" && c["status"] == "ok"));
+}
+
+#[test]
+fn session_end_starts_the_observer_in_the_background() {
+    let env = observer_env(&format!("cat > /dev/null\nsleep 2\necho '{OBSERVED_NOTE}'"));
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/claude.jsonl");
+    let payload = |id: &str| serde_json::json!({ "session_id": id, "transcript_path": fixture, "cwd": env.dir.path(), "reason": "exit" });
+    assert_eq!(hook(&env, "session-end", &payload("unapproved")), "");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(inbox_items(&env).is_empty(), "no observer before approval");
+
+    approve_observer(&env);
+    let start = std::time::Instant::now();
+    assert_eq!(hook(&env, "session-end", &payload("s2")), "");
+    assert!(start.elapsed() < std::time::Duration::from_secs(1), "the hook does not wait: {:?}", start.elapsed());
+    wait_for("the observed item", || inbox_items(&env).iter().any(|i| i["kind"] == "observed"));
+
+    // pi and omp wait for the hook's output to close, within 1.8 s; the observer must not hold it open.
+    let pi = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/pi.jsonl");
+    let start = std::time::Instant::now();
+    let o = env.rkb_in(
+        &["hook", "session-end", "--harness", "pi"],
+        &serde_json::json!({ "session_id": "pi1", "transcript_path": pi, "cwd": env.dir.path() }).to_string(),
+    );
+    assert!(o.status.success() && start.elapsed() < std::time::Duration::from_secs(1), "{:?}", start.elapsed());
+    wait_for("the pi observed item", || inbox_items(&env).len() == 2);
+
+    let fake = env.dir.path().join("fake/observer.sh");
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), &format!("[observer]\ncmd = \"{} --other-model\"\n", fake.display()));
+    assert_eq!(hook(&env, "session-end", &payload("s3")), "");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert_eq!(inbox_items(&env).len(), 2, "a changed command needs a new approval");
+}
+
+#[test]
+fn hooks_do_nothing_inside_an_observer_run() {
+    let env = search_kb();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/claude.jsonl");
+    signal(&env, "child", r#"{"kind":"remember"}"#);
+    let payload = serde_json::json!({ "session_id": "child", "transcript_path": fixture, "cwd": env.dir.path(), "prompt": "remember that cmake needs ZLIB_ROOT here" });
+    for event in ["session-start", "prompt", "pre-tool", "tool-ok", "tool-failed", "stop", "pre-compact", "session-end"] {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.env("RKB_OBSERVER", "1");
+        let o = rkb_with(c, &["hook", event], &payload.to_string());
+        assert_eq!((o.status.code(), stdout(&o)), (Some(0), String::new()), "{event}");
+    }
+    assert!(inbox_items(&env).is_empty());
+    assert!(!env.dir.path().join("state/rkb/heartbeat").exists());
+}

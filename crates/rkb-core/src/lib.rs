@@ -24,6 +24,7 @@ pub mod lint;
 pub mod list;
 pub mod lock;
 pub mod matching;
+pub mod observer;
 pub mod paths;
 pub mod request;
 pub mod rerank;
