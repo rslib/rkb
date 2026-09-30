@@ -1809,7 +1809,7 @@ dependencies = [
 
 [[package]]
 name = "rkb"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "clap",
  "jiff",
@@ -1827,7 +1827,7 @@ dependencies = [
 
 [[package]]
 name = "rkb-core"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "getrandom 0.4.3",
  "globset",
@@ -1845,7 +1845,7 @@ dependencies = [
 
 [[package]]
 name = "rkb-rerank"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "anyhow",
  "candle-core",
