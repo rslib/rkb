@@ -137,7 +137,7 @@ pub fn install(env: &Env, names: Vec<String>, list_only: bool, uninstall: bool) 
             session: None,
         };
         request::save(&env.state.join("requests"), &req)?;
-        return Ok(needs_user_output(env, &req));
+        return needs_user_output(env, &req);
     }
 
     let changes = install::apply(&steps, install::SKILL)?;

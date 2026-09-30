@@ -27,7 +27,7 @@ const MESSAGE_LIMIT: usize = 200;
 pub const ABOUT: &str = "Read and grow a knowledge base of lessons learned.";
 
 #[derive(Parser)]
-#[command(name = "rkb", version, about = ABOUT, after_help = "Example:\n  rkb lint")]
+#[command(name = "rkb", version, about = ABOUT, after_help = "Environment:\n  RKB_AUTO_CONFIRM  Comma-separated option names, such as install,continue. In CI, rkb answers a needs_user\n                    question with the first listed name that is one of its options, and prints\n                    `auto_confirmed: <option> (RKB_AUTO_CONFIRM)`. Read only from the environment.\n\nExample:\n  rkb lint")]
 struct Cli {
     /// Output format. Default: RKB_FORMAT, then human.
     #[arg(long, global = true, value_enum)]
@@ -775,7 +775,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
                     None => rkb_core::write::Outcome::Info(format!("The {} script of {id} is already approved here", kind.name())),
                 }
             };
-            Ok(writes::outcome(&env, o))
+            writes::outcome(&env, o)
         }
         Cmd::Verify { id, auto } => {
             kb::open(&root)?;
@@ -784,7 +784,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
                 return Ok(session::verify_summary(&s, colored));
             }
             let (_, o) = rkb_core::verify::one(&env.ctx(), &id.expect("clap requires an id"), false)?;
-            Ok(writes::outcome(&env, o))
+            writes::outcome(&env, o)
         }
         Cmd::Unarchive { id } => writes::lifecycle(&env, rkb_core::request::Action::Unarchive { id }),
         Cmd::Label { folder, assignment, unset } => writes::label(&env, folder, assignment, unset),

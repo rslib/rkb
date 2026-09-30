@@ -291,6 +291,9 @@ pub struct Change {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The option `RKB_AUTO_CONFIRM` answered for this write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_confirmed: Option<String>,
 }
 
 /// The reason a flag, supersede or archive recorded in the lesson it wrote.
@@ -307,16 +310,30 @@ fn reason_in(kind: &str, path: &str, text: &str) -> Option<String> {
 
 /// rkb commits since `since` (a date git understands), newest first, without usage commits. Reads only.
 pub fn changes(root: &Path, since: &str) -> Result<Vec<Change>> {
-    let out = git::run(root, &["log", &format!("--since={since}"), "--format=%x1e%h%x1f%cs%x1f%s", "--name-only", "--no-renames"])?;
+    let out = git::run(
+        root,
+        &[
+            "log",
+            &format!("--since={since}"),
+            "--format=%x1e%h%x1f%cs%x1f%s%x1f%(trailers:key=Auto-confirmed,valueonly,separator=%x20)%x1f",
+            "--name-only",
+            "--no-renames",
+        ],
+    )?;
     let subject = regex::Regex::new(r"^([a-z]+)\(([^)]*)\): (.*?)(?: \[([0-9a-f]{10})\])?$").expect("valid regex");
     let mut rows = vec![];
     for entry in String::from_utf8_lossy(&out).split('\x1e').filter(|e| !e.trim().is_empty()) {
-        let mut lines = entry.lines();
-        let mut head = lines.next().unwrap_or_default().split('\x1f');
-        let (Some(commit), Some(date), Some(s)) = (head.next(), head.next(), head.next()) else { continue };
+        let mut head = entry.splitn(5, '\x1f');
+        let (Some(commit), Some(date), Some(s), Some(auto), Some(names)) =
+            (head.next(), head.next(), head.next(), head.next(), head.next())
+        else {
+            continue;
+        };
+        let commit = commit.trim();
+        let auto = Some(auto.trim().to_string()).filter(|a| !a.is_empty());
         let Some(m) = subject.captures(s) else { continue };
         let kind = m[1].to_string();
-        let first_lesson = lines.map(str::trim).find(|p| p.ends_with(".md") && !p.ends_with("README.md")).map(str::to_string);
+        let first_lesson = names.lines().map(str::trim).find(|p| p.ends_with(".md") && !p.ends_with("README.md")).map(str::to_string);
         rows.push((
             commit.to_string(),
             date.to_string(),
@@ -325,6 +342,7 @@ pub fn changes(root: &Path, since: &str) -> Result<Vec<Change>> {
             m[3].to_string(),
             m.get(4).map(|i| i.as_str().to_string()),
             first_lesson,
+            auto,
         ));
     }
     let wanted: Vec<String> = rows
@@ -335,12 +353,12 @@ pub fn changes(root: &Path, since: &str) -> Result<Vec<Change>> {
     let mut blobs = git::read_blobs(root, &wanted)?.into_iter();
     Ok(rows
         .into_iter()
-        .map(|(commit, date, kind, folder, title, id, path)| {
+        .map(|(commit, date, kind, folder, title, id, path, auto_confirmed)| {
             let reason = match (&path, matches!(kind.as_str(), "flag" | "supersede" | "archive")) {
                 (Some(p), true) => blobs.next().flatten().and_then(|b| reason_in(&kind, p, &String::from_utf8_lossy(&b))),
                 _ => None,
             };
-            Change { commit, date, kind, id: id.unwrap_or_default(), folder, title, reason }
+            Change { commit, date, kind, id: id.unwrap_or_default(), folder, title, reason, auto_confirmed }
         })
         .collect())
 }

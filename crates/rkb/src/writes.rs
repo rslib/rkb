@@ -65,12 +65,12 @@ fn quote(choice: &str) -> String {
     format!("\"{}\"", choice.replace('"', "\\\""))
 }
 
-pub(crate) fn needs_user_output(env: &Env, req: &Request) -> Output {
+pub(crate) fn needs_user_output(env: &Env, req: &Request) -> Result<Output, CliError> {
     needs_user(env, req)
 }
 
-pub fn outcome(env: &Env, o: Outcome) -> Output {
-    match o {
+pub fn outcome(env: &Env, o: Outcome) -> Result<Output, CliError> {
+    Ok(match o {
         Outcome::Written(w) => {
             let lines: Vec<&str> = w.diff.lines().collect();
             let show = format!("git -C {} show {}", env.root.display(), w.commit);
@@ -106,10 +106,10 @@ pub fn outcome(env: &Env, o: Outcome) -> Output {
         Outcome::Cancelled => {
             Output { data: json!({ "status": "cancelled" }), human: "Cancelled; nothing was written".into(), exit: 0, raw: false }
         }
-        Outcome::NeedsUser(req) => needs_user(env, &req),
+        Outcome::NeedsUser(req) => return needs_user(env, &req),
         Outcome::Imported(i) => imported(env, &i),
         Outcome::Info(message) => Output { data: json!({ "status": "done", "message": message }), human: message, exit: 0, raw: false },
-    }
+    })
 }
 
 fn imported(env: &Env, i: &write::Imported) -> Output {
@@ -144,7 +144,7 @@ fn imported(env: &Env, i: &write::Imported) -> Output {
 pub fn import(env: &Env, dir: &std::path::Path) -> Result<Output, CliError> {
     kb::open(&env.root)?;
     match rkb_core::import::plan(&env.ctx(), dir)? {
-        rkb_core::import::Plan::Ready(req) => Ok(needs_user(env, &req)),
+        rkb_core::import::Plan::Ready(req) => needs_user(env, &req),
         rkb_core::import::Plan::Invalid(bad) => {
             let mut human = String::new();
             for b in &bad {
@@ -164,7 +164,16 @@ pub fn import(env: &Env, dir: &std::path::Path) -> Result<Output, CliError> {
     }
 }
 
-fn needs_user(env: &Env, req: &Request) -> Output {
+/// The first name in `RKB_AUTO_CONFIRM` (environment only, never a config file) that is one of `options`.
+fn auto_choice(options: &[String]) -> Option<String> {
+    let list = std::env::var("RKB_AUTO_CONFIRM").ok()?;
+    list.split(',').map(str::trim).find(|n| options.iter().any(|o| o == n)).map(String::from)
+}
+
+fn needs_user(env: &Env, req: &Request) -> Result<Output, CliError> {
+    if let Some(choice) = auto_choice(&req.options()) {
+        return confirm(env, req.id.clone(), choice);
+    }
     let options = req.options();
     let next = format!("rkb confirm {} --choice {}", req.id, quote(&options[0]));
     let mut human = format!("{}\n{}\n", paint(env.colored, "33;1", "Needs your decision:"), req.question);
@@ -181,7 +190,7 @@ fn needs_user(env: &Env, req: &Request) -> Output {
             "Then run `rkb confirm` with the option they chose; nothing was written yet",
         ],
     });
-    Output { data, human, exit: 3, raw: false }
+    Ok(Output { data, human, exit: 3, raw: false })
 }
 
 pub fn add(
@@ -217,7 +226,7 @@ pub fn add(
         read_stdin()?
     };
     let o = write::apply(&env.ctx(), &Action::Add { text, topic, assets: absolute(assets), inbox }, &[])?;
-    Ok(outcome(env, o))
+    outcome(env, o)
 }
 
 /// `--asset` paths made absolute, so a confirm from another folder finds them.
@@ -244,13 +253,13 @@ pub fn edit(env: &Env, id: String, base: Option<String>, assets: Vec<String>, gi
         (read_stdin()?, base)
     };
     let o = write::apply(&env.ctx(), &Action::Edit { id, text, base, assets: absolute(assets) }, &[])?;
-    Ok(outcome(env, o))
+    outcome(env, o)
 }
 
 pub fn flag(env: &Env, id: String, reason: String) -> Result<Output, CliError> {
     kb::open(&env.root)?;
     let o = write::apply(&env.ctx(), &Action::Flag { id, reason }, &[])?;
-    Ok(outcome(env, o))
+    outcome(env, o)
 }
 
 /// `rkb label <folder> [key=value | key --unset]`; with no assignment it shows the labels and writes nothing.
@@ -286,12 +295,12 @@ pub fn label(env: &Env, folder: String, assignment: Option<String>, unset: bool)
             ));
         }
     };
-    Ok(outcome(env, write::apply(&env.ctx(), &Action::Label { folder, key, value }, &[])?))
+    outcome(env, write::apply(&env.ctx(), &Action::Label { folder, key, value }, &[])?)
 }
 
 pub fn lifecycle(env: &Env, action: Action) -> Result<Output, CliError> {
     kb::open(&env.root)?;
-    Ok(outcome(env, write::apply(&env.ctx(), &action, &[])?))
+    outcome(env, write::apply(&env.ctx(), &action, &[])?)
 }
 
 /// `result` is `worked`, `failed` (also flags) or `irrelevant`.
@@ -309,7 +318,7 @@ pub fn used(env: &Env, id: String, result: &str, reason: Option<String>, session
     let mut human = format!("Recorded: {id} {result}");
     if failed {
         let reason = reason.unwrap_or_default();
-        let flagged = outcome(env, write::apply(&env.ctx(), &Action::Flag { id, reason }, &[])?);
+        let flagged = outcome(env, write::apply(&env.ctx(), &Action::Flag { id, reason }, &[])?)?;
         human.push_str(&format!("\n{}", flagged.human));
         data["flag"] = flagged.data;
     }
@@ -406,6 +415,20 @@ fn ask_terminal(req: &Request, choice: &str) -> Result<(), CliError> {
 }
 
 pub fn confirm(env: &Env, id: String, choice: String) -> Result<Output, CliError> {
+    let auto = auto_choice(std::slice::from_ref(&choice)).is_some();
+    if auto {
+        rkb_core::git::set_auto_confirmed(&choice);
+    }
+    let mut out = confirm_choice(env, id, choice.clone(), auto)?;
+    if auto {
+        let line = format!("auto_confirmed: {choice} (RKB_AUTO_CONFIRM)");
+        out.data["auto_confirmed"] = json!(format!("{choice} (RKB_AUTO_CONFIRM)"));
+        out.human.push_str(&format!("\n{line}"));
+    }
+    Ok(out)
+}
+
+fn confirm_choice(env: &Env, id: String, choice: String, auto: bool) -> Result<Output, CliError> {
     let req = request::load(&env.state.join("requests"), &id)?;
     if !matches!(req.action, request::Action::Install { .. }) {
         kb::open(&env.root)?;
@@ -414,13 +437,13 @@ pub fn confirm(env: &Env, id: String, choice: String) -> Result<Output, CliError
         return Err(rkb_core::Error::BadChoice { choice, options: req.options() }.into());
     }
     let answered = ANSWERED.load(std::sync::atomic::Ordering::Relaxed);
-    if choice != "cancel" && !answered && request::trusted_harness(&paths::config_dir()).is_none() {
+    if choice != "cancel" && !answered && !auto && request::trusted_harness(&paths::config_dir()).is_none() {
         ask_terminal(&req, &choice)?;
     }
     if let request::Action::Publish { ids, encrypted, out, serve } = &req.action {
         request::remove(&env.state.join("requests"), &req.id);
         if choice == "cancel" {
-            return Ok(outcome(env, Outcome::Cancelled));
+            return outcome(env, Outcome::Cancelled);
         }
         return crate::site::run(
             env,
@@ -431,7 +454,7 @@ pub fn confirm(env: &Env, id: String, choice: String) -> Result<Output, CliError
         );
     }
     let o = write::confirm(&env.ctx(), &req, &choice)?;
-    Ok(outcome(env, o))
+    outcome(env, o)
 }
 
 #[cfg(test)]

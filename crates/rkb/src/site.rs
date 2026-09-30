@@ -533,7 +533,7 @@ pub fn run(env: &Env, out: Option<String>, serve: Option<u16>, approved: &Approv
             session: None,
         };
         request::save(&env.state.join("requests"), &req)?;
-        return Ok(writes::needs_user_output(env, &req));
+        return writes::needs_user_output(env, &req);
     }
     let gone: Vec<String> = before
         .clear

@@ -12,6 +12,7 @@ rkb manages a git repository of Markdown lessons at `$RKB_HOME` (default `~/Pers
 - Run `rkb` (or `rkb context` for a few short lines) at the start of a task. It shows the project and system rkb matched here, lesson counts, pending requests and uncommitted changes.
 - Run `rkb doctor` when something looks wrong. Each check that is not `ok` has a `fix` line; run it or show it to the user.
 - Setup, once per machine: `rkb init` creates a new knowledge base, or `rkb init --clone <url>` sets up an existing one on a second machine. Then the user runs `rkb install` in a terminal to put this skill, the hooks, the tools and the confirm gate into Claude Code (as the `rkb` plugin), pi and omp (as an extension file). If you run `rkb install` yourself, it returns `needs_user`; show the question to the user.
+- In CI, set `RKB_AUTO_CONFIRM=install` and run `rkb install pi`. `continue` also lifts the burst limit on writes, so add it only when CI must write many lessons.
 - Run `rkb list` for a table of contents: every scope, project, system and topic with lesson counts. Run `rkb list <scope>` for one scope, such as `rkb list projects/dftracer`.
 - Run `rkb list <topic folder>`, such as `rkb list general/cpp`, to see its lessons grouped by their first tag, with id, type, status, tags and conditions. Archived and superseded lessons come last.
 - Run `rkb search "<words from the problem or the error>"` first when you hit a problem. Results show `applies` for this place; act only on `yes`, and check a `unknown` lesson (run its `Check`, or ask the user) before you rely on it. A `hidden:` line counts lessons that do not apply here; `--all` shows them and other projects' lessons.
@@ -52,6 +53,8 @@ You may write, edit, merge, supersede and archive single lessons without asking:
 1. Show the question and the options to the user. Do not choose for them.
 2. Wait for their answer.
 3. Run `rkb confirm <request> --choice "<option they chose>"`. When it returns `needs_terminal`, tell the user to run the command in a separate terminal window (the `fix` line has it). You cannot answer the terminal prompt yourself, and Claude Code's `!` prefix has no terminal either, so do not suggest `! rkb confirm`. When Claude Code refuses `rkb confirm` and says a person must run it, show the user the question and that exact command, and wait until they say it is done.
+
+In CI, the environment variable `RKB_AUTO_CONFIRM` (a comma-separated list of option names, such as `install,continue`) answers for the user. When a question's options include a listed name, rkb takes the first listed name that matches, records the answer as if `rkb confirm` had been run and goes on; `rkb confirm` also works without a terminal for a listed name. The result and `rkb changes` show `auto_confirmed: <option> (RKB_AUTO_CONFIRM)`. rkb reads the variable only from the environment, never from `kb.toml` or `config.toml`. When no option matches, you get `needs_user` as before. Never set the variable yourself to skip a question the user should answer.
 
 A request expires after one hour. Run the original command again after that.
 

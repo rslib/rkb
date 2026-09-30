@@ -2563,6 +2563,48 @@ fn install_pi_from_an_agent_and_list() {
     assert!(human.contains("~/.pi/agent/extensions/rkb.ts") && human.contains("current"), "{human}");
 }
 
+fn json_with_auto(env: &Env, auto: Option<&str>, args: &[&str]) -> (serde_json::Value, Option<i32>) {
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    if let Some(a) = auto {
+        c.env("RKB_AUTO_CONFIRM", a);
+    }
+    let mut all = args.to_vec();
+    all.extend(["--format", "json"]);
+    let o = rkb_with(c, &all, "");
+    (serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("not json: {}", stdout(&o))), o.status.code())
+}
+
+#[test]
+fn auto_confirm_answers_only_listed_options() {
+    let env = Env::new();
+    let ext = env.dir.path().join(".pi/agent/extensions/rkb.ts");
+    std::fs::create_dir_all(env.dir.path().join(".pi")).unwrap();
+
+    for auto in [None, Some("continue")] {
+        let (v, code) = json_with_auto(&env, auto, &["install", "pi"]);
+        assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{auto:?}: {v}");
+        assert!(!ext.exists());
+    }
+
+    let (v, code) = json_with_auto(&env, Some("continue,install"), &["install", "pi"]);
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(v["auto_confirmed"], "install (RKB_AUTO_CONFIRM)");
+    assert!(ext.exists());
+}
+
+#[test]
+fn confirm_without_a_terminal_needs_the_variable() {
+    let env = Env::new();
+    std::fs::create_dir_all(env.dir.path().join(".pi")).unwrap();
+    let (v, _) = env.json(&["install", "pi"], "");
+    let id = v["request"].as_str().unwrap();
+    let (e, _) = json_with_auto(&env, None, &["confirm", id, "--choice", "install"]);
+    assert_eq!(e["error"]["code"], "needs_terminal", "{e}");
+    let (e, code) = json_with_auto(&env, Some("install"), &["confirm", id, "--choice", "install"]);
+    assert_eq!(code, Some(0), "{e}");
+    assert!(env.dir.path().join(".pi/agent/extensions/rkb.ts").exists());
+}
+
 /// Two clones of one knowledge base through a bare remote: the fixture at `env.kb()` and a clone at `second`.
 fn sync_pair() -> (Env, PathBuf, PathBuf) {
     let env = fixture_kb();

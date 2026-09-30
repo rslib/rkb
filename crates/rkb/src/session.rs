@@ -119,10 +119,10 @@ pub fn context(s: &State) -> Output {
 pub fn doctor(env: &Env, place: &Place, break_lock: bool) -> Result<Output, CliError> {
     if break_lock {
         kb::open(&env.root)?;
-        return Ok(match doctor::break_lock_request(&env.root, &env.state)? {
+        return match doctor::break_lock_request(&env.root, &env.state)? {
             Some(req) => writes::outcome(env, rkb_core::write::Outcome::NeedsUser(req)),
             None => writes::outcome(env, rkb_core::write::Outcome::Info("There is no write lock; nothing to break".into())),
-        });
+        };
     }
     let mut checks = doctor::run(&env.root, place, &env.state, &paths::config_dir(), &env.lint);
     let settings = rkb_core::rerank::Settings::load(&env.root);
@@ -244,6 +244,9 @@ pub fn changes(rows: &[rkb_core::review::Change], since: &str, c: bool) -> Outpu
         ));
         if let Some(reason) = &r.reason {
             human.push_str(&format!("    {}\n", paint(c, "2", reason)));
+        }
+        if let Some(o) = &r.auto_confirmed {
+            human.push_str(&format!("    {}\n", paint(c, "2", &format!("auto_confirmed: {o} (RKB_AUTO_CONFIRM)"))));
         }
     }
     if rows.is_empty() {

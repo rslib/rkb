@@ -46,9 +46,20 @@ pub fn commit(dir: &Path, message: &str) -> Result<()> {
     run(dir, &["-c", "user.useConfigOnly=true", "commit", "--no-verify", "-q", "-m", message]).map(|_| ())
 }
 
+static AUTO_CONFIRMED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Marks every later commit of this process with the option `RKB_AUTO_CONFIRM` answered, for `rkb changes`.
+pub fn set_auto_confirmed(option: &str) {
+    *AUTO_CONFIRMED.lock().unwrap() = Some(option.to_string());
+}
+
 /// Commits only `paths`, even when other changes are staged.
 pub fn commit_paths(dir: &Path, message: &str, paths: &[&str]) -> Result<()> {
-    let mut args = vec!["-c", "user.useConfigOnly=true", "commit", "--no-verify", "-q", "-m", message, "--"];
+    let message = match AUTO_CONFIRMED.lock().unwrap().as_deref() {
+        Some(o) => format!("{message}\n\nAuto-confirmed: {o}"),
+        None => message.to_string(),
+    };
+    let mut args = vec!["-c", "user.useConfigOnly=true", "commit", "--no-verify", "-q", "-m", &message, "--"];
     args.extend_from_slice(paths);
     run(dir, &args).map(|_| ())
 }
