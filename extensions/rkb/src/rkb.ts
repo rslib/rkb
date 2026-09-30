@@ -233,7 +233,8 @@ export default function rkb(pi: ExtensionAPI) {
     "session_shutdown",
     safe(async (event, ctx) => {
       const path = transcript(ctx);
-      if (path) await hook("session-end", { ...base(ctx), transcript_path: path, reason: String(event?.reason ?? "") }, SHUTDOWN_TIMEOUT_MS);
+      const model = ctx?.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
+      if (path) await hook("session-end", { ...base(ctx), transcript_path: path, reason: String(event?.reason ?? ""), model }, SHUTDOWN_TIMEOUT_MS);
       return undefined;
     }),
   );

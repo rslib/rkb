@@ -400,8 +400,8 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<InboxCmd>,
     },
-    /// Have the approved observer command read a session and save its durable notes to the inbox.
-    /// The session-end hook starts it in the background; it runs only with `[observer] cmd` approved.
+    /// Have the harness's agent, with the approved [observer] models, read a session and save its
+    /// durable notes to the inbox. The session-end hook starts it in the background.
     #[command(
         after_help = "Example:\n  rkb observe --session 3f2a --transcript ~/.claude/projects/p/3f2a.jsonl --harness claude-code --cwd ~/code/p"
     )]
@@ -416,6 +416,9 @@ enum Cmd {
         /// The session's working directory; picks the project and system for the lesson titles.
         #[arg(long)]
         cwd: Option<String>,
+        /// The session's model, for a chain entry `session`. Default: the harness's default model.
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Download or check model files for reranking.
     #[command(after_help = "Example:\n  rkb models fetch")]
@@ -803,7 +806,9 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Note { words, priority } => inbox::note(&env, words, priority),
         Cmd::Tools => Ok(agent::list()),
         Cmd::Tool { .. } | Cmd::Mcp => unreachable!("main runs tools and the MCP server first"),
-        Cmd::Observe { session, transcript, harness, cwd } => inbox::observe(&env, &session, &transcript, &harness, cwd.as_deref()),
+        Cmd::Observe { session, transcript, harness, cwd, model } => {
+            inbox::observe(&env, &session, &transcript, &harness, cwd.as_deref(), model.as_deref())
+        }
         Cmd::Inbox { action: None } => inbox::list(&env),
         Cmd::Inbox { action: Some(InboxCmd::Show { id }) } => inbox::show(&env, &id),
         Cmd::Inbox { action: Some(InboxCmd::Done { ids }) } => inbox::done(&env, &ids),

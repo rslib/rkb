@@ -256,19 +256,22 @@ fn capture(p: &Value, state: &Path, session: &str, harness: &str) -> Result<Opti
     Ok(None)
 }
 
-/// Starts `rkb observe` for the session in the background when the observer is set up and approved
-/// here, and returns at once.
+/// Starts `rkb observe` for the session in the background when the observer has an approved chain
+/// for this harness, and returns at once.
 fn start_observer(p: &Value, session: &str, harness: &str) -> Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let Some(transcript) = p["transcript_path"].as_str() else { return Ok(()) };
-    if rkb_core::observer::ready(&paths::config_dir()).is_none() {
+    if rkb_core::observer::ready(&paths::config_dir(), harness).is_none() {
         return Ok(());
     }
     let mut c = Command::new(std::env::current_exe()?);
     c.args(["observe", "--session", session, "--transcript", transcript, "--harness", harness]);
     if let Some(cwd) = p["cwd"].as_str() {
         c.args(["--cwd", cwd]);
+    }
+    if let Some(model) = p["model"].as_str().filter(|m| !m.is_empty()) {
+        c.args(["--model", model]);
     }
     c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0).spawn()?;
     Ok(())

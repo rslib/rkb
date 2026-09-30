@@ -185,32 +185,76 @@ pub fn machine(config_dir: &std::path::Path) -> Result<(std::path::PathBuf, toml
     }
 }
 
-/// `[observer]` in the per-machine `config.toml`. Without `cmd` the observer is off.
+/// The harnesses an observer chain can be set for, as `[observer]` keys.
+pub const OBSERVER_HARNESSES: [&str; 3] = ["claude-code", "pi", "omp"];
+
+/// A model chain: one model, or a list tried in order.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(untagged)]
+enum Chain {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObserverTable {
+    #[serde(rename = "claude-code")]
+    claude_code: Option<Chain>,
+    pi: Option<Chain>,
+    omp: Option<Chain>,
+    timeout_secs: Option<u64>,
+    min_prompts: Option<usize>,
+}
+
+/// `[observer]` in the per-machine `config.toml`: a model chain per harness. Without a chain the
+/// observer is off for that harness.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ObserverConfig {
-    pub cmd: Option<String>,
+    /// `(harness, models)` in `OBSERVER_HARNESSES` order, only harnesses with at least one model.
+    pub chains: Vec<(String, Vec<String>)>,
     pub timeout_secs: u64,
     pub min_prompts: usize,
 }
 
 impl Default for ObserverConfig {
     fn default() -> Self {
-        ObserverConfig { cmd: None, timeout_secs: 600, min_prompts: 3 }
+        ObserverConfig { chains: vec![], timeout_secs: 600, min_prompts: 3 }
     }
 }
 
 impl ObserverConfig {
     pub fn from_table(machine: &toml::Table) -> Result<ObserverConfig, String> {
-        match machine.get("observer") {
-            None => Ok(ObserverConfig::default()),
-            Some(v) => v.clone().try_into().map_err(|e: toml::de::Error| format!("[observer]: {}", e.message())),
+        let Some(v) = machine.get("observer") else { return Ok(ObserverConfig::default()) };
+        let t: ObserverTable = v.clone().try_into().map_err(|e: toml::de::Error| format!("[observer]: {}", e.message()))?;
+        let d = ObserverConfig::default();
+        let mut chains = vec![];
+        for (h, c) in OBSERVER_HARNESSES.iter().zip([t.claude_code, t.pi, t.omp]) {
+            let models: Vec<String> = match c {
+                None => vec![],
+                Some(Chain::One(m)) => vec![m],
+                Some(Chain::Many(ms)) => ms,
+            };
+            let models: Vec<String> = models.iter().map(|m| m.trim().to_string()).filter(|m| !m.is_empty()).collect();
+            if !models.is_empty() {
+                chains.push((h.to_string(), models));
+            }
         }
+        Ok(ObserverConfig {
+            chains,
+            timeout_secs: t.timeout_secs.unwrap_or(d.timeout_secs),
+            min_prompts: t.min_prompts.unwrap_or(d.min_prompts),
+        })
     }
 
-    /// The command, when one is set and not blank.
-    pub fn command(&self) -> Option<&str> {
-        self.cmd.as_deref().map(str::trim).filter(|c| !c.is_empty())
+    /// The models for `harness`, empty when it has no observer.
+    pub fn chain(&self, harness: &str) -> &[String] {
+        self.chains.iter().find(|(h, _)| h == harness).map_or(&[], |(_, m)| m)
+    }
+
+    /// What the user approves: every chain, one line per harness, such as `pi = openai-codex/gpt-5.6-luna, session`.
+    pub fn summary(&self) -> String {
+        self.chains.iter().map(|(h, m)| format!("{h} = {}", m.join(", "))).collect::<Vec<_>>().join("\n")
     }
 }
 
@@ -270,17 +314,21 @@ mod tests {
 
     #[test]
     fn observer_table() {
-        let t: toml::Table = toml::from_str("[observer]\ncmd = \"claude -p\"\nmin_prompts = 5\n").unwrap();
+        let t: toml::Table = toml::from_str(
+            "[observer]\nclaude-code = \"sonnet\"\npi = [\"openai-codex/gpt-5.6-luna\", \" session \"]\nomp = []\nmin_prompts = 5\n",
+        )
+        .unwrap();
         let o = ObserverConfig::from_table(&t).unwrap();
-        assert_eq!(o.command(), Some("claude -p"));
+        assert_eq!(o.chain("claude-code"), ["sonnet"]);
+        assert_eq!(o.chain("pi"), ["openai-codex/gpt-5.6-luna", "session"]);
+        assert!(o.chain("omp").is_empty(), "an empty list is off");
         assert_eq!((o.timeout_secs, o.min_prompts), (600, 5));
+        assert_eq!(o.summary(), "claude-code = sonnet\npi = openai-codex/gpt-5.6-luna, session");
         let off = ObserverConfig::from_table(&toml::Table::new()).unwrap();
         assert_eq!(off, ObserverConfig::default());
-        assert_eq!(off.command(), None);
-        let blank: toml::Table = toml::from_str("[observer]\ncmd = \"  \"\n").unwrap();
-        assert_eq!(ObserverConfig::from_table(&blank).unwrap().command(), None);
-        let bad: toml::Table = toml::from_str("[observer]\ncommand = \"x\"\n").unwrap();
-        assert!(ObserverConfig::from_table(&bad).is_err());
+        assert!(off.chains.is_empty());
+        let bad: toml::Table = toml::from_str("[observer]\ncmd = \"claude -p\"\n").unwrap();
+        assert!(ObserverConfig::from_table(&bad).unwrap_err().contains("cmd"));
     }
 
     #[test]

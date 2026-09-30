@@ -1,5 +1,6 @@
-//! The opt-in observer: after a session ends, a command the user approved reads a digest of the
-//! session and prints durable notes, which become one `observed` inbox item for distill.
+//! The opt-in observer: after a session ends, the harness's own command-line agent, with a model
+//! chain the user approved, reads a digest of the session and prints durable notes, which become one
+//! `observed` inbox item for distill.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -16,11 +17,11 @@ use crate::request::{self, Action, Choice, Decision, Request};
 use crate::write::{Ctx, Outcome};
 use crate::{lock, paths, script};
 
-/// Set in the command's environment; every rkb hook does nothing while it is set.
+/// Set in the model's environment; every rkb hook does nothing while it is set.
 pub const ENV: &str = "RKB_OBSERVER";
 /// Days of outcome lines kept in `observer.jsonl`.
 const LOG_DAYS: u64 = 90;
-/// Output of one command run read at most.
+/// Output of one model run read at most.
 const MAX_OUTPUT: u64 = 1 << 20;
 
 /// Whether this process runs inside an observer command.
@@ -39,34 +40,40 @@ pub fn load(config_dir: &Path) -> std::result::Result<ObserverConfig, String> {
     ObserverConfig::from_table(&table)
 }
 
-pub fn approved(config_dir: &Path, cmd: &str) -> bool {
-    approval::is_approved(config_dir, &script::hash(cmd), &system())
+pub fn approved(config_dir: &Path, cfg: &ObserverConfig) -> bool {
+    !cfg.chains.is_empty() && approval::is_approved(config_dir, &script::hash(&cfg.summary()), &system())
 }
 
-/// The settings, when the observer has a command and that command is approved here.
-pub fn ready(config_dir: &Path) -> Option<ObserverConfig> {
-    load(config_dir).ok().filter(|c| c.command().is_some_and(|cmd| approved(config_dir, cmd)))
+/// The settings, when `harness` has a chain and the chains are approved here.
+pub fn ready(config_dir: &Path, harness: &str) -> Option<ObserverConfig> {
+    load(config_dir).ok().filter(|c| !c.chain(harness).is_empty() && approved(config_dir, c))
 }
 
-fn no_command() -> Error {
+fn no_chain() -> Error {
     Error::NotReady {
-        reason: "no observer command is set".into(),
-        fix: format!("set `cmd` under [observer] in {}", paths::config_dir().join("config.toml").display()),
+        reason: "no observer model chain is set".into(),
+        fix: format!(
+            "add `claude-code`, `pi` or `omp` with a list of models under [observer] in {}",
+            paths::config_dir().join("config.toml").display()
+        ),
     }
 }
 
-/// A request to approve the observer command, or `None` when it is already approved here.
+/// A request to approve the observer chains, or `None` when they are already approved here.
 pub fn approve_request(ctx: &Ctx) -> Result<Option<Request>> {
     let dir = paths::config_dir();
     let cfg = load(&dir).map_err(Error::Refused)?;
-    let cmd = cfg.command().ok_or_else(no_command)?;
-    let sha = script::hash(cmd);
+    if cfg.chains.is_empty() {
+        return Err(no_chain());
+    }
+    let summary = cfg.summary();
+    let sha = script::hash(&summary);
     let system = system();
     if approval::is_approved(&dir, &sha, &system) {
         return Ok(None);
     }
     let question = format!(
-        "Approve the observer command on {system}? After each session with {} or more prompts ends, rkb runs it with `sh -c` in the background and sends it the session's text on stdin: your prompts, the agent's text, tool calls and error lines. Whatever model it calls receives that text.\n```sh\n{cmd}\n```\nsha256 {sha}",
+        "Approve the observer on {system}? After each session with {} or more prompts ends, rkb runs that harness's own agent in print mode, with no tools, in the background, and sends it the session's text: your prompts, the agent's text, tool calls and error lines. It tries the models in order until one answers:\n{summary}\n(`session` is the model the session used.) sha256 {sha}",
         cfg.min_prompts
     );
     let req = Request {
@@ -85,12 +92,12 @@ pub fn approve_request(ctx: &Ctx) -> Result<Option<Request>> {
     Ok(Some(req))
 }
 
-/// Records a confirmed approval, when the command is still the one the request showed.
+/// Records a confirmed approval, when the chains are still the ones the request showed.
 pub fn approve(ctx: &Ctx, sha256: &str, system: &str) -> Result<Outcome> {
     let dir = paths::config_dir();
     let cfg = load(&dir).map_err(Error::Refused)?;
-    if cfg.command().map(script::hash).as_deref() != Some(sha256) {
-        return Err(Error::Refused("the observer command changed since the request; run `rkb approve observer` again".into()));
+    if script::hash(&cfg.summary()) != sha256 {
+        return Err(Error::Refused("the observer chains changed since the request; run `rkb approve observer` again".into()));
     }
     approval::add(
         &dir,
@@ -102,7 +109,36 @@ pub fn approve(ctx: &Ctx, sha256: &str, system: &str) -> Result<Outcome> {
             date: ctx.today.to_string(),
         },
     )?;
-    Ok(Outcome::Info(format!("Approved the observer command on {system}")))
+    Ok(Outcome::Info(format!("Approved the observer on {system}")))
+}
+
+/// The program and arguments that run `harness`'s agent in print mode with `model` (its default model
+/// when `None`), reading the prompt on stdin, with no tools, extensions, hooks or saved session.
+/// `RKB_CLAUDE`, `RKB_PI` and `RKB_OMP` override the program.
+pub fn command(harness: &str, model: Option<&str>) -> (String, Vec<String>) {
+    let (var, name, flags): (&str, &str, &[&str]) = match harness {
+        "claude-code" => (
+            "RKB_CLAUDE",
+            "claude",
+            &[
+                "--tools",
+                "",
+                "--settings",
+                r#"{"disableAllHooks":true}"#,
+                "--strict-mcp-config",
+                "--no-session-persistence",
+                "--disable-slash-commands",
+            ],
+        ),
+        "omp" => ("RKB_OMP", "omp", &["--no-session", "--no-tools", "--no-extensions", "--no-lsp"]),
+        _ => ("RKB_PI", "pi", &["--no-session", "--no-tools", "--no-extensions"]),
+    };
+    let mut args = vec!["-p".to_string()];
+    if let Some(m) = model {
+        args.extend(["--model".to_string(), m.to_string()]);
+    }
+    args.extend(flags.iter().map(|f| f.to_string()));
+    (std::env::var(var).unwrap_or_else(|_| name.into()), args)
 }
 
 /// Notes kept from a command's output, and how many other non-empty lines were dropped.
@@ -118,19 +154,20 @@ fn note_re() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
         regex::Regex::new(
-            r"^(?:[-*] +)?(\d{4}-\d{2}-\d{2} \[(high|med|low)\] \((decision|preference|pitfall|fact); (general|project)\) \S.*)$",
+            r"^(?:[-*] +)?(\d{4}-\d{2}-\d{2}) +\[?(high|med|low)\]? +\(?(decision|preference|pitfall|fact) *; *(general|project)\)?:? +(\S.*)$",
         )
         .expect("valid note pattern")
     })
 }
 
-/// The lines of `out` in the note format, each starting with `- `, as models sometimes leave the
-/// bullet out; `NONE` and blank lines are not counted as dropped.
+/// The lines of `out` in the note format, rewritten to `- <date> [<level>] (<type>; <scope>) <note>`:
+/// models sometimes leave out the bullet, the brackets or the parentheses. `NONE` and blank lines are
+/// not counted as dropped.
 pub fn parse_notes(out: &str) -> Notes {
     let mut n = Notes::default();
     for line in out.lines().map(str::trim) {
         if let Some(c) = note_re().captures(line) {
-            n.notes.push(format!("- {}", &c[1]));
+            n.notes.push(format!("- {} [{}] ({}; {}) {}", &c[1], &c[2], &c[3], &c[4], &c[5]));
         } else if !line.trim().is_empty() && line.trim() != "NONE" {
             n.dropped += 1;
             n.first_dropped.get_or_insert_with(|| line.trim().chars().take(200).collect());
@@ -212,9 +249,9 @@ pub enum Ran {
     Timeout,
 }
 
-/// Runs `cmd` with `sh -c`, `input` on stdin and `RKB_OBSERVER=1`, in its own process group; kills the
-/// group after `timeout`.
-pub fn run(cmd: &str, input: &str, cwd: Option<&Path>, timeout: Duration, scratch: &Path) -> Result<Ran> {
+/// Runs `program` with `input` on stdin and `RKB_OBSERVER=1`, in `scratch` and its own process group;
+/// kills the group after `timeout`.
+pub fn run(program: &str, args: &[String], input: &str, timeout: Duration, scratch: &Path) -> Result<Ran> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::process::CommandExt;
     std::fs::create_dir_all(scratch).map_err(io(scratch))?;
@@ -225,11 +262,8 @@ pub fn run(cmd: &str, input: &str, cwd: Option<&Path>, timeout: Duration, scratc
     std::io::Write::write_all(&mut open(&input_path)?, input.as_bytes()).map_err(io(&input_path))?;
     let out_file = open(&output_path)?;
     let stdin = std::fs::File::open(&input_path).map_err(io(&input_path))?;
-    let mut c = Command::new("sh");
-    c.args(["-c", cmd]).env(ENV, "1").stdin(stdin).stdout(out_file).stderr(Stdio::null()).process_group(0);
-    if let Some(d) = cwd.filter(|d| d.is_dir()) {
-        c.current_dir(d);
-    }
+    let mut c = Command::new(program);
+    c.args(args).env(ENV, "1").current_dir(scratch).stdin(stdin).stdout(out_file).stderr(Stdio::null()).process_group(0);
     let ran = match c.spawn() {
         Err(e) => Ran::Failed(format!("did not start: {e}")),
         Ok(mut child) => {
@@ -262,8 +296,16 @@ pub fn run(cmd: &str, input: &str, cwd: Option<&Path>, timeout: Duration, scratc
 /// What one `rkb observe` did.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Observed {
-    Added { item: distill::Item, dropped: usize },
-    NoNotes { dropped: usize },
+    /// `via` names the models that answered, and any that failed before them.
+    Added {
+        item: distill::Item,
+        dropped: usize,
+        via: String,
+    },
+    NoNotes {
+        dropped: usize,
+        via: String,
+    },
     Skipped(String),
     Failed(String),
 }
@@ -271,8 +313,10 @@ pub enum Observed {
 impl Observed {
     fn outcome(&self) -> (&'static str, String) {
         match self {
-            Observed::Added { item, dropped } => ("added", format!("{} notes, {dropped} lines dropped", item.body.lines().count())),
-            Observed::NoNotes { dropped } => ("none", format!("{dropped} lines dropped")),
+            Observed::Added { item, dropped, via } => {
+                ("added", format!("{} notes, {dropped} lines dropped, via {via}", item.body.lines().count()))
+            }
+            Observed::NoNotes { dropped, via } => ("none", format!("{dropped} lines dropped, via {via}")),
             Observed::Skipped(r) => ("skipped", r.clone()),
             Observed::Failed(r) => ("failed", r.clone()),
         }
@@ -320,12 +364,28 @@ pub struct Job<'a> {
     pub transcript: &'a Path,
     pub harness: &'a str,
     pub cwd: Option<&'a str>,
+    /// The session's model, for a chain entry `session`; the harness default when unknown.
+    pub model: Option<&'a str>,
     /// Titles of the lessons that can apply to the session's place.
     pub titles: Vec<String>,
 }
 
-/// Observes the entries of a session after its last observed point with the approved command `cmd`.
-pub fn observe(state: &Path, cfg: &ObserverConfig, cmd: &str, job: &Job) -> Result<Observed> {
+/// Observes the entries of a session after its last observed point with the harness's chain.
+pub fn observe(state: &Path, cfg: &ObserverConfig, job: &Job) -> Result<Observed> {
+    let timeout = Duration::from_secs(cfg.timeout_secs);
+    let scratch = state.join("observer");
+    observe_with(state, cfg, job, |model, input| {
+        let (program, args) = command(job.harness, model);
+        run(&program, &args, input, timeout, &scratch)
+    })
+}
+
+/// `observe`, with `run_model(model, prompt)` in place of running the harness.
+fn observe_with(state: &Path, cfg: &ObserverConfig, job: &Job, run_model: impl Fn(Option<&str>, &str) -> Result<Ran>) -> Result<Observed> {
+    let chain = cfg.chain(job.harness);
+    if chain.is_empty() {
+        return Ok(Observed::Skipped(format!("no observer chain for {}", job.harness)));
+    }
     let records = crate::hooks::read(state, job.session);
     let from = records.iter().rev().find(|r| r["kind"] == "observed").and_then(|r| r["offset"].as_u64());
     let (steps, end) = distill::read_from(job.transcript, job.harness, from)?;
@@ -349,22 +409,37 @@ pub fn observe(state: &Path, cfg: &ObserverConfig, cmd: &str, job: &Job) -> Resu
     let mut kept: Vec<String> = vec![];
     let mut dropped = 0;
     let mut first_dropped: Option<String> = None;
+    let mut via: Vec<String> = vec![];
     for part in &d.parts {
         let input = prompt(&job.titles, &pending, part);
-        let ran = run(cmd, &input, job.cwd.map(Path::new), Duration::from_secs(cfg.timeout_secs), &state.join("observer"))?;
-        let out = match ran {
-            Ran::Ok(out) => out,
-            Ran::Failed(r) => return Ok(fail(state, job.session, d.parts.len(), r)),
-            Ran::Timeout => return Ok(fail(state, job.session, d.parts.len(), "timeout".into())),
-        };
+        let mut failures: Vec<String> = vec![];
+        let mut answer = None;
+        for m in chain {
+            let model = if m == "session" { job.model } else { Some(m.as_str()) };
+            match run_model(model, &input)? {
+                Ran::Ok(out) => {
+                    answer = Some(out);
+                    let name = if m == "session" { format!("session ({})", model.unwrap_or("default")) } else { m.clone() };
+                    let entry = if failures.is_empty() { name } else { format!("{name} ({})", failures.join("; ")) };
+                    if !via.contains(&entry) {
+                        via.push(entry);
+                    }
+                    break;
+                }
+                Ran::Failed(r) => failures.push(format!("{m}: {r}")),
+                Ran::Timeout => failures.push(format!("{m}: timeout")),
+            }
+        }
+        let Some(out) = answer else { return Ok(fail(state, job.session, d.parts.len(), failures.join("; "))) };
         let n = parse_notes(&out);
         dropped += n.dropped;
         first_dropped = first_dropped.or(n.first_dropped);
         pending.extend(n.notes.iter().cloned());
         kept.extend(n.notes);
     }
+    let via = via.join(", ");
     let o = if kept.is_empty() {
-        Observed::NoNotes { dropped }
+        Observed::NoNotes { dropped, via }
     } else {
         let meta = Meta {
             kind: Kind::Observed,
@@ -376,7 +451,7 @@ pub fn observe(state: &Path, cfg: &ObserverConfig, cmd: &str, job: &Job) -> Resu
             priority: Some(priority(&kept)),
             source: None,
         };
-        Observed::Added { item: distill::add(state, meta, &kept.join("\n"))?, dropped }
+        Observed::Added { item: distill::add(state, meta, &kept.join("\n"))?, dropped, via }
     };
     crate::hooks::append(state, job.session, &json!({ "kind": "observed", "offset": end }))?;
     record(state, job.session, d.parts.len(), &o, first_dropped.as_deref());
@@ -399,6 +474,8 @@ mod tests {
         let n = parse_notes(out);
         assert_eq!(n.notes.len(), 2);
         assert!(n.notes[0].starts_with("- 2026-09-29 [med]"), "a missing bullet is added");
+        let bare = parse_notes("2026-09-29 med pitfall;project Building with `make -j8` on CI runs out of memory; use `make -j4`");
+        assert_eq!(bare.notes, ["- 2026-09-29 [med] (pitfall; project) Building with `make -j8` on CI runs out of memory; use `make -j4`"]);
         assert!(n.notes[1].ends_with("(replaces: 5f0ebe448c)"));
         assert_eq!(n.dropped, 3, "prose, fence and bad level");
         assert_eq!(n.first_dropped.as_deref(), Some("Here are the notes:"));
@@ -417,66 +494,104 @@ mod tests {
         assert!(p.contains("NEVER write version numbers"));
     }
 
+    fn sh(script: &str) -> Vec<String> {
+        vec!["-c".into(), script.into()]
+    }
+
     #[test]
     fn run_passes_stdin_env_and_times_out() {
         let d = tempfile::tempdir().unwrap();
-        let ran = run("cat; echo \"$RKB_OBSERVER\"", "hello\n", None, Duration::from_secs(10), d.path()).unwrap();
-        assert_eq!(ran, Ran::Ok("hello\n1\n".into()));
-        assert_eq!(run("exit 4", "", None, Duration::from_secs(10), d.path()).unwrap(), Ran::Failed("exit 4".into()));
+        let ran = run("sh", &sh("cat; echo \"$RKB_OBSERVER\"; pwd"), "hello\n", Duration::from_secs(10), d.path()).unwrap();
+        let Ran::Ok(out) = ran else { panic!("{ran:?}") };
+        assert!(out.starts_with("hello\n1\n") && out.trim_end().ends_with(d.path().file_name().unwrap().to_str().unwrap()), "{out}");
+        assert_eq!(run("sh", &sh("exit 4"), "", Duration::from_secs(10), d.path()).unwrap(), Ran::Failed("exit 4".into()));
         let start = Instant::now();
-        assert_eq!(run("sleep 30", "", None, Duration::from_secs(1), d.path()).unwrap(), Ran::Timeout);
+        assert_eq!(run("sh", &sh("sleep 30"), "", Duration::from_secs(1), d.path()).unwrap(), Ran::Timeout);
         assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(
+            matches!(run("/nonexistent/pi", &[], "", Duration::from_secs(1), d.path()).unwrap(), Ran::Failed(r) if r.starts_with("did not start"))
+        );
         assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 0, "input and output files removed");
     }
 
-    fn job<'a>(t: &'a Path) -> Job<'a> {
-        Job { session: "s1", transcript: t, harness: "claude-code", cwd: None, titles: vec![] }
+    #[test]
+    fn commands_per_harness() {
+        let (p, a) = command("pi", Some("openai-codex/gpt-5.6-luna"));
+        assert!(p.ends_with("pi"));
+        assert_eq!(a, ["-p", "--model", "openai-codex/gpt-5.6-luna", "--no-session", "--no-tools", "--no-extensions"]);
+        let (_, a) = command("omp", None);
+        assert_eq!(a, ["-p", "--no-session", "--no-tools", "--no-extensions", "--no-lsp"]);
+        let (_, a) = command("claude-code", Some("haiku"));
+        assert_eq!(&a[..4], ["-p", "--model", "haiku", "--tools"]);
+        assert!(a.contains(&r#"{"disableAllHooks":true}"#.to_string()) && a.contains(&"--no-session-persistence".to_string()));
     }
 
-    fn setup() -> (tempfile::TempDir, PathBuf, ObserverConfig) {
+    fn job<'a>(t: &'a Path) -> Job<'a> {
+        Job { session: "s1", transcript: t, harness: "pi", cwd: None, model: Some("openai-codex/gpt-5.6-sol"), titles: vec![] }
+    }
+
+    fn setup(chain: &str) -> (tempfile::TempDir, PathBuf, ObserverConfig) {
         let d = tempfile::tempdir().unwrap();
         let t = d.path().join("t.jsonl");
-        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/claude.jsonl"), &t).unwrap();
-        (d, t, ObserverConfig { cmd: None, timeout_secs: 10, min_prompts: 1 })
+        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/pi.jsonl"), &t).unwrap();
+        let table: toml::Table = toml::from_str(&format!("[observer]\npi = {chain}\ntimeout_secs = 10\nmin_prompts = 1\n")).unwrap();
+        (d, t, ObserverConfig::from_table(&table).unwrap())
     }
 
-    const NOTE: &str = "printf '%s\\n' '- 2026-09-20 [med] (pitfall; general) CMake finds ZLIB under /opt/zlib only with ZLIB_ROOT set.'";
+    const NOTE: &str = "- 2026-09-20 [med] (pitfall; general) CMake finds ZLIB under /opt/zlib only with ZLIB_ROOT set.";
+
+    /// A fake harness: `bad` exits 1, `slow` times out, `none` prints NONE, anything else prints a note.
+    fn fake(model: Option<&str>, _prompt: &str) -> Result<Ran> {
+        Ok(match model {
+            Some("bad") => Ran::Failed("exit 1".into()),
+            Some("slow") => Ran::Timeout,
+            Some("none") => Ran::Ok("NONE\n".into()),
+            _ => Ran::Ok(format!("Working...\n{NOTE}\n")),
+        })
+    }
 
     #[test]
     fn observe_adds_one_item_and_only_new_entries() {
-        let (d, t, cfg) = setup();
+        let (d, t, cfg) = setup(r#"["bad", "session"]"#);
         let state = d.path().join("state");
-        let o = observe(&state, &cfg, NOTE, &job(&t)).unwrap();
-        let Observed::Added { item, dropped: 0 } = o else { panic!("{o:?}") };
+        let o = observe_with(&state, &cfg, &job(&t), fake).unwrap();
+        let Observed::Added { item, dropped: 1, via } = o else { panic!("{o:?}") };
+        assert_eq!(via, "session (openai-codex/gpt-5.6-sol) (bad: exit 1)");
         assert_eq!((item.meta.kind, item.meta.priority), (Kind::Observed, Some(2)));
-        assert_eq!(item.meta.session.as_deref(), Some("s1"));
+        assert_eq!((item.meta.session.as_deref(), item.meta.harness.as_deref()), (Some("s1"), Some("pi")));
         assert!(item.body.contains("ZLIB_ROOT"));
-        let again = observe(&state, &cfg, "echo ran >> ran.txt", &job(&t)).unwrap();
+        let again = observe_with(&state, &cfg, &job(&t), |_, _| panic!("no model runs for nothing new")).unwrap();
         assert!(matches!(again, Observed::Skipped(_)), "{again:?}");
         assert_eq!(distill::list(&state).len(), 1);
-        assert_eq!(log(&state).last().unwrap()["outcome"], "added");
+        let last = log(&state).last().unwrap().clone();
+        assert_eq!(last["outcome"], "added");
+        assert!(last["detail"].as_str().unwrap().contains("via session"), "{last}");
+        assert_eq!(last["first_dropped"], "Working...");
     }
 
     #[test]
     fn short_sessions_failures_and_busy_runs_keep_the_point() {
-        let (d, t, mut cfg) = setup();
+        let (d, t, mut cfg) = setup(r#"["bad", "slow"]"#);
         let state = d.path().join("state");
         cfg.min_prompts = 3;
-        assert!(matches!(observe(&state, &cfg, NOTE, &job(&t)).unwrap(), Observed::Skipped(r) if r.contains("fewer than 3")));
+        assert!(matches!(observe_with(&state, &cfg, &job(&t), fake).unwrap(), Observed::Skipped(r) if r.contains("fewer than 3")));
         assert!(log(&state).is_empty(), "a short session records nothing");
         cfg.min_prompts = 1;
-        assert_eq!(observe(&state, &cfg, "exit 3", &job(&t)).unwrap(), Observed::Failed("exit 3".into()));
+        assert_eq!(observe_with(&state, &cfg, &job(&t), fake).unwrap(), Observed::Failed("bad: exit 1; slow: timeout".into()));
         let errors = std::fs::read_to_string(state.join("hook-errors.log")).unwrap();
-        assert!(errors.contains("\"session\":\"s1\"") && errors.contains("exit 3"));
-        cfg.timeout_secs = 1;
-        assert_eq!(observe(&state, &cfg, "sleep 30", &job(&t)).unwrap(), Observed::Failed("timeout".into()));
-        cfg.timeout_secs = 10;
+        assert!(errors.contains("\"session\":\"s1\"") && errors.contains("slow: timeout"));
+        let (_, _, ok) = setup(r#""x""#);
         let held = lock::acquire(&state.join("observer-run.lock"), 60, Duration::ZERO).unwrap();
-        assert!(matches!(observe(&state, &cfg, NOTE, &job(&t)).unwrap(), Observed::Skipped(r) if r.contains("another")));
+        assert!(matches!(observe_with(&state, &ok, &job(&t), fake).unwrap(), Observed::Skipped(r) if r.contains("another")));
         drop(held);
         assert!(distill::list(&state).is_empty());
-        assert_eq!(observe(&state, &cfg, "echo NONE", &job(&t)).unwrap(), Observed::NoNotes { dropped: 0 });
-        assert!(matches!(observe(&state, &cfg, NOTE, &job(&t)).unwrap(), Observed::Skipped(_)), "NONE still marks the point");
+        let (_, _, none) = setup(r#""none""#);
+        assert_eq!(observe_with(&state, &none, &job(&t), fake).unwrap(), Observed::NoNotes { dropped: 0, via: "none".into() });
+        assert!(matches!(observe_with(&state, &ok, &job(&t), fake).unwrap(), Observed::Skipped(_)), "NONE still marks the point");
+        let other = Job { harness: "omp", ..job(&t) };
+        assert!(
+            matches!(observe_with(&state, &ok, &other, fake).unwrap(), Observed::Skipped(r) if r.contains("no observer chain for omp"))
+        );
     }
 
     #[test]

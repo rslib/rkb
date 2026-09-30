@@ -120,44 +120,52 @@ pub fn done(env: &Env, ids: &[String]) -> Result<Output, CliError> {
     Ok(Output { data: json!({ "items": rows }), human: human.trim_end().to_string(), exit, raw: false })
 }
 
-/// `rkb observe`: runs the approved observer command over the new part of one session.
-pub fn observe(env: &Env, session: &str, transcript: &std::path::Path, harness: &str, cwd: Option<&str>) -> Result<Output, CliError> {
+/// `rkb observe`: runs the harness's approved model chain over the new part of one session.
+pub fn observe(
+    env: &Env,
+    session: &str,
+    transcript: &std::path::Path,
+    harness: &str,
+    cwd: Option<&str>,
+    model: Option<&str>,
+) -> Result<Output, CliError> {
     use rkb_core::observer::{self, Observed};
     let config = rkb_core::paths::config_dir();
     let cfg = observer::load(&config).map_err(|e| CliError::new(ErrorCode::Usage, e, "fix [observer] in config.toml"))?;
-    let Some(cmd) = cfg.command() else {
+    if cfg.chain(harness).is_empty() {
         return Err(CliError::new(
             ErrorCode::Usage,
-            "no observer command is set",
-            "set `cmd` under [observer] in ~/.config/rkb/config.toml",
+            format!("no observer model chain for {harness}"),
+            format!("add `{harness} = [\"<model>\", \"session\"]` under [observer] in ~/.config/rkb/config.toml"),
         ));
-    };
-    if !observer::approved(&config, cmd) {
-        return Err(CliError::new(ErrorCode::Usage, "the observer command is not approved here", "run `rkb approve observer`"));
+    }
+    if !observer::approved(&config, &cfg) {
+        return Err(CliError::new(ErrorCode::Usage, "the observer is not approved here", "run `rkb approve observer`"));
     }
     rkb_core::kb::open(&env.root)?;
     let here = cwd.map(std::path::PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let place = rkb_core::state::locate(&env.root, &here, &rkb_core::matching::Hints::default(), &env.state)?;
     let name = |m: &Option<rkb_core::matching::Matched>| m.as_ref().map(|m| m.name.clone());
     let titles = observer::titles(&env.root, name(&place.project).as_deref(), name(&place.system).as_deref())?;
-    let job = observer::Job { session, transcript, harness, cwd, titles };
-    let (human, data) = match observer::observe(&env.state, &cfg, cmd, &job)? {
-        Observed::Added { item, dropped } => {
+    let job = observer::Job { session, transcript, harness, cwd, model, titles };
+    let (human, data) = match observer::observe(&env.state, &cfg, &job)? {
+        Observed::Added { item, dropped, via } => {
             let n = item.body.lines().count();
             (
-                format!("observed {n} notes into inbox item {}; {dropped} other lines dropped", item.id),
-                json!({ "id": item.id, "notes": n, "dropped": dropped }),
+                format!("observed {n} notes into inbox item {} via {via}; {dropped} other lines dropped", item.id),
+                json!({ "id": item.id, "notes": n, "dropped": dropped, "via": via }),
             )
         }
-        Observed::NoNotes { dropped } => {
-            (format!("no durable notes; {dropped} other lines dropped"), json!({ "id": null, "notes": 0, "dropped": dropped }))
-        }
+        Observed::NoNotes { dropped, via } => (
+            format!("no durable notes via {via}; {dropped} other lines dropped"),
+            json!({ "id": null, "notes": 0, "dropped": dropped, "via": via }),
+        ),
         Observed::Skipped(r) => (format!("skipped: {r}"), json!({ "id": null, "skipped": r })),
         Observed::Failed(r) => {
             return Err(CliError::new(
                 ErrorCode::Refused,
-                format!("the observer command failed: {r}"),
-                "check `[observer] cmd`; see `rkb doctor`",
+                format!("every observer model failed: {r}"),
+                "check the [observer] models; see `rkb doctor`",
             ));
         }
     };
