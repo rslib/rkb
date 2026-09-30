@@ -925,6 +925,14 @@ fn edit(
     let (lessons, _) = snap.lessons();
     let old = find(&lessons, id)?;
     let current = content_hash(&snap.files[&old.path]);
+    // A retyped base with a character too many or too few is a typo, not a change to the lesson.
+    if base.len() != current.len() || !base.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(refused(format!(
+            "--base takes the {}-character `hash` that `rkb show {id}` prints; `{base}` has {} characters. Copy it from a fresh `rkb show`, do not retype it",
+            current.len(),
+            base.chars().count()
+        )));
+    }
     if current != base {
         return Err(Error::Conflict(current));
     }

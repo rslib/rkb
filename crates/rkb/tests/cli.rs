@@ -749,6 +749,12 @@ fn edit_rules() {
     assert_eq!(v["status"], "unchanged");
     let (v, code) = env.json(&["edit", &id], &text);
     assert_eq!((v["error"]["code"].as_str(), code), (Some("usage"), Some(2)));
+    let (v, _) = env.json(&["edit", &id, "--base", &format!("{hash}6")], &text);
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(
+        v["error"]["code"] != "conflict" && msg.contains("13 characters") && msg.contains("do not retype"),
+        "a retyped base is a typo, not a change: {v}"
+    );
 
     for (from, to) in [
         (id.as_str(), "0000000000"),
