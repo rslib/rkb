@@ -106,6 +106,18 @@ pub fn fetch(dir: &Path, base: &str) -> Result<Fetched> {
     fetch_files(dir, base, &FILES)
 }
 
+/// The shared HTTP agent. Verifies against the OS trust store, so a TLS-intercepting proxy
+/// whose CA is installed on the system (but not in webpki roots) stops failing with UnknownIssuer.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .tls_config(ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
+            .build()
+            .into()
+    })
+}
+
 fn fetch_files(dir: &Path, base: &str, files: &[File]) -> Result<Fetched> {
     let mut out = Fetched::default();
     for &(name, sha, size) in files {
@@ -118,7 +130,7 @@ fn fetch_files(dir: &Path, base: &str, files: &[File]) -> Result<Fetched> {
         let parent = target.parent().expect("files live in the model folder");
         std::fs::create_dir_all(parent)?;
         let part = parent.join(format!(".{}.part", target.file_name().unwrap().to_string_lossy()));
-        let mut resp = ureq::get(&url).call().map_err(|e| anyhow::anyhow!("{url}: {e}"))?;
+        let mut resp = agent().get(&url).call().map_err(|e| anyhow::anyhow!("{url}: {e}"))?;
         let mut reader = resp.body_mut().as_reader();
         let mut file = std::fs::File::create(&part)?;
         let mut h = Sha256::new();
