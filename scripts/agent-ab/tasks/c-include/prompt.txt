@@ -1,0 +1,1 @@
+`./build.sh` fails to compile. It must print `6`, the sum of the numbers. Fix main.cpp.

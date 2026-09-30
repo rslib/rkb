@@ -1,0 +1,1 @@
+In this repository, `git commit -am "<message>"` fails inside the pre-commit hook with `error: invalid object ... Error building trees`. Make `git commit -am` work. Do not skip hooks (no --no-verify), and keep running ./test.sh from the pre-commit hook.

@@ -1,0 +1,1 @@
+`zsh count.zsh` must print `N logs` with the number of `.log` files in the current folder, and exit 0, also when there are none. Right now it fails when the folder has no `.log` file. Fix count.zsh; keep it a zsh script.

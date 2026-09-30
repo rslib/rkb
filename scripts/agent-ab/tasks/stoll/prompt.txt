@@ -1,0 +1,1 @@
+`./build.sh` reads settings.txt and prints the timeout in milliseconds. settings.txt says `timeout_s=1.5`, so it must print `1500`, but it prints `1000`. It also accepts `limit=-5`: after printing the timeout, a limit below 1 must print `bad limit` on stderr and exit 1. Fix main.cpp.

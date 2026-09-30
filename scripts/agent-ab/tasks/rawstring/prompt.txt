@@ -1,0 +1,1 @@
+`./build.sh` fails to compile. The program must print `1` because the pattern matches `"a"`. Fix it without changing what the pattern means.

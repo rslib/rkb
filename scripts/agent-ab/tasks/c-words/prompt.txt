@@ -1,0 +1,1 @@
+`sh count.sh notes.txt` must print the number of words in the file. It prints the number of lines. Fix count.sh.
