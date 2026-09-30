@@ -341,7 +341,7 @@ fn recall(p: &Value, state: &Path, session: &str, text: &str) -> Result<Option<S
     let strong: Vec<search::Hit> = hits
         .into_iter()
         .take(1)
-        .filter(|h| hooks::clear_winner(top, next, min, margin) && h.applies != Verdict::No)
+        .filter(|h| hooks::clear_winner(top, next, min, margin) && h.applies != Verdict::No && h.status == rkb_core::lesson::Status::Active)
         .filter(|h| !seen.iter().any(|r| r["kind"] == "injected" && r["id"] == h.id.as_str()))
         .collect();
     if strong.is_empty() {

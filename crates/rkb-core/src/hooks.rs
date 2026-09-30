@@ -293,7 +293,8 @@ impl Strength {
 /// not apply here or is not strong enough. `text_of` reads a lesson's text for the coverage rule. The
 /// hook and `rkb eval --replay` both decide here, so they cannot drift.
 pub fn would_inject<'a>(hits: &'a [Hit], text_of: impl FnOnce(&str) -> String, error: &str, t: &Strength) -> Option<&'a Hit> {
-    let top = hits.first().filter(|h| h.applies != Verdict::No)?;
+    // A stale lesson (flagged, often after it failed) is never pushed into a session unasked.
+    let top = hits.first().filter(|h| h.applies != Verdict::No && h.status == crate::lesson::Status::Active)?;
     let next = hits.get(1).and_then(|h| h.relevance).map_or(0.0, f64::from);
     strong_enough(top.relevance, next, || coverage(error, &text_of(&top.id)), t).then_some(top)
 }

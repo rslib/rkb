@@ -4594,6 +4594,12 @@ fn recall_uses_jev_thresholds_when_jev_ranked() {
     env.write("kb.toml", &toml.replace("hook_timeout_ms = 5000", "hook_timeout_ms = 5000\nrecall_min_relevance = 0.85"));
     assert_eq!(run("j2"), "", "a kb.toml value wins over Jev's default");
     assert_eq!(std::fs::read_to_string(env.dir.path().join("state/rkb/hook-errors.log")).unwrap_or_default(), "", "no hook error");
+
+    env.write("kb.toml", &toml);
+    let injected = run("j3");
+    let id = injected.split("id=").nth(1).and_then(|r| r.split(['"', ' ', '\\']).find(|w| w.len() == 10)).unwrap().to_string();
+    assert_eq!(env.json(&["flag", &id, "--reason", "the fix failed on clang 18"], "").0["status"], "written");
+    assert_eq!(run("j4"), "", "a stale lesson is never injected");
 }
 
 /// A search KB with a fake `pi` for the observer: `--model bad` exits 1, any other model saves its
@@ -4800,4 +4806,21 @@ fn prompt_hook_reads_only_what_the_user_typed_and_logs_rankings() {
     assert!(v["skipped"][0].as_str().unwrap().starts_with("laya: "), "{v}");
     let (d, _) = env.json(&["doctor"], "");
     assert!(d["checks"].as_array().unwrap().iter().any(|c| c["check"] == "hook rankings"), "{d}");
+}
+
+#[test]
+fn install_pins_the_distill_model_from_config() {
+    let env = search_kb();
+    let home = env.dir.path();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    env.write_abs(&home.join("config/rkb/config.toml"), "[distill]\nclaude-code = \"sonnet\"\n");
+    let (v, _) = env.json(&["install", "claude"], "");
+    let tty = home.join("tty");
+    std::fs::write(&tty, "yes\n").unwrap();
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_TTY", &tty);
+    assert!(rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", "install"], "").status.success());
+    let plugin = home.join("data/rkb/claude-plugin/plugins/rkb/commands");
+    assert!(std::fs::read_to_string(plugin.join("distill.md")).unwrap().starts_with("---\nmodel: sonnet\n"));
+    assert!(!std::fs::read_to_string(plugin.join("retro.md")).unwrap().contains("model:"), "retro needs the session's context and model");
 }

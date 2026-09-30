@@ -51,6 +51,25 @@ pub fn claude_program() -> String {
 
 /// The marketplace files, relative to `plugin_dir`, and the plugin version, which carries a hash of
 /// the content so a changed binary path or prompt makes `claude plugin update` pick it up.
+/// The Claude Code model for the distill command: `claude-code` under `[distill]` in this machine's
+/// `config.toml`, when it is a plain model name. Unit tests never read the user's file.
+pub fn distill_model() -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
+    let (_, t) = crate::config::machine(&crate::paths::config_dir()).ok()?;
+    let m = t.get("distill")?.get("claude-code")?.as_str()?.trim().to_string();
+    (!m.is_empty() && m.chars().all(|c| c.is_ascii_alphanumeric() || "._:/-[]".contains(c))).then_some(m)
+}
+
+/// A command file with `model: <model>` added to its frontmatter, so Claude Code runs it on that model.
+fn with_model(command: &str, model: Option<&str>) -> String {
+    match (model, command.strip_prefix("---\n")) {
+        (Some(m), Some(rest)) => format!("---\nmodel: {m}\n{rest}"),
+        _ => command.to_string(),
+    }
+}
+
 pub fn plugin_files(bin: &str) -> (Vec<(String, String)>, String) {
     use sha2::{Digest, Sha256};
     let mut hooks = serde_json::Map::new();
@@ -65,7 +84,7 @@ pub fn plugin_files(bin: &str) -> (Vec<(String, String)>, String) {
     let mut files = vec![
         ("plugins/rkb/skills/rkb/SKILL.md".to_string(), SKILL.to_string()),
         ("plugins/rkb/commands/retro.md".to_string(), COMMANDS[0].1.to_string()),
-        ("plugins/rkb/commands/distill.md".to_string(), COMMANDS[1].1.to_string()),
+        ("plugins/rkb/commands/distill.md".to_string(), with_model(COMMANDS[1].1, distill_model().as_deref())),
         ("plugins/rkb/commands/curate.md".to_string(), COMMANDS[2].1.to_string()),
         ("plugins/rkb/hooks/hooks.json".to_string(), pretty(serde_json::json!({ "hooks": hooks }))),
         ("plugins/rkb/.mcp.json".to_string(), pretty(serde_json::json!({ "mcpServers": { "rkb": { "command": bin, "args": ["mcp"] } } }))),
@@ -1032,5 +1051,13 @@ mod tests {
         assert!(hooks(&settings, None).unwrap());
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(v, serde_json::json!({ "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "my-own stop hook" }] }] } }));
+    }
+
+    #[test]
+    fn distill_model_goes_in_the_frontmatter() {
+        let text = with_model(COMMANDS[1].1, Some("sonnet"));
+        assert!(text.starts_with("---\nmodel: sonnet\n") && text.contains(COMMAND_MARKER));
+        assert_eq!(command_body(&text), command_body(COMMANDS[1].1), "the prompt is unchanged");
+        assert_eq!(with_model(COMMANDS[1].1, None), COMMANDS[1].1);
     }
 }
