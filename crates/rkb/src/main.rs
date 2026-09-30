@@ -954,7 +954,11 @@ fn models_fetch() -> Result<Output, CliError> {
     let dir = rkb_rerank::files::default_dir();
     let base = std::env::var("RKB_MODELS_URL").unwrap_or_else(|_| "https://huggingface.co".into());
     let f = rkb_rerank::files::fetch(&dir, &base).map_err(|e| {
-        CliError::new(output::ErrorCode::Io, e.to_string(), "check the network and the disk space, then run `rkb models fetch` again")
+        CliError::new(
+            output::ErrorCode::Io,
+            e.to_string(),
+            "check the network, the disk space and the TLS proxy certificates, then run `rkb models fetch` again",
+        )
     })?;
     let mb = f.bytes as f64 / 1e6;
     let mut human = String::new();
