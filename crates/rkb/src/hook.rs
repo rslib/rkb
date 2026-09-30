@@ -377,7 +377,10 @@ fn stop(p: &Value, state: &Path, session: &str, harness: &str) -> Result<Option<
     let threshold = cfg.get("record_score").and_then(toml::Value::as_integer).map_or(DEFAULT_RECORD_SCORE, |v| v.max(1) as u32);
     let asked = records.iter().any(|r| r["kind"] == "asked");
     let nudged = records.iter().filter(|r| r["kind"] == "nudged").count();
-    let strong = score >= threshold && !asked;
+    // Only the user's own words make the stop block: task signals alone added about 2.5 turns per task
+    // and no passes in the agent A/B (scripts/agent-ab, 2026-09-29).
+    let from_user = new.iter().any(|r| r["kind"] == "remember" || r["kind"] == "correction");
+    let strong = score >= threshold && from_user && !asked;
     if !strong && nudged >= MAX_NUDGES {
         return Ok(None);
     }
@@ -407,11 +410,9 @@ fn stop(p: &Value, state: &Path, session: &str, harness: &str) -> Result<Option<
             "rkb: this session looks worth a lesson ({}). Before you stop, record what would help next time. {ask} If nothing here would help next time, say so and stop.",
             parts.join(", ")
         );
-        // Claude Code continues on a blocking reason; pi and omp continue on the extension's context.
-        if harness == "claude-code" {
-            return Ok(Some(json!({ "decision": "block", "reason": reason }).to_string()));
-        }
-        return Ok(Some(reply("Stop", "additionalContext", json!(reason))));
+        // Every harness continues on a blocking reason; the pi and omp extensions map it to a continuation.
+        let _ = harness;
+        return Ok(Some(json!({ "decision": "block", "reason": reason }).to_string()));
     }
     hooks::append(state, session, &json!({ "kind": "nudged" }))?;
     let context = format!(

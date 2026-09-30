@@ -84,6 +84,12 @@ function parse(reply: string | undefined): any {
   }
 }
 
+/** The reason of a blocking stop reply, which asks the agent to continue. */
+function blockReason(reply: string | undefined): string | undefined {
+  const r = parse(reply);
+  return r?.decision === "block" && typeof r.reason === "string" && r.reason ? r.reason : undefined;
+}
+
 function additional(reply: string | undefined): string | undefined {
   const text = parse(reply)?.hookSpecificOutput?.additionalContext;
   return typeof text === "string" && text ? text : undefined;
@@ -266,14 +272,18 @@ export default function rkb(pi: ExtensionAPI) {
       "agent_before_settle",
       safe(async (event, ctx) => {
         if (event?.outcome !== "completed" || event?.context?.canContinue === false) return undefined;
-        const note = additional(await hook("stop", { ...base(ctx), stop_hook_active: continuedByRkb }));
+        const reply = await hook("stop", { ...base(ctx), stop_hook_active: continuedByRkb });
+        const reason = blockReason(reply);
+        const note = reason ?? additional(reply);
         if (!note) {
           continuedByRkb = false;
           return undefined;
         }
-        continuedByRkb = true;
+        // Only a blocking reply continues the run; a note is kept for the next turn.
+        continuedByRkb = Boolean(reason);
         const entries = Array.isArray(event.entries) ? event.entries : [];
-        return { entries: [...entries, { type: "custom_message", customType: "rkb", content: note, display: false }], continue: true };
+        const entry = { type: "custom_message", customType: "rkb", content: note, display: false };
+        return reason ? { entries: [...entries, entry], continue: true } : { entries: [...entries, entry] };
       }),
     );
   }
@@ -289,8 +299,8 @@ export default function rkb(pi: ExtensionAPI) {
         if (event?.session_id) stopSession.id = String(event.session_id);
         const payload: Record<string, unknown> = { ...base(ctx), stop_hook_active: Boolean(event?.stop_hook_active) };
         if (event?.session_id) payload.session_id = String(event.session_id);
-        const note = additional(await hook("stop", payload));
-        return note ? { continue: true, additionalContext: note } : undefined;
+        const reason = blockReason(await hook("stop", payload));
+        return reason ? { continue: true, additionalContext: reason } : undefined;
       }),
     );
   }

@@ -4824,3 +4824,24 @@ fn install_pins_the_distill_model_from_config() {
     assert!(std::fs::read_to_string(plugin.join("distill.md")).unwrap().starts_with("---\nmodel: sonnet\n"));
     assert!(!std::fs::read_to_string(plugin.join("retro.md")).unwrap().contains("model:"), "retro needs the session's context and model");
 }
+
+#[test]
+fn stop_blocks_only_for_the_users_own_signals() {
+    let env = search_kb();
+    for r in [
+        r#"{"kind":"failed","program":"cmake"}"#,
+        r#"{"kind":"failed","program":"cmake"}"#,
+        r#"{"kind":"failed","program":"cmake"}"#,
+        r#"{"kind":"nohit","program":"cmake"}"#,
+        r#"{"kind":"fixed","program":"cmake"}"#,
+    ] {
+        signal(&env, "t1", r);
+    }
+    let out = hook(&env, "stop", &serde_json::json!({ "session_id": "t1", "stop_hook_active": false }));
+    let reply: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+    assert!(reply.get("decision").is_none(), "task signals alone score 3 but only get a note: {out}");
+    assert!(reply["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("cmake"), "{out}");
+    signal(&env, "t2", r#"{"kind":"remember"}"#);
+    let out = hook(&env, "stop", &serde_json::json!({ "session_id": "t2", "stop_hook_active": false }));
+    assert!(out.contains("\"decision\":\"block\""), "the user asked to remember: {out}");
+}
