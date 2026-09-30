@@ -754,7 +754,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             let o = if id == "observer" {
                 match rkb_core::observer::approve_request(&env.ctx())? {
                     Some(req) => rkb_core::write::Outcome::NeedsUser(req),
-                    None => rkb_core::write::Outcome::Info("The observer command is already approved here".into()),
+                    None => rkb_core::write::Outcome::Info("The observer is already approved here".into()),
                 }
             } else if let Some(key) = id.strip_prefix("facts.") {
                 match rkb_core::verify::approve_fact_request(&env.ctx(), key)? {

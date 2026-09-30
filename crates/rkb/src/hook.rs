@@ -212,6 +212,9 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
 
     let root = kb::home();
     kb::open(&root)?;
+    if hooks_config(&root).get("failure_recall").and_then(toml::Value::as_bool) == Some(false) {
+        return Ok(None);
+    }
     let query = hooks::error_query(command, error);
     let cfg = hooks_config(&root);
     let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, &query, "failure")?;
@@ -377,10 +380,13 @@ fn stop(p: &Value, state: &Path, session: &str, harness: &str) -> Result<Option<
     let threshold = cfg.get("record_score").and_then(toml::Value::as_integer).map_or(DEFAULT_RECORD_SCORE, |v| v.max(1) as u32);
     let asked = records.iter().any(|r| r["kind"] == "asked");
     let nudged = records.iter().filter(|r| r["kind"] == "nudged").count();
-    // Only the user's own words make the stop block: task signals alone added about 2.5 turns per task
-    // and no passes in the agent A/B (scripts/agent-ab, 2026-09-29).
-    let from_user = new.iter().any(|r| r["kind"] == "remember" || r["kind"] == "correction");
-    let strong = score >= threshold && from_user && !asked;
+    // Only the user's own words reach the stop. In the agent A/B (scripts/agent-ab, 2026-09-29) even a
+    // non-blocking note on task signals cost turns and added no passes; transcript capture and the
+    // observer still take those sessions to the inbox.
+    if !new.iter().any(|r| r["kind"] == "remember" || r["kind"] == "correction") {
+        return Ok(None);
+    }
+    let strong = score >= threshold && !asked;
     if !strong && nudged >= MAX_NUDGES {
         return Ok(None);
     }

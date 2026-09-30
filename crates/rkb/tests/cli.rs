@@ -4838,10 +4838,21 @@ fn stop_blocks_only_for_the_users_own_signals() {
         signal(&env, "t1", r);
     }
     let out = hook(&env, "stop", &serde_json::json!({ "session_id": "t1", "stop_hook_active": false }));
-    let reply: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
-    assert!(reply.get("decision").is_none(), "task signals alone score 3 but only get a note: {out}");
-    assert!(reply["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("cmake"), "{out}");
+    assert_eq!(out, "", "task signals alone score 3 but reach the stop not at all");
     signal(&env, "t2", r#"{"kind":"remember"}"#);
     let out = hook(&env, "stop", &serde_json::json!({ "session_id": "t2", "stop_hook_active": false }));
     assert!(out.contains("\"decision\":\"block\""), "the user asked to remember: {out}");
+}
+
+#[test]
+fn failure_recall_can_be_turned_off() {
+    let env = search_kb();
+    set_chain(&env, "chain = [\"laya\", \"bm25\"]\n\n[hooks]\nfailure_recall = false");
+    let mut failed = bash("f1", &env.kb(), "g++ main.o -o app");
+    failed["error"] =
+        "Exit code 1\n/usr/bin/ld: main.o: undefined reference to `vtable for Widget'\ncollect2: error: ld returned 1 exit status\n".into();
+    assert_eq!(hook(&env, "tool-failed", &failed), "");
+    let state = env.dir.path().join("state/rkb");
+    assert!(std::fs::read_to_string(state.join("sessions/f1.jsonl")).unwrap().contains("\"failed\""), "the signal is kept");
+    assert!(!state.join("rankings.jsonl").exists() && !state.join("replays.jsonl").exists(), "no search ran");
 }

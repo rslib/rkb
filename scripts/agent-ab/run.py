@@ -36,6 +36,10 @@ def claude(prompt, cwd, model, env, extra):
     return result, tools, time.time() - start
 
 
+# Arms that turn off one hook setting in the KB clone's kb.toml.
+VARIANTS = {"on-nofail": "failure_recall = false", "on-nostop": "stop_nudge = false"}
+
+
 def run_one(task, arm, rep, model):
     src = os.path.join(HERE, "tasks", task)
     with tempfile.TemporaryDirectory() as tmp:
@@ -52,9 +56,12 @@ def run_one(task, arm, rep, model):
             env.pop(k, None)
         extra = []
         state = os.path.join(tmp, "state")
-        if arm == "on":
+        if arm.startswith("on"):
             kb = os.path.join(tmp, "kb")
             subprocess.run(["git", "clone", "-q", KB, kb], check=True)
+            if arm in VARIANTS:
+                with open(os.path.join(kb, "kb.toml"), "a") as f:
+                    f.write(f"\n[hooks]\n{VARIANTS[arm]}\n")
             env.update(RKB_HOME=kb, XDG_STATE_HOME=state)
             hooks = json.load(open(PLUGIN_HOOKS))
             settings = os.path.join(tmp, "settings.json")
@@ -88,12 +95,13 @@ def main():
     ap.add_argument("--model", default="sonnet")
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--only", default="")
+    ap.add_argument("--arms", default="off,on", help="off, on, " + ", ".join(VARIANTS))
     ap.add_argument("--out", default=os.path.join(HERE, "results.jsonl"))
     a = ap.parse_args()
     tasks = sorted(os.listdir(os.path.join(HERE, "tasks")))
     if a.only:
         tasks = [t for t in tasks if t in a.only.split(",")]
-    jobs = [(t, arm, r) for r in range(a.reps) for t in tasks for arm in ("off", "on")]
+    jobs = [(t, arm, r) for r in range(a.reps) for t in tasks for arm in a.arms.split(",")]
     rows = []
     with ThreadPoolExecutor(a.jobs) as ex, open(a.out, "a") as out:
         for row in ex.map(lambda j: run_one(*j, a.model), jobs):
@@ -110,8 +118,8 @@ def summarize(rows):
         f = lambda k: sum(r[k] or 0 for r in rs) / max(1, n)
         return f"pass {sum(r['pass'] for r in rs)}/{n}, turns {f('turns'):.1f}, cost ${f('cost'):.3f}, {f('secs'):.0f}s, in {f('tokens_in') / 1000:.0f}k tok"
     for group, pred in (("lesson tasks", lambda r: not r["task"].startswith("c-")), ("controls", lambda r: r["task"].startswith("c-"))):
-        for arm in ("off", "on"):
-            print(f"{group:13} {arm:3}: {agg([r for r in rows if pred(r) and r['arm'] == arm])}")
+        for arm in sorted({r["arm"] for r in rows}):
+            print(f"{group:13} {arm:9}: {agg([r for r in rows if pred(r) and r['arm'] == arm])}")
     print("per task (off -> on pass):")
     for t in sorted({r["task"] for r in rows}):
         p = lambda arm: sum(r["pass"] for r in rows if r["task"] == t and r["arm"] == arm)
