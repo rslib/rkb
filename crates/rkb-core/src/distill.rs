@@ -11,6 +11,16 @@ use crate::error::{Error, Result, io};
 
 /// Items older than this are deleted without being distilled.
 pub const EXPIRY_DAYS: u64 = 30;
+/// Inbox items one distill run takes, unless `[distill] batch` in `config.toml` says otherwise.
+pub const DEFAULT_BATCH: usize = 5;
+
+/// The distill batch size: `batch` under `[distill]` in this machine's `config.toml`, from 1 to 20.
+pub fn batch(config_dir: &Path) -> usize {
+    crate::config::machine(config_dir)
+        .ok()
+        .and_then(|(_, t)| t.get("distill")?.get("batch")?.as_integer())
+        .map_or(DEFAULT_BATCH, |n| n.clamp(1, 20) as usize)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -460,7 +470,7 @@ pub fn digest(steps: &[Step]) -> Digest {
 }
 
 /// The session-start line, only when the inbox holds at least 5 items or its oldest is over 7 days old.
-pub fn nudge(state: &Path, now: u64, command: &str) -> Option<String> {
+pub fn nudge(state: &Path, now: u64, command: &str, batch: usize) -> Option<String> {
     let items = list(state);
     let oldest = items.iter().map(|i| i.meta.time).min()?;
     let days = now.saturating_sub(oldest) / 86400;
@@ -468,7 +478,7 @@ pub fn nudge(state: &Path, now: u64, command: &str) -> Option<String> {
     (items.len() >= 5 || days > 7 || urgent > 0).then(|| {
         let high = if urgent > 0 { format!(" ({urgent} of high priority)") } else { String::new() };
         format!(
-            "rkb inbox: {} items wait{high}, the oldest {days} days old. At a natural pause in the work, run {command} for up to 3 of them, without waiting for the user.",
+            "rkb inbox: {} items wait{high}, the oldest {days} days old. At a natural pause in the work, run {command} for up to {batch} of them, without waiting for the user.",
             items.len()
         )
     })
@@ -635,7 +645,7 @@ mod tests {
         let high = add(dir.path(), Meta { priority: Some(3), ..note(200) }, "new high").unwrap();
         let ids: Vec<String> = list(dir.path()).into_iter().map(|i| i.id).collect();
         assert_eq!(ids, [high.id.clone(), old.id.clone()], "priority first, then oldest");
-        let line = nudge(dir.path(), 300, "/rkb:distill").expect("a high-priority item is enough");
+        let line = nudge(dir.path(), 300, "/rkb:distill", 5).expect("a high-priority item is enough");
         assert!(line.contains("1 of high priority") && line.contains("without waiting for the user"), "{line}");
 
         let steps = vec![Step::Command {
@@ -745,10 +755,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = dir.path();
         let day = 86400;
-        assert_eq!(nudge(s, 100 * day, "/rkb-distill"), None);
+        assert_eq!(nudge(s, 100 * day, "/rkb-distill", 5), None);
         add(s, note(90 * day), "old").unwrap();
-        assert!(nudge(s, 97 * day, "/rkb-distill").is_none(), "7 days is not yet old");
-        assert!(nudge(s, 98 * day, "/rkb-distill").unwrap().contains("the oldest 8 days old"));
+        assert!(nudge(s, 97 * day, "/rkb-distill", 5).is_none(), "7 days is not yet old");
+        assert!(nudge(s, 98 * day, "/rkb-distill", 5).unwrap().contains("the oldest 8 days old"));
+        assert!(nudge(s, 98 * day, "/rkb-distill", 5).unwrap().contains("for up to 5 of them"));
     }
 
     #[test]
@@ -785,5 +796,15 @@ mod tests {
         let later = capture(s, "claude-code", "x", &t, None).unwrap().unwrap();
         assert_eq!(later.body, "[agent] Configured. ZLIB_ROOT tells find_package where to look.");
         assert_eq!(list(s).len(), 2);
+    }
+
+    #[test]
+    fn batch_from_config() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(batch(d.path()), DEFAULT_BATCH);
+        std::fs::write(d.path().join("config.toml"), "[distill]\nbatch = 8\n").unwrap();
+        assert_eq!(batch(d.path()), 8);
+        std::fs::write(d.path().join("config.toml"), "[distill]\nbatch = 99\n").unwrap();
+        assert_eq!(batch(d.path()), 20);
     }
 }

@@ -62,6 +62,12 @@ pub fn distill_model() -> Option<String> {
     (!m.is_empty() && m.chars().all(|c| c.is_ascii_alphanumeric() || "._:/-[]".contains(c))).then_some(m)
 }
 
+/// The distill command with this machine's batch size. Unit tests use the default.
+fn distill_command() -> String {
+    let batch = if cfg!(test) { crate::distill::DEFAULT_BATCH } else { crate::distill::batch(&crate::paths::config_dir()) };
+    COMMANDS[1].1.replace("__BATCH__", &batch.to_string())
+}
+
 /// A command file with `model: <model>` added to its frontmatter, so Claude Code runs it on that model.
 fn with_model(command: &str, model: Option<&str>) -> String {
     match (model, command.strip_prefix("---\n")) {
@@ -84,7 +90,7 @@ pub fn plugin_files(bin: &str) -> (Vec<(String, String)>, String) {
     let mut files = vec![
         ("plugins/rkb/skills/rkb/SKILL.md".to_string(), SKILL.to_string()),
         ("plugins/rkb/commands/retro.md".to_string(), COMMANDS[0].1.to_string()),
-        ("plugins/rkb/commands/distill.md".to_string(), with_model(COMMANDS[1].1, distill_model().as_deref())),
+        ("plugins/rkb/commands/distill.md".to_string(), with_model(&distill_command(), distill_model().as_deref())),
         ("plugins/rkb/commands/curate.md".to_string(), COMMANDS[2].1.to_string()),
         ("plugins/rkb/hooks/hooks.json".to_string(), pretty(serde_json::json!({ "hooks": hooks }))),
         ("plugins/rkb/.mcp.json".to_string(), pretty(serde_json::json!({ "mcpServers": { "rkb": { "command": bin, "args": ["mcp"] } } }))),
@@ -232,7 +238,7 @@ impl Harness {
         EXTENSION
             .replace("__HARNESS__", self.trust_name())
             .replace("\"__RETRO__\"", &json(COMMANDS[0].1))
-            .replace("\"__DISTILL__\"", &json(COMMANDS[1].1))
+            .replace("\"__DISTILL__\"", &json(&distill_command()))
             .replace("\"__CURATE__\"", &json(COMMANDS[2].1))
             .replace("\"__RKB__\"", &serde_json::to_string(&hook_binary()).expect("a string serializes"))
             .replace(
@@ -1055,6 +1061,8 @@ mod tests {
 
     #[test]
     fn distill_model_goes_in_the_frontmatter() {
+        assert!(distill_command().contains("Take up to 5 items") && !distill_command().contains("__BATCH__"));
+        assert!(Harness::Pi.extension().contains("Take up to 5 items"));
         let text = with_model(COMMANDS[1].1, Some("sonnet"));
         assert!(text.starts_with("---\nmodel: sonnet\n") && text.contains(COMMAND_MARKER));
         assert_eq!(command_body(&text), command_body(COMMANDS[1].1), "the prompt is unchanged");

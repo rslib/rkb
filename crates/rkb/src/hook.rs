@@ -102,7 +102,7 @@ fn session_start(p: &Value, state: &Path, harness: &str) -> Result<Option<String
     let s = state::build(&root, place, state)?;
     let mut text = crate::session::context(&s).human;
     let distill = if harness == "claude-code" { "/rkb:distill" } else { "/rkb-distill" };
-    if let Some(line) = rkb_core::distill::nudge(state, request::now(), distill) {
+    if let Some(line) = rkb_core::distill::nudge(state, request::now(), distill, rkb_core::distill::batch(&paths::config_dir())) {
         text.push_str(&format!("\n{line}"));
     }
     let curate = if harness == "claude-code" { "/rkb:curate" } else { "/rkb-curate" };
