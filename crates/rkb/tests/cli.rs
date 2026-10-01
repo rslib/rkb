@@ -4432,6 +4432,24 @@ fn jev_ranks_with_the_key_from_config() {
 }
 
 #[test]
+fn jev_never_receives_the_example_queries() {
+    let env = search_kb();
+    set_chain(&env, "chain = [\"jev\", \"bm25\"]");
+    jev_config(&env, "[jev]\napi_key = \"k\"\n", 0o600);
+    let files = stdout(&env.git(&["ls-files", "*.md"]));
+    for f in files.lines() {
+        let p = env.kb().join(f);
+        let text = std::fs::read_to_string(&p).unwrap();
+        std::fs::write(&p, text.replacen("\nstatus: active\n", "\nstatus: active\nqueries:\n  - zzprobe zzunique\n", 1)).unwrap();
+    }
+    let (url, log) = fake_jev(jev_answers);
+    let (v, _) = jev_search(&env, &url, "git rebase", &[]);
+    assert_eq!(v["ranked_by"], "jev", "{v}");
+    let log = log.lock().unwrap();
+    assert!(!log.is_empty() && log.iter().all(|(_, b)| !b.to_string().contains("zzprobe")), "{log:?}");
+}
+
+#[test]
 fn jev_falls_back_and_sends_nothing_it_may_not() {
     let env = search_kb();
     set_chain(&env, "chain = [\"jev\", \"bm25\"]");

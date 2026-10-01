@@ -91,6 +91,9 @@ pub struct Frontmatter {
     pub verified_how: VerifiedHow,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Example queries someone would type before they know the lesson exists; only the `bm25-bert` index reads them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queries: Vec<String>,
     #[serde(default, skip_serializing_if = "Mapping::is_empty")]
     pub labels: Mapping,
     #[serde(default, skip_serializing_if = "Mapping::is_empty")]
@@ -161,6 +164,9 @@ when:
 verified: 2026-09-25
 verified_how: ran
 tags: [cmake, hdf5]
+queries:
+  - undefined reference to H5Fopen
+  - cmake cannot find hdf5
 labels:
   sensitivity: internal
 ---
@@ -178,8 +184,18 @@ Configure fails.
         assert_eq!(l.frontmatter.kind, LessonType::Pitfall);
         assert_eq!(l.frontmatter.verified, jiff::civil::date(2026, 9, 25));
         assert_eq!(l.frontmatter.when.len(), 2);
+        assert_eq!(l.frontmatter.queries, ["undefined reference to H5Fopen", "cmake cannot find hdf5"]);
         assert!(l.body.starts_with("\n# CMake"));
-        assert_eq!(l.body_line, 15);
+        assert_eq!(l.body_line, 18);
+    }
+
+    #[test]
+    fn queries_are_optional_and_written_in_block_style() {
+        let text = LESSON.replace("queries:\n  - undefined reference to H5Fopen\n  - cmake cannot find hdf5\n", "");
+        let l = parse("a.md", &text).unwrap();
+        assert!(l.frontmatter.queries.is_empty() && !write(&l.frontmatter, &l.body).contains("queries"));
+        let l = parse("a.md", LESSON).unwrap();
+        assert!(write(&l.frontmatter, &l.body).contains("queries:\n  - undefined reference to H5Fopen\n  - cmake cannot find hdf5\n"));
     }
 
     #[test]
@@ -236,7 +252,7 @@ Configure fails.
             .filter(|l| !l.starts_with(' ') && !l.starts_with('-'))
             .map(|l| l.split(':').next().unwrap())
             .collect();
-        assert_eq!(keys, ["schema", "id", "type", "status", "when", "verified", "verified_how", "tags", "labels"]);
+        assert_eq!(keys, ["schema", "id", "type", "status", "when", "verified", "verified_how", "tags", "queries", "labels"]);
         assert!(out.find("zeta").unwrap() < out.find("alpha").unwrap());
     }
 }

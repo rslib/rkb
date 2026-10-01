@@ -10,8 +10,9 @@ use crate::error::{Error, Result};
 
 /// A model that scores how well each item fits a query.
 pub trait Reranker: Send {
-    /// Relevance of each item in [0, 1], in the items' order.
-    fn score(&self, query: &str, items: &[String]) -> std::result::Result<Vec<f32>, String>;
+    /// Relevance of each item in [0, 1], in the items' order. `queries[i]` holds example queries of
+    /// item `i`, for a backend that matches against them; the others ignore it.
+    fn score(&self, query: &str, items: &[String], queries: &[Vec<String>]) -> std::result::Result<Vec<f32>, String>;
 
     /// The sort key of each item, given its relevance, when the order is not the relevance's; `None`
     /// sorts by relevance. The items arrive in BM25 order.
@@ -95,12 +96,14 @@ impl Ranked {
 /// Each model backend is opened and asked on a worker thread, so `timeout` covers loading too.
 /// A backend in `blocked` is skipped with its reason before it is opened, such as Jev when a
 /// candidate may not leave the machine.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     settings: &Settings,
     only: Option<&str>,
     opener: &Opener,
     query: &str,
     items: &[String],
+    queries: &[Vec<String>],
     timeout: Duration,
     blocked: &BTreeMap<String, String>,
 ) -> Result<Ranked> {
@@ -118,7 +121,7 @@ pub fn run(
         }
         let reason = match blocked.get(&name) {
             Some(reason) => reason.clone(),
-            None => match ask(&name, opener, query, items, timeout) {
+            None => match ask(&name, opener, query, items, queries, timeout) {
                 Ok((scores, order)) => {
                     let scores = scores.into_iter().map(Some).collect();
                     return Ok(Ranked { backend: name, scores: Some(scores), order, skipped });
@@ -141,14 +144,16 @@ fn ask(
     opener: &Opener,
     query: &str,
     items: &[String],
+    queries: &[Vec<String>],
     timeout: Duration,
 ) -> std::result::Result<(Vec<f32>, Option<Vec<f32>>), String> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let (opener, name_owned, query, items) = (opener.clone(), name.to_string(), query.to_string(), items.to_vec());
+    let (opener, name_owned, query, items, queries) =
+        (opener.clone(), name.to_string(), query.to_string(), items.to_vec(), queries.to_vec());
     // The worker is never joined: a model cannot be interrupted, and the process ends with the command.
     std::thread::spawn(move || {
         let answer = opener(&name_owned).and_then(|r| {
-            let scores = r.score(&query, &items)?;
+            let scores = r.score(&query, &items, &queries)?;
             if scores.len() != items.len() {
                 return Err(format!("returned {} scores for {} items", scores.len(), items.len()));
             }
@@ -173,7 +178,7 @@ mod tests {
     }
 
     impl Reranker for Fake {
-        fn score(&self, _: &str, items: &[String]) -> std::result::Result<Vec<f32>, String> {
+        fn score(&self, _: &str, items: &[String], _: &[Vec<String>]) -> std::result::Result<Vec<f32>, String> {
             std::thread::sleep(self.delay);
             if self.fail { Err("model crashed".into()) } else { Ok((0..items.len()).map(|i| i as f32 / 10.0).collect()) }
         }
@@ -206,6 +211,7 @@ mod tests {
             &opener(),
             "q",
             &items(),
+            &[],
             Duration::from_secs(2),
             &BTreeMap::new(),
         )
@@ -218,24 +224,25 @@ mod tests {
     #[test]
     fn a_blocked_backend_is_skipped_unopened() {
         let blocked = BTreeMap::from([("fast".to_string(), "a candidate is not allowed by sinks.fast".to_string())]);
-        let r = run(&settings(&["fast", BM25], false), None, &opener(), "q", &items(), Duration::from_secs(1), &blocked).unwrap();
+        let r = run(&settings(&["fast", BM25], false), None, &opener(), "q", &items(), &[], Duration::from_secs(1), &blocked).unwrap();
         assert_eq!(r.describe(), "bm25 (fast: a candidate is not allowed by sinks.fast)");
-        let e = run(&settings(&["fast"], true), None, &opener(), "q", &items(), Duration::from_secs(1), &blocked).unwrap_err();
+        let e = run(&settings(&["fast"], true), None, &opener(), "q", &items(), &[], Duration::from_secs(1), &blocked).unwrap_err();
         assert!(e.to_string().contains("not allowed by sinks.fast"), "{e}");
     }
 
     #[test]
     fn fallback_timeout_and_strict() {
-        let r =
-            run(&settings(&["slow", BM25], false), None, &opener(), "q", &items(), Duration::from_millis(100), &BTreeMap::new()).unwrap();
+        let r = run(&settings(&["slow", BM25], false), None, &opener(), "q", &items(), &[], Duration::from_millis(100), &BTreeMap::new())
+            .unwrap();
         assert_eq!(r.describe(), "bm25 (slow: timeout after 100 ms)");
-        let r = run(&settings(&["missing"], false), None, &opener(), "q", &items(), Duration::from_secs(1), &BTreeMap::new()).unwrap();
+        let r = run(&settings(&["missing"], false), None, &opener(), "q", &items(), &[], Duration::from_secs(1), &BTreeMap::new()).unwrap();
         assert_eq!((r.backend.as_str(), r.scores.is_none()), (BM25, true), "an exhausted chain falls back to BM25");
-        let e = run(&settings(&["missing"], true), None, &opener(), "q", &items(), Duration::from_secs(1), &BTreeMap::new())
+        let e = run(&settings(&["missing"], true), None, &opener(), "q", &items(), &[], Duration::from_secs(1), &BTreeMap::new())
             .unwrap_err()
             .to_string();
         assert!(e.contains("missing") && e.contains("not configured") && e.contains("strict"), "{e}");
-        let r = run(&settings(&[BM25], true), Some("fast"), &opener(), "q", &items(), Duration::from_secs(1), &BTreeMap::new()).unwrap();
+        let r =
+            run(&settings(&[BM25], true), Some("fast"), &opener(), "q", &items(), &[], Duration::from_secs(1), &BTreeMap::new()).unwrap();
         assert_eq!(r.backend, "fast", "--rerank replaces the chain");
     }
 

@@ -95,6 +95,17 @@ fn frontmatter_rules() {
 }
 
 #[test]
+fn queries_rules() {
+    let q = |items: &str| rules(&[(P, &fact("  - demo\n", &format!("  - demo\nqueries:\n{items}")))]);
+    assert_eq!(q("  - how do I fix demo\n  - \"demo: error 5\"\n"), Vec::<&str>::new());
+    assert_eq!(q("  - one\n  - one\n"), ["format/queries"]);
+    assert_eq!(q("  - \" \"\n"), ["format/queries"]);
+    assert_eq!(q(&format!("  - {}\n", "x".repeat(201))), ["format/queries"]);
+    let nine: String = (0..9).map(|i| format!("  - q{i}\n")).collect();
+    assert_eq!(q(&nine), ["format/queries"]);
+}
+
+#[test]
 fn superseded_needs_its_heading() {
     let ok = fact("status: active", "status: superseded\nsuperseded_by: 7f3a9c2b41") + "\n## Why superseded\nWrong range.\n";
     assert_eq!(rules(&[(P, &ok)]), Vec::<&str>::new());

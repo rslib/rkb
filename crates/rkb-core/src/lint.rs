@@ -347,6 +347,26 @@ pub(crate) fn resolve(from: &str, target: &str) -> Option<Option<String>> {
     Some(Some(parts.join("/")))
 }
 
+pub const MAX_QUERIES: usize = 8;
+pub const MAX_QUERY_CHARS: usize = 200;
+
+fn check_queries(out: &mut Out, path: &str, queries: &[String]) {
+    let mut err = |message: String| out.error(path, None, "format/queries", message);
+    if queries.len() > MAX_QUERIES {
+        err(format!("`queries` has {} entries; at most {MAX_QUERIES}", queries.len()));
+    }
+    let mut seen = BTreeSet::new();
+    for q in queries {
+        if q.trim().is_empty() {
+            err("a query is empty".into());
+        } else if q.chars().count() > MAX_QUERY_CHARS {
+            err(format!("query `{}...` is over {MAX_QUERY_CHARS} characters", q.chars().take(30).collect::<String>()));
+        } else if !seen.insert(q.trim()) {
+            err(format!("query `{q}` is listed twice"));
+        }
+    }
+}
+
 fn check_label(out: &mut Out, kb: Option<&KbConfig>, path: &str, line: Option<usize>, key: &str, value: &str) {
     let Some(kb) = kb else { return };
     match kb.labels.get(key) {
@@ -393,6 +413,7 @@ fn lint_lesson(out: &mut Out, kb: Option<&KbConfig>, l: &Lesson, b: &Body) {
             out.error(p, None, "format/tags", format!("tag `{tag}` must be lowercase with no spaces"));
         }
     }
+    check_queries(out, p, &fm.queries);
     for (k, v) in &fm.labels {
         match (k, v) {
             (Value::String(k), Value::String(v)) => check_label(out, kb, p, None, k, v),

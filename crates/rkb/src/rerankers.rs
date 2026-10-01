@@ -184,7 +184,7 @@ impl JevBackend {
 }
 
 impl Reranker for JevBackend {
-    fn score(&self, query: &str, items: &[String]) -> Result<Vec<f32>, String> {
+    fn score(&self, query: &str, items: &[String], _: &[Vec<String>]) -> Result<Vec<f32>, String> {
         if self.batch {
             let mut state = format!("problem: {query}\n\nlessons:");
             for (n, it) in items.iter().enumerate() {
@@ -239,6 +239,7 @@ pub fn run(
     timeout: Duration,
 ) -> rkb_core::error::Result<Ranked> {
     let items = search::rerank_items(root, hits);
+    let queries = search::rerank_queries(root, hits);
     let wants_jev = only.map_or_else(|| settings.chain.iter().any(|b| b == JEV), |o| o == JEV);
     let mut blocked = BTreeMap::new();
     if wants_jev {
@@ -253,7 +254,7 @@ pub fn run(
             // Jev rates the lessons it may see; the others keep their BM25 place with no relevance.
             Ok(allowed) if allowed.contains(&false) => {
                 let seen: Vec<String> = items.iter().zip(&allowed).filter(|(_, a)| **a).map(|(t, _)| t.clone()).collect();
-                let r = rerank::run(settings, Some(JEV), &opener(), query, &seen, timeout, &BTreeMap::new())?;
+                let r = rerank::run(settings, Some(JEV), &opener(), query, &seen, &[], timeout, &BTreeMap::new())?;
                 if r.backend == JEV {
                     let mut rated = r.scores.clone().unwrap_or_default().into_iter();
                     let scores = allowed.iter().map(|a| if *a { rated.next().flatten() } else { None }).collect();
@@ -265,7 +266,7 @@ pub fn run(
             Ok(_) => {}
         }
     }
-    rerank::run(settings, only, &opener(), query, &items, timeout, &blocked)
+    rerank::run(settings, only, &opener(), query, &items, &queries, timeout, &blocked)
 }
 
 /// The doctor checks for the `jev` backend, when the chain has it: where the key comes from (never the

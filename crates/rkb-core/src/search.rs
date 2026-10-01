@@ -236,11 +236,21 @@ pub fn rerank_items(root: &Path, hits: &[Hit]) -> Vec<String> {
         .collect()
 }
 
-/// The rerank text of every active lesson, for filling a model's cache ahead of searches.
-pub fn active_rerank_items(root: &Path) -> Result<Vec<String>> {
+/// The example queries of each hit's lesson, in the hits' order.
+pub fn rerank_queries(root: &Path, hits: &[Hit]) -> Vec<Vec<String>> {
+    hits.iter()
+        .map(|h| {
+            let text = std::fs::read_to_string(root.join(&h.path)).unwrap_or_default();
+            crate::lesson::parse(&h.path, &text).map(|l| l.frontmatter.queries).unwrap_or_default()
+        })
+        .collect()
+}
+
+/// The rerank text and example queries of every active lesson, for filling a model's cache ahead of searches.
+pub fn active_rerank_items(root: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
     let (lessons, _) = Snapshot::from_dir(root)?.lessons();
     let hits: Vec<Hit> = lessons.iter().filter(|l| l.frontmatter.status == Status::Active).map(|l| hit(l, 0.0, None)).collect();
-    Ok(rerank_items(root, &hits))
+    Ok((rerank_items(root, &hits), rerank_queries(root, &hits)))
 }
 
 /// Gives the first `scores.len()` hits their relevance and sorts the rated ones among their own

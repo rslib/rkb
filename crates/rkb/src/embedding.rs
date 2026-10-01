@@ -20,7 +20,7 @@ pub const NAME: &str = "bm25-bert";
 /// ties toward BM25's order. It sorts only; the relevance a hook reads is the cosine alone.
 const PRIOR: f32 = 0.05;
 
-/// A search embeds at most this many missing lessons itself; more means a bulk change (a sync, a new
+/// A search embeds at most this many missing lesson texts and example queries itself; more means a bulk change (a sync, a new
 /// KB), which a background `rkb models warm` fills so the hook's time limit is not spent on it.
 const INLINE_MISSES: usize = 3;
 
@@ -50,6 +50,15 @@ fn key(text: &str) -> String {
 
 fn document(item: &str) -> String {
     format!("{DOCUMENT_PREFIX}{item}")
+}
+
+fn query(text: &str) -> String {
+    format!("{QUERY_PREFIX}{text}")
+}
+
+/// Every text a search scores: each lesson text, then each lesson's example queries.
+fn texts(items: &[String], queries: &[Vec<String>]) -> Vec<String> {
+    items.iter().map(|i| document(i)).chain(queries.iter().flatten().map(|q| query(q))).collect()
 }
 
 impl Cache {
@@ -120,33 +129,38 @@ fn spawn_warm() {
 }
 
 /// Embeds what the cache lacks, appending each vector as it is made so a search cut short by its timeout still leaves progress.
-fn fill(embedder: &impl Embed, cache: &mut Cache, items: &[String]) -> Result<(), String> {
-    for item in items {
-        let text = document(item);
-        let k = key(&text);
+fn fill(embedder: &impl Embed, cache: &mut Cache, texts: &[String]) -> Result<(), String> {
+    for text in texts {
+        let k = key(text);
         if !cache.vectors.contains_key(&k) {
-            cache.add(k, embedder.embed(&text)?);
+            cache.add(k, embedder.embed(text)?);
         }
     }
     Ok(())
 }
 
 impl<E: Embed + Send> Reranker for Bert<E> {
-    /// The cosine of each item to the query, cut to [0, 1].
-    fn score(&self, query: &str, items: &[String]) -> Result<Vec<f32>, String> {
+    /// The cosine of the query to each item or to any of its example queries, whichever is higher, cut to [0, 1].
+    fn score(&self, query_text: &str, items: &[String], queries: &[Vec<String>]) -> Result<Vec<f32>, String> {
         let mut cache = Cache::open(self.cache.clone());
-        let missing = items.iter().filter(|it| !cache.vectors.contains_key(&key(&document(it)))).count();
+        let wanted = texts(items, queries);
+        let missing = wanted.iter().filter(|t| !cache.vectors.contains_key(&key(t))).count();
         if missing > INLINE_MISSES {
             (self.warm)();
-            return Err(format!("{missing} of {} lessons are not embedded yet; embedding them in the background", items.len()));
+            return Err(format!(
+                "{missing} of {} lesson texts and example queries are not embedded yet; embedding them in the background",
+                wanted.len()
+            ));
         }
-        let q = self.embedder.embed(&format!("{QUERY_PREFIX}{query}"))?;
-        fill(&self.embedder, &mut cache, items)?;
+        let q = self.embedder.embed(&query(query_text))?;
+        fill(&self.embedder, &mut cache, &wanted)?;
+        let cosine = |text: String| q.iter().zip(&cache.vectors[&key(&text)]).map(|(a, b)| a * b).sum::<f32>();
         Ok(items
             .iter()
-            .map(|it| {
-                let d = &cache.vectors[&key(&document(it))];
-                q.iter().zip(d).map(|(a, b)| a * b).sum::<f32>().clamp(0.0, 1.0)
+            .enumerate()
+            .map(|(i, it)| {
+                let examples = queries.get(i).into_iter().flatten().map(|e| cosine(query(e)));
+                examples.fold(cosine(document(it)), f32::max).clamp(0.0, 1.0)
             })
             .collect())
     }
@@ -169,14 +183,18 @@ pub fn checks(root: &Path) -> Vec<Check> {
     if let Err(e) = files::check(&files::default_dir()) {
         return check(Level::Warn, format!("{e:#}"), Some("rkb models fetch"));
     }
-    let Ok(items) = search::active_rerank_items(root) else { return vec![] };
+    let Ok((items, queries)) = search::active_rerank_items(root) else { return vec![] };
     let cache = Cache::open(cache_path());
-    let missing = items.iter().filter(|i| !cache.vectors.contains_key(&key(&document(i)))).count();
+    let wanted = texts(&items, &queries);
+    let missing = wanted.iter().filter(|t| !cache.vectors.contains_key(&key(t))).count();
     if missing > 0 {
-        let detail = format!("{missing} of {} active lessons are not embedded yet, so searches embed them in the background", items.len());
+        let detail = format!(
+            "{missing} of {} lesson texts and example queries are not embedded yet, so searches embed them in the background",
+            wanted.len()
+        );
         return check(Level::Warn, detail, Some("rkb models warm"));
     }
-    check(Level::Ok, format!("model present; {} lessons embedded", items.len()), None)
+    check(Level::Ok, format!("model present; {} lessons and {} example queries embedded", items.len(), wanted.len() - items.len()), None)
 }
 
 fn io_error(what: &str, e: impl std::fmt::Display, fix: &str) -> CliError {
@@ -222,14 +240,18 @@ fn warm(root: &Path) -> Result<Output, CliError> {
     let start = Instant::now();
     let embedder = Embedder::open(&files::default_dir(), std::env::var("RKB_EMBED_DEVICE").is_ok_and(|v| v == "cpu"))
         .map_err(|e| io_error("the model did not load", format!("{e:#}"), "run `rkb models fetch`"))?;
-    let items = search::active_rerank_items(root)?;
+    let (items, queries) = search::active_rerank_items(root)?;
+    let wanted = texts(&items, &queries);
     let mut cache = Cache::open(cache_path());
     let before = cache.vectors.len();
-    fill(&embedder, &mut cache, &items).map_err(|e| io_error("embedding failed", e, "run `rkb models warm` again"))?;
+    fill(&embedder, &mut cache, &wanted).map_err(|e| io_error("embedding failed", e, "run `rkb models warm` again"))?;
     let (device, secs) = (embedder.device(), start.elapsed().as_secs_f64());
     let added = cache.vectors.len() - before;
-    let human = format!("{added} lessons embedded, {} already in the cache ({device}, {secs:.1} s)", items.len().saturating_sub(added));
-    let data = json!({ "lessons": items.len(), "embedded": added, "device": device, "seconds": (secs * 10.0).round() / 10.0 });
+    let human = format!(
+        "{added} lesson texts and example queries embedded, {} already in the cache ({device}, {secs:.1} s)",
+        wanted.len().saturating_sub(added)
+    );
+    let data = json!({ "lessons": items.len(), "queries": wanted.len() - items.len(), "embedded": added, "device": device, "seconds": (secs * 10.0).round() / 10.0 });
     Ok(Output { data, human, exit: 0, raw: false })
 }
 
@@ -269,7 +291,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let b = bert(dir.path());
         let it = items(&["linker vtable undefined", "slurm binding cpu", "linker vtable undefined"]);
-        let rel = b.score("undefined vtable linker", &it).unwrap();
+        let rel = b.score("undefined vtable linker", &it, &[]).unwrap();
         assert!((rel[0] - 1.0).abs() < 1e-5 && rel[1] == 0.0 && rel[0] == rel[2], "{rel:?}");
         let order = b.order(&rel).unwrap();
         for (p, (o, r)) in order.iter().zip(&rel).enumerate() {
@@ -289,8 +311,8 @@ mod tests {
         let opener: Opener =
             Arc::new(move |_: &str| Ok(Box::new(Bert { embedder: Words, cache: cache.clone(), warm: || {} }) as Box<dyn Reranker>));
         let it = items(&["slurm binding cpu", "linker vtable undefined", "linker vtable"]);
-        let r =
-            rerank::run(&Settings::default(), Some(NAME), &opener, "linker vtable", &it, Duration::from_secs(5), &BTreeMap::new()).unwrap();
+        let r = rerank::run(&Settings::default(), Some(NAME), &opener, "linker vtable", &it, &[], Duration::from_secs(5), &BTreeMap::new())
+            .unwrap();
         let scores: Vec<f32> = r.scores.unwrap().into_iter().map(Option::unwrap).collect();
         assert!(scores[0] == 0.0 && scores[2] > scores[1] && scores[2] > 0.99, "{scores:?}");
         let order = r.order.unwrap();
@@ -303,7 +325,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.txt");
         let mut c = Cache::open(path.clone());
-        fill(&Words, &mut c, &items(&["a b", "c d"])).unwrap();
+        fill(&Words, &mut c, &texts(&items(&["a b", "c d"]), &[])).unwrap();
         std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"deadbeef 12\ntorn").unwrap_or_default();
         let again = Cache::open(path);
         assert_eq!(again.vectors.len(), 2);
@@ -324,9 +346,9 @@ mod tests {
         let n = Counting(Default::default());
         let b = Bert { embedder: &n, cache: dir.path().join("c.txt"), warm: || {} };
         let it = items(&["a b", "c d", "e f"]);
-        b.score("a", &it).unwrap();
+        b.score("a", &it, &[]).unwrap();
         assert_eq!(n.0.load(std::sync::atomic::Ordering::SeqCst), 4, "query plus three lessons when cold");
-        b.score("c", &it).unwrap();
+        b.score("c", &it, &[]).unwrap();
         assert_eq!(n.0.load(std::sync::atomic::Ordering::SeqCst), 5, "only the query when warm");
     }
 
@@ -340,7 +362,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let b = Bert { embedder: Broken, cache: dir.path().join("c.txt"), warm: || {} };
-        assert_eq!(b.score("q", &items(&["a"])).unwrap_err(), "out of memory");
+        assert_eq!(b.score("q", &items(&["a"]), &[]).unwrap_err(), "out of memory");
     }
 
     #[test]
@@ -354,11 +376,41 @@ mod tests {
                 STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             },
         };
-        let err = b.score("q", &items(&["a", "b", "c", "d"])).unwrap_err();
-        assert!(err.starts_with("4 of 4 lessons are not embedded yet"), "{err}");
+        let err = b.score("q", &items(&["a", "b", "c", "d"]), &[]).unwrap_err();
+        assert!(err.starts_with("4 of 4 lesson texts and example queries are not embedded yet"), "{err}");
         assert_eq!(STARTED.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(!dir.path().join("c.txt").exists(), "nothing was embedded inline");
-        b.score("q", &items(&["a", "b", "c"])).unwrap();
+        b.score("q", &items(&["a", "b", "c"]), &[]).unwrap();
         assert_eq!(STARTED.load(std::sync::atomic::Ordering::SeqCst), 1, "three misses are embedded inline");
+    }
+
+    #[test]
+    fn an_example_query_can_beat_the_lesson_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = bert(dir.path());
+        let it = items(&["slurm binding cpu", "linker vtable undefined"]);
+        let none: Vec<Vec<String>> = vec![vec![], vec![]];
+        let plain = b.score("segfault at exit", &it, &none).unwrap();
+        assert_eq!(plain, [0.0, 0.0]);
+        let with = vec![vec!["segfault at exit".to_string(), "never matches".to_string()], vec![]];
+        let rel = b.score("segfault at exit", &it, &with).unwrap();
+        assert!((rel[0] - 1.0).abs() < 1e-5 && rel[1] == 0.0, "{rel:?}");
+        let text_wins = vec![vec!["unrelated words".to_string()], vec![]];
+        assert!((b.score("slurm binding cpu", &it, &text_wins).unwrap()[0] - 1.0).abs() < 1e-5, "the text still counts");
+    }
+
+    #[test]
+    fn queries_are_cached_under_the_query_prefix_and_count_as_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("c.txt");
+        let b = Bert { embedder: Words, cache: cache.clone(), warm: || {} };
+        let it = items(&["a b"]);
+        b.score("q", &it, &[vec!["x y".into()]]).unwrap();
+        let c = Cache::open(cache);
+        assert!(c.vectors.contains_key(&key("search_query: x y")) && c.vectors.contains_key(&key("search_document: a b")));
+        assert_eq!(texts(&it, &[vec!["x y".into(), "z".into()]]).len(), 3);
+        let cold = bert(&dir.path().join("cold"));
+        let err = cold.score("q", &it, &[vec!["1".into(), "2".into(), "3".into()]]).unwrap_err();
+        assert!(err.starts_with("4 of 4 lesson texts"), "a lesson and its three queries are four misses: {err}");
     }
 }

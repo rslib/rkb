@@ -157,6 +157,11 @@ verified_how: ran
 tags:
   - cmake
   - hdf5
+queries:
+  - "CMake Error: Could not find a package configuration file provided by HDF5"
+  - configure says hdf5 is missing though it is installed
+  - how do I make cmake find hdf5 on a module system
+  - find_package fails to locate the HDF5 libraries
 labels:
   sensitivity: internal
 ---
@@ -171,6 +176,7 @@ labels:
 - `type`: `pitfall`, `recipe`, `fact`, `decision` or `preference`.
 - `status`: `active`, `stale` (needs `stale_reason`), `superseded` (needs `superseded_by`) or `archived`.
 - `verified_how`: `ran` (you ran the fix), `read` (from documentation) or `told` (the user said it). Never write `checked`. Only `rkb verify` sets it, and the pre-commit hook rejects it.
+- `queries` (optional): 3 to 4 examples of what someone would type or paste when they hit the problem, before they know this lesson exists. Write: (a) raw tool output or error text as it appears in a terminal, (b) the symptom in plain words, (c) a how-do-I question, (d) the same problem in different vocabulary. Never copy the title. At most 8, each at most 200 characters, no duplicates. Only the `bm25-bert` reranker reads them; quote a query that has a colon.
 - `when`, `labels` and `meta` are maps. Any other top-level key is an error.
 - Write frontmatter in block style: one key per line and one list item per line, indented under its key. Never write `[a, b]` or `{k: v}`.
 - A lesson without `labels` takes the `labels` of the nearest folder note, and is `internal` when no note sets one.

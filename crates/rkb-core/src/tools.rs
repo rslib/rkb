@@ -40,6 +40,7 @@ pub fn definitions() -> Vec<Value> {
         "title": { "type": "string", "description": "What the lesson says, as a short sentence, such as `CMake cannot find HDF5 unless HDF5_ROOT is set`" },
         "topic": { "type": "string", "description": "Topic folder, such as `cmake` or `git`; rkb picks the scope from `when`" },
         "tags": { "type": "array", "items": { "type": "string" }, "description": "A few words to find it by" },
+        "queries": { "type": "array", "items": { "type": "string" }, "description": "3 to 4 example queries someone would type before they know this lesson exists, never the title: raw error text, the symptom in plain words, a how-do-I question, the same problem in other words" },
         "when": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Conditions under which it holds, such as {\"hdf5\": \"1.12:1.14.2\"}. Set {\"project\": \"<name>\"} when the claim holds only for one project (its code, decisions or conventions); leave it out for a general rule, and name the project only in evidence" },
         "verified_how": { "type": "string", "enum": ["ran", "read", "told"], "description": "ran: you ran it and saw it work; read: from docs or code; told: the user said so. Default: ran" },
         "assets": { "type": "array", "items": { "type": "string" }, "description": "Image files (png, jpg, webp, svg) to store with the lesson, metadata removed; link each in a section by its file name, such as ![trace](trace.png)" },
@@ -162,6 +163,9 @@ pub fn lesson(args: &Value) -> Result<(String, String), String> {
     fm.insert("verified_how".into(), text("verified_how").unwrap_or("ran").into());
     if let Some(tags) = args["tags"].as_array().filter(|a| !a.is_empty()) {
         fm.insert("tags".into(), tags.iter().filter_map(Value::as_str).map(serde_norway::Value::from).collect::<Vec<_>>().into());
+    }
+    if let Some(queries) = args["queries"].as_array().filter(|a| !a.is_empty()) {
+        fm.insert("queries".into(), queries.iter().filter_map(Value::as_str).map(serde_norway::Value::from).collect::<Vec<_>>().into());
     }
     if let Some(when) = args["when"].as_object().filter(|w| !w.is_empty()) {
         let mut m = serde_norway::Mapping::new();

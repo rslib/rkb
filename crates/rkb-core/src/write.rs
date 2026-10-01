@@ -181,8 +181,10 @@ pub fn scope_of(when: &Mapping) -> String {
 /// A lesson skeleton with the headings its type requires.
 pub fn template(kind: LessonType) -> String {
     let name = serde_norway::to_string(&kind).unwrap_or_default();
-    let mut out =
-        format!("---\ntype: {}\nverified_how: ran\n# when:\n#   project: <name>\n# tags:\n#   - <word>\n---\n\n# <Title>\n", name.trim());
+    let mut out = format!(
+        "---\ntype: {}\nverified_how: ran\n# when:\n#   project: <name>\n# tags:\n#   - <word>\n# queries:\n#   - <error text as it prints>\n#   - <the symptom in plain words>\n#   - <a how-do-I question>\n#   - <the same problem in other words>\n---\n\n# <Title>\n",
+        name.trim()
+    );
     for h in kind.required_headings() {
         out.push_str(&format!("\n## {h}\n\n"));
     }
