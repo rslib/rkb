@@ -248,7 +248,8 @@ pub fn collect_holding(root: &Path, usable: impl Fn(&str) -> bool, held: &BTreeS
             ),
         });
     }
-    let index = index(&g, &kinds, &passwords, &kb.site, &snap.files);
+    let uses = crate::usage::counts(root);
+    let index = index(&g, &kinds, &passwords, &kb.site, &snap.files, &uses);
     let held: Vec<String> = dropped.iter().map(|&i| g.lessons[i].frontmatter.id.clone()).collect();
     let mut site =
         Site { files: vec![], ids: vec![], protected: vec![], groups: BTreeMap::new(), secrets: vec![], left_out, held, defaulted, index };
@@ -287,6 +288,7 @@ fn row(
     passwords: &[Option<String>],
     by_path: &BTreeMap<&str, usize>,
     files: &BTreeMap<String, Vec<u8>>,
+    uses: &BTreeMap<String, crate::usage::Counts>,
     i: usize,
 ) -> Value {
     let l: &Lesson = &g.lessons[i];
@@ -332,6 +334,10 @@ fn row(
         "hrefs": hrefs,
         "images": images(l, files).into_iter().map(|(t, p)| (t, format!("{}/{p}", folder(kind)))).collect::<BTreeMap<_, _>>(),
     });
+    if let Some(u) = uses.get(&fm.id).filter(|u| u.worked + u.failed > 0) {
+        row["worked"] = json!(u.worked);
+        row["failed"] = json!(u.failed);
+    }
     if let Some(r) = &fm.stale_reason {
         row["stale_reason"] = json!(r);
     }
@@ -347,14 +353,21 @@ fn row(
     row
 }
 
-fn index(g: &Graph, kinds: &[Option<Kind>], passwords: &[Option<String>], site: &SiteConfig, files: &BTreeMap<String, Vec<u8>>) -> Value {
+fn index(
+    g: &Graph,
+    kinds: &[Option<Kind>],
+    passwords: &[Option<String>],
+    site: &SiteConfig,
+    files: &BTreeMap<String, Vec<u8>>,
+    uses: &BTreeMap<String, crate::usage::Counts>,
+) -> Value {
     let by_path: BTreeMap<&str, usize> = g.lessons.iter().enumerate().map(|(j, l)| (l.path.as_str(), j)).collect();
     let mut groups: BTreeMap<&str, BTreeMap<String, Vec<String>>> = BTreeMap::new();
     let (mut public, mut protected) = (vec![], vec![]);
     for i in 0..g.lessons.len() {
         match kinds[i] {
             Some(Kind::Public) => {
-                let r = row(g, kinds, passwords, &by_path, files, i);
+                let r = row(g, kinds, passwords, &by_path, files, uses, i);
                 let id = r["id"].as_str().unwrap_or_default().to_string();
                 groups.entry("topics").or_default().entry(r["topic"].as_str().unwrap_or_default().into()).or_default().push(id.clone());
                 for (key, group) in [("project", "projects"), ("system", "systems")] {
@@ -367,7 +380,7 @@ fn index(g: &Graph, kinds: &[Option<Kind>], passwords: &[Option<String>], site: 
                 }
                 public.push(r);
             }
-            Some(Kind::Protected) => protected.push(row(g, kinds, passwords, &by_path, files, i)),
+            Some(Kind::Protected) => protected.push(row(g, kinds, passwords, &by_path, files, uses, i)),
             None => {}
         }
     }

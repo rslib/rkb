@@ -154,6 +154,15 @@ local function by_title(a, b)
   return a.title:lower() < b.title:lower()
 end
 
+-- Where a lesson sits, in full: "dpucrumbs / cluster" for a topic of a project.
+local function where(l)
+  local top = l.project or l.system
+  if not top then
+    return l.topic
+  end
+  return l.topic ~= "" and (top .. " / " .. l.topic) or top
+end
+
 local function card(l)
   local t = type_of(l)
   return {
@@ -164,6 +173,7 @@ local function card(l)
     type = l.type,
     type_name = t.name,
     topic = l.topic,
+    where = where(l),
     place = place(l),
     verified = l.verified,
     date = date(l.verified),
@@ -239,12 +249,17 @@ local function breadcrumb(l, locked)
   if locked then
     table.insert(parts, svg("lock", 12) .. '<a href="/protected/">Protected</a>')
   end
+  -- A project or system with no public lesson has no public page, so its link leads to the protected list.
+  local function crumb(scope, label, name)
+    local list_url = #tree[scope] > 0 and ("/" .. scope .. "/") or "/protected/"
+    local url = groups[scope .. "/" .. name] and ("/" .. scope .. "/" .. esc(name) .. "/") or ("/protected/#" .. slug(name))
+    table.insert(parts, '<a href="' .. list_url .. '">' .. label .. "</a>")
+    table.insert(parts, '<a href="' .. url .. '">' .. esc(name) .. "</a>")
+  end
   if l.project then
-    table.insert(parts, '<a href="/projects/">Projects</a>')
-    table.insert(parts, '<a href="/projects/' .. esc(l.project) .. '/">' .. esc(l.project) .. "</a>")
+    crumb("projects", "Projects", l.project)
   elseif l.system then
-    table.insert(parts, '<a href="/systems/">Systems</a>')
-    table.insert(parts, '<a href="/systems/' .. esc(l.system) .. '/">' .. esc(l.system) .. "</a>")
+    crumb("systems", "Systems", l.system)
   else
     table.insert(parts, '<a href="/general/">General</a>')
   end
@@ -280,7 +295,8 @@ local function lesson_html(l, locked)
   end)
   local when = when_lines(l)
   local holds = #when > 0 and "<code>" .. table.concat(when, "</code> <code>") .. "</code>" or "anywhere"
-  local verified = date(l.verified) .. (HOW[l.verified_how] and (", " .. HOW[l.verified_how]) or "")
+  local verified = "<span>" .. date(l.verified) .. '</span><span class="muted"><span class="age" data-date="' .. esc(tostring(l.verified)) .. '"></span>'
+    .. (HOW[l.verified_how] or "") .. "</span>"
   local tags = {}
   for _, tag in ipairs(l.tags or {}) do
     if locked then
@@ -292,6 +308,10 @@ local function lesson_html(l, locked)
   local queries = {}
   for _, q in ipairs(l.queries or {}) do
     table.insert(queries, "<li>" .. esc(q) .. "</li>")
+  end
+  local record = ""
+  if (l.worked or 0) + (l.failed or 0) > 0 then
+    record = "worked " .. (l.worked or 0) .. ", failed " .. (l.failed or 0)
   end
   local c = around[l.id] or {}
   local nav = ""
@@ -323,7 +343,8 @@ local function lesson_html(l, locked)
     #toc > 0 and ('<section class="side-list toc"><h2 class="label">On this page</h2>' .. table.concat(toc) .. "</section>") or "",
     '<dl class="facts">',
     '<div><dt>Type</dt><dd><span class="dot"></span>' .. esc(t.name) .. "</dd></div>",
-    "<div><dt>Verified</dt><dd>" .. verified .. "</dd></div>",
+    '<div><dt>Verified</dt><dd class="stack">' .. verified .. "</dd></div>",
+    record ~= "" and ("<div><dt>Record</dt><dd>" .. record .. "</dd></div>") or "",
     "<div><dt>Holds</dt><dd>" .. holds .. "</dd></div>",
     #tags > 0 and ('<div><dt>Tags</dt><dd class="tags">' .. table.concat(tags) .. "</dd></div>") or "",
     locked and "<div><dt>Access</dt><dd>protected, decrypted in this tab</dd></div>" or "",
@@ -361,9 +382,12 @@ local function entry(l)
     title = l.title,
     type = l.type,
     topic = l.topic,
+    where = where(l),
     place = place(l),
     tags = l.tags or {},
     queries = l.queries or {},
+    verified = l.verified,
+    stale = l.status == "stale" or nil,
     url = l.url,
     text = plain(l),
   }

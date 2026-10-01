@@ -86,9 +86,20 @@
     mark();
   }
 
+  // Age of a verified date, as of the day the page is opened.
+  function ages(root) {
+    $$(".age", root).forEach((e) => {
+      const days = Math.floor((Date.now() - Date.parse(e.dataset.date)) / 864e5);
+      if (!(days >= 0)) return;
+      const [n, unit] = days < 14 ? [days, "day"] : days < 60 ? [Math.floor(days / 7), "week"] : days < 730 ? [Math.floor(days / 30), "month"] : [Math.floor(days / 365), "year"];
+      e.textContent = days === 0 ? "today" : n + " " + unit + (n === 1 ? "" : "s") + " ago";
+    });
+  }
+
   // Code blocks: a bar with the language and a copy button
   function enhance(root) {
     watchSections(root);
+    ages(root);
     $$(".prose > pre", root).forEach((pre) => {
       const code = $("code", pre);
       const lang = code && (code.className.match(/language-(\S+)/) || [])[1];
@@ -105,6 +116,71 @@
     });
   }
   enhance(document);
+
+  // List pages: unlocked protected lessons join the rows that belong on the page.
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const slugOf = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  const longDate = (iso) => { const [y, m, d] = String(iso).split("-").map(Number); return m ? d + " " + MONTHS[m - 1] + " " + y : String(iso); };
+  function mergeRows(list) {
+    const rows = $(".rows[data-list]");
+    if (!rows) return;
+    $$(".row[data-locked]", rows).forEach((r) => r.remove());
+    const [kind, name] = location.pathname.split("/").filter(Boolean);
+    const here = (e) => !kind || kind === "all" ? kind === "all"
+      : kind === "types" ? e.type === name
+      : kind === "tags" ? arr(e.tags).some((t) => slugOf(t) === name)
+      : e.place === kind + "/" + name;
+    for (const e of list.filter(here)) {
+      rows.append(el("a", { class: "row t-" + e.type, "data-locked": "1", "data-type": e.type, "data-type-name": TYPES[e.type] || e.type, "data-title": e.title, "data-verified": e.verified || "", href: e.url, ...(e.stale ? { "data-stale": "1" } : {}) },
+        el("span", { class: "dot", role: "img", "aria-label": TYPES[e.type] || e.type }),
+        el("span", { class: "row-title" }, titleNode(e.title), e.stale ? el("span", { class: "badge stale" }, "Stale") : null),
+        el("span", { class: "mono muted" }, e.where || e.topic), el("span", { class: "muted date" }, longDate(e.verified))));
+    }
+    listTools();
+  }
+
+  // Lists with many lessons: filter by type, hide stale ones, sort by date or title.
+  function listTools() {
+    const rows = $(".rows[data-list]");
+    if (!rows) return;
+    $$(".list-tools").forEach((b) => b.remove());
+    const items = $$(".row", rows);
+    if (items.length < 8) return;
+    const hidden = new Set();
+    let stale = true;
+    let sortBy = "date";
+    const apply = () => {
+      const by = sortBy === "date" ? (a, b) => b.dataset.verified.localeCompare(a.dataset.verified) || a.dataset.title.localeCompare(b.dataset.title)
+        : (a, b) => a.dataset.title.localeCompare(b.dataset.title);
+      items.sort(by).forEach((r) => {
+        r.hidden = hidden.has(r.dataset.type) || (!stale && !!r.dataset.stale);
+        rows.append(r);
+      });
+    };
+    const chip = (label, click, cls) => {
+      const b = el("button", { type: "button", class: "chip-btn" + (cls ? " " + cls : ""), "aria-pressed": "true" }, label);
+      b.addEventListener("click", () => { const now = click(b.getAttribute("aria-pressed") !== "true"); b.setAttribute("aria-pressed", String(now)); apply(); });
+      return b;
+    };
+    const bar = el("div", { class: "list-tools" });
+    const types = [...new Map(items.map((r) => [r.dataset.type, r.dataset.typeName])).entries()];
+    if (types.length > 1) {
+      for (const [t, name] of types) {
+        bar.append(chip(name, (on) => { if (on) hidden.delete(t); else hidden.add(t); return on; }, "t-" + t));
+      }
+    }
+    if (items.some((r) => r.dataset.stale)) bar.append(chip("Stale", (on) => (stale = on)));
+    const sorter = el("span", { class: "sorter" }, "Sort ");
+    for (const [key, label] of [["date", "Newest"], ["title", "A to Z"]]) {
+      const b = el("button", { type: "button", class: "chip-btn", "aria-pressed": String(key === sortBy) }, label);
+      b.addEventListener("click", () => { sortBy = key; $$(".sorter button", bar).forEach((x) => x.setAttribute("aria-pressed", String(x === b))); apply(); });
+      sorter.append(b);
+    }
+    bar.append(sorter);
+    rows.before(bar);
+    apply();
+  }
+  listTools();
 
   // Search
   const input = $("#search");
@@ -348,7 +424,10 @@
   function fill(list) {
     extra = list.map((e) => prepare(Object.assign({ locked: true }, e)));
     document.body.classList.add("is-unlocked");
+    mergeRows(list);
     $("#unlocked").hidden = false;
+    const pill = $("#locked");
+    if (pill) pill.hidden = true;
     input.placeholder = "Search " + (baseCount + list.length) + " lessons, protected included";
     const note = $("#search-note");
     if (note) note.textContent = "Search runs in your browser over the published lessons and the unlocked protected lessons.";
@@ -377,9 +456,10 @@
         $("#unlock .lead").textContent = "Another password opens more lessons. The ones you opened stay open until you close this tab.";
       }
       box.hidden = false;
+      if (location.hash) { const g = document.getElementById(location.hash.slice(1)); if (g) g.scrollIntoView(); }
       $("h1", box).textContent = list.length + (locked > 0 ? " protected lessons unlocked" : " protected lessons");
       $("#protected-groups").replaceChildren(...groupsOf(list).map(([name, items]) =>
-        el("section", null, el("h2", { class: "mono" }, name),
+        el("section", { id: slugOf(name) }, el("h2", { class: "mono" }, name),
           el("div", { class: "rows" }, ...items.map((e) =>
             el("a", { class: "row t-" + e.type, href: e.url },
               el("span", { class: "dot", role: "img", "aria-label": TYPES[e.type] || e.type }),
