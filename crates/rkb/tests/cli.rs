@@ -1489,31 +1489,6 @@ fn eval_fixture_meets_recall() {
     assert!(stdout(&o).contains("recall does not apply"), "{}", stdout(&o));
 }
 
-/// Runs only with `RKB_TEST_LAYA_DIR` set to fetched model files.
-#[test]
-fn eval_sweeps_recall_with_laya() {
-    let Ok(model) = std::env::var("RKB_TEST_LAYA_DIR") else { return };
-    let env = named_kb("eval");
-    let data = env.dir.path().join("data/rkb/models");
-    std::fs::create_dir_all(&data).unwrap();
-    std::os::unix::fs::symlink(&model, data.join("laya")).unwrap();
-    let q = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/eval/queries.toml");
-    let o = env
-        .cmd(env!("CARGO_BIN_EXE_rkb"))
-        .args(["eval", "--queries", q.to_str().unwrap(), "--rerank", "laya", "--recall-sweep", "--format", "json"])
-        .env("XDG_DATA_HOME", env.dir.path().join("data"))
-        .env("RKB_LAYA_DEVICE", "cpu")
-        .output()
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
-    assert_eq!(v["ranked_by"], "laya (cpu)", "{v}");
-    let sweep = v["recall_sweep"].as_array().unwrap();
-    assert_eq!(sweep.len(), 24, "{v}");
-    let total = |c: &serde_json::Value| ["right", "wrong", "silent"].iter().map(|k| c[k].as_u64().unwrap()).sum::<u64>();
-    assert_eq!(total(&v["recall"]), 124, "{v}");
-    assert!(sweep.iter().all(|c| total(c) == 124), "{v}");
-}
-
 #[test]
 fn search_outputs_and_hidden_results() {
     let env = search_kb();
@@ -1570,78 +1545,55 @@ fn ids(v: &serde_json::Value) -> Vec<String> {
 fn search_falls_back_to_bm25_without_a_model() {
     let env = search_kb();
     let (plain, _) = env.json(&["search", "git rebase"], "");
-    set_chain(&env, "chain = [\"laya\", \"bm25\"]");
+    set_chain(&env, "chain = [\"missing\", \"bm25\"]");
     let (v, _) = env.json(&["search", "git rebase"], "");
     let by = v["ranked_by"].as_str().unwrap();
-    assert!(by.starts_with("bm25 (laya: not configured") && by.contains("rkb models fetch"), "{v}");
+    assert!(by.starts_with("bm25 (missing: unknown backend `missing`; this build knows jev, bm25-bert and bm25)"), "{v}");
     assert_eq!(ids(&v), ids(&plain));
     assert!(v["results"][0].get("relevance").is_none(), "{v}");
     let human = stdout(&env.rkb(&["search", "git rebase", "--format", "human"]));
-    assert!(human.contains("reranker: bm25 (laya: not configured"), "{human}");
+    assert!(human.contains("reranker: bm25 (missing: unknown backend"), "{human}");
     let (v, _) = env.json(&["search", "git rebase", "--no-model"], "");
     assert_eq!(v["ranked_by"], "bm25");
 
-    set_chain(&env, "chain = [\"laya\"]\nstrict = true");
+    set_chain(&env, "chain = [\"missing\"]\nstrict = true");
     let (v, code) = env.json(&["search", "git rebase"], "");
     assert_eq!(code, Some(1), "{v}");
-    assert!(v["error"]["message"].as_str().unwrap().contains("laya"), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("missing"), "{v}");
     let o =
         env.cmd(env!("CARGO_BIN_EXE_rkb")).args(["search", "git rebase", "--format", "json"]).env("RKB_NO_MODEL", "1").output().unwrap();
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!((v["ranked_by"].as_str(), o.status.code()), (Some("bm25"), Some(0)), "{v}");
 
-    let (v, _) = env.json(&["doctor"], "");
-    let model = v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "model").unwrap_or_else(|| panic!("{v}"));
-    assert_eq!((model["status"].as_str(), model["fix"].as_str()), (Some("warn"), Some("rkb models fetch")), "{v}");
+    set_chain(&env, "chain = [\"bm25-bert\", \"bm25\"]");
+    let o = env
+        .cmd(env!("CARGO_BIN_EXE_rkb"))
+        .args(["search", "git rebase", "--format", "json"])
+        .env("XDG_DATA_HOME", env.dir.path().join("empty-data"))
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let by = v["ranked_by"].as_str().unwrap();
+    assert!(by.starts_with("bm25 (bm25-bert: not configured") && by.contains("rkb models fetch"), "{v}");
+    assert_eq!(ids(&v), ids(&plain));
+    let o = env
+        .cmd(env!("CARGO_BIN_EXE_rkb"))
+        .args(["doctor", "--format", "json"])
+        .env("XDG_DATA_HOME", env.dir.path().join("empty-data"))
+        .output()
+        .unwrap();
+    let d: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let check = d["checks"].as_array().unwrap().iter().find(|c| c["check"] == "bm25-bert").unwrap_or_else(|| panic!("{d}"));
+    assert_eq!((check["status"].as_str(), check["fix"].as_str()), (Some("warn"), Some("rkb models fetch")), "{d}");
+    set_chain(&env, "chain = [\"missing\", \"bm25\"]");
 
     let q = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/search/queries.toml");
     let q = q.to_str().unwrap();
     let (v, code) = env.json(&["eval", "--queries", q, "--rerank", "bm25"], "");
     assert_eq!((v["ranked_by"].as_str(), code), (Some("bm25"), Some(0)), "{v}");
-    let (v, code) = env.json(&["eval", "--queries", q, "--rerank", "laya"], "");
+    let (v, code) = env.json(&["eval", "--queries", q, "--rerank", "missing"], "");
     assert_eq!(code, Some(1), "a skipped backend fails the eval: {v}");
-    assert!(v["error"]["message"].as_str().unwrap().contains("laya"), "{v}");
-}
-
-/// Runs only with `RKB_TEST_LAYA_DIR` set to fetched model files.
-#[test]
-fn search_reranks_with_laya() {
-    let Ok(model) = std::env::var("RKB_TEST_LAYA_DIR") else { return };
-    let env = search_kb();
-    let (plain, _) = env.json(&["search", "messy git history before review", "--limit", "20"], "");
-    set_chain(&env, "chain = [\"laya\", \"bm25\"]\ntimeout_ms = 60000");
-    let data = env.dir.path().join("data/rkb/models");
-    std::fs::create_dir_all(&data).unwrap();
-    std::os::unix::fs::symlink(&model, data.join("laya")).unwrap();
-    let o = env
-        .cmd(env!("CARGO_BIN_EXE_rkb"))
-        .args(["search", "messy git history before review", "--limit", "20", "--format", "json"])
-        .env("XDG_DATA_HOME", env.dir.path().join("data"))
-        .env("RKB_LAYA_DEVICE", "cpu")
-        .output()
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
-    assert_eq!(v["ranked_by"], "laya (cpu)", "{v}");
-    let (mut got, mut want) = (ids(&v), ids(&plain));
-    assert_ne!(got, want, "the model changes the order");
-    got.sort();
-    want.sort();
-    assert_eq!(got, want, "nothing is removed or added");
-    let rel: Vec<f64> = v["results"].as_array().unwrap().iter().map(|r| r["relevance"].as_f64().unwrap()).collect();
-    assert!(rel.iter().all(|r| ((r * 100.0).round() / 100.0 - r).abs() < 1e-12), "two decimals: {rel:?}");
-    assert!(rel.windows(2).all(|w| w[0] >= w[1]), "{rel:?}");
-
-    let q = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/search/queries.toml");
-    let o = env
-        .cmd(env!("CARGO_BIN_EXE_rkb"))
-        .args(["eval", "--queries", q.to_str().unwrap(), "--rerank", "laya", "--format", "json"])
-        .env("XDG_DATA_HOME", env.dir.path().join("data"))
-        .env("RKB_LAYA_DEVICE", "cpu")
-        .output()
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
-    assert_eq!(v["ranked_by"], "laya (cpu)", "{v}");
-    assert!(v["recall_at_5"].as_f64().unwrap() >= 0.9, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("missing"), "{v}");
 }
 
 fn graph_kb() -> Env {
@@ -1835,8 +1787,6 @@ fn argument_errors_are_records_on_stdout() {
     let (v, code) = env.json(&["lsit"], "");
     assert_eq!(code, Some(2));
     assert!(v["error"]["fix"].as_str().unwrap().contains("list"), "{v}");
-    let (v, _) = env.json(&["models"], "");
-    assert!(v["error"]["fix"].as_str().unwrap().contains("fetch"), "{v}");
 
     let help = env.rkb(&["show", "--help"]);
     assert_eq!(help.status.code(), Some(0));
@@ -2151,37 +2101,6 @@ fn recall_needs_a_model() {
     assert_eq!(hook(&env, "prompt", &payload), "", "BM25 alone never recalls");
 }
 
-/// Runs only with `RKB_TEST_LAYA_DIR` set to fetched model files.
-#[test]
-fn recall_adds_a_strong_lesson_once() {
-    let Ok(model) = std::env::var("RKB_TEST_LAYA_DIR") else { return };
-    let env = search_kb();
-    set_chain(&env, "chain = [\"laya\", \"bm25\"]\n\n[hooks]\nhook_timeout_ms = 60000");
-    let data = env.dir.path().join("data/rkb/models");
-    std::fs::create_dir_all(&data).unwrap();
-    std::os::unix::fs::symlink(&model, data.join("laya")).unwrap();
-    let run = |prompt: &str| {
-        let payload = serde_json::json!({ "session_id": "r", "cwd": env.dir.path(), "prompt": prompt });
-        let o = env
-            .cmd(env!("CARGO_BIN_EXE_rkb"))
-            .args(["hook", "prompt"])
-            .env("XDG_DATA_HOME", env.dir.path().join("data"))
-            .env("RKB_LAYA_DEVICE", "cpu")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        use std::io::Write;
-        let mut o = o;
-        o.stdin.take().unwrap().write_all(payload.to_string().as_bytes()).unwrap();
-        String::from_utf8_lossy(&o.wait_with_output().unwrap().stdout).into_owned()
-    };
-    let first = run("the linker says undefined reference to vtable for Widget");
-    assert!(first.contains("1a00000012") && first.contains("additionalContext"), "{first}");
-    assert_eq!(run("the linker says undefined reference to vtable for Widget again"), "", "once per session");
-    assert_eq!(run("/rkb:retro"), "");
-}
-
 #[test]
 fn eval_replays_logged_failures() {
     let env = search_kb();
@@ -2217,30 +2136,6 @@ fn eval_replays_logged_failures() {
     assert_eq!(stdout(&env.git(&["status", "--porcelain", "--", ".rkb"])), "", "changes nothing");
     assert_eq!(env.rkb(&["eval", "--replay", "--self"]).status.code(), Some(2));
     assert_eq!(env.rkb(&["eval", "--days", "3"]).status.code(), Some(2), "--days needs --replay");
-}
-
-/// Runs only with `RKB_TEST_LAYA_DIR` set to fetched model files.
-#[test]
-fn failure_hook_needs_a_clear_winner() {
-    let Ok(model) = std::env::var("RKB_TEST_LAYA_DIR") else { return };
-    let env = search_kb();
-    set_chain(&env, "chain = [\"laya\", \"bm25\"]\n\n[hooks]\nhook_timeout_ms = 60000");
-    let data = env.dir.path().join("data/rkb/models");
-    std::fs::create_dir_all(&data).unwrap();
-    std::os::unix::fs::symlink(&model, data.join("laya")).unwrap();
-    let lesson = "general/cpp/undefined-vtable-means-missing-virtual.md";
-    let twin = std::fs::read_to_string(env.kb().join(lesson)).unwrap().replace("id: 1a00000012", "id: 1a000000ff");
-    env.write("general/cpp/undefined-vtable-twin.md", &twin);
-    let run = |session: &str| {
-        let mut failed = bash(session, &env.kb(), "g++ main.o -o app");
-        failed["error"] = "Exit code 1\n/usr/bin/ld: main.o: in function `main':\nmain.cpp:(.text+0x1f): undefined reference to `vtable for Widget'\ncollect2: error: ld returned 1 exit status\n".into();
-        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
-        c.args(["hook", "tool-failed"]).env("XDG_DATA_HOME", env.dir.path().join("data")).env("RKB_LAYA_DEVICE", "cpu");
-        stdout(&rkb_with(c, &[], &failed.to_string()))
-    };
-    assert_eq!(run("twins"), "", "two lessons rated alike: no clear winner");
-    std::fs::remove_file(env.kb().join("general/cpp/undefined-vtable-twin.md")).unwrap();
-    assert!(run("single").contains("1a00000012"), "alone, the lesson is a clear winner");
 }
 
 #[test]
@@ -4827,16 +4722,16 @@ fn jev_rates_only_the_candidates_it_may_see() {
         assert_eq!(y["relevance"].is_null(), !public, "{y}");
     }
 
-    set_chain(&env, "chain = [\"laya\", \"jev\", \"bm25\"]");
-    let (v, _) = jev_search(&env, &url, "git rebase", &[("RKB_LAYA_DIR", "/nonexistent")]);
-    assert!(v["ranked_by"].as_str().unwrap().contains("jev: a candidate is not allowed by sinks.jev"), "behind laya: {v}");
+    set_chain(&env, "chain = [\"missing\", \"jev\", \"bm25\"]");
+    let (v, _) = jev_search(&env, &url, "git rebase", &[]);
+    assert!(v["ranked_by"].as_str().unwrap().contains("jev: a candidate is not allowed by sinks.jev"), "behind another backend: {v}");
     assert_eq!(log.lock().unwrap().len(), 1, "nothing more sent");
 }
 
 #[test]
 fn prompt_hook_reads_only_what_the_user_typed_and_logs_rankings() {
     let env = search_kb();
-    set_chain(&env, "chain = [\"laya\", \"bm25\"]");
+    set_chain(&env, "chain = [\"missing\", \"bm25\"]");
     let sessions = env.dir.path().join("state/rkb/sessions/h1.jsonl");
     let send = |prompt: &str| hook(&env, "prompt", &serde_json::json!({ "session_id": "h1", "cwd": env.dir.path(), "prompt": prompt }));
     send(
@@ -4851,7 +4746,7 @@ fn prompt_hook_reads_only_what_the_user_typed_and_logs_rankings() {
     let log = std::fs::read_to_string(&rankings).unwrap();
     let v: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
     assert_eq!((v["hook"].as_str(), v["backend"].as_str()), (Some("recall"), Some("bm25")), "{v}");
-    assert!(v["skipped"][0].as_str().unwrap().starts_with("laya: "), "{v}");
+    assert!(v["skipped"][0].as_str().unwrap().starts_with("missing: "), "{v}");
     let (d, _) = env.json(&["doctor"], "");
     assert!(d["checks"].as_array().unwrap().iter().any(|c| c["check"] == "hook rankings"), "{d}");
 }
@@ -4895,7 +4790,7 @@ fn stop_blocks_only_for_the_users_own_signals() {
 #[test]
 fn failure_recall_can_be_turned_off() {
     let env = search_kb();
-    set_chain(&env, "chain = [\"laya\", \"bm25\"]\n\n[hooks]\nfailure_recall = false");
+    set_chain(&env, "chain = [\"missing\", \"bm25\"]\n\n[hooks]\nfailure_recall = false");
     let mut failed = bash("f1", &env.kb(), "g++ main.o -o app");
     failed["error"] =
         "Exit code 1\n/usr/bin/ld: main.o: undefined reference to `vtable for Widget'\ncollect2: error: ld returned 1 exit status\n".into();

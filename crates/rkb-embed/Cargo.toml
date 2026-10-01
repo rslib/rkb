@@ -1,32 +1,31 @@
 [package]
-name = "rkb-rerank"
+name = "rkb-embed"
 version.workspace = true
 publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-
 # Released with the rkb binary; only rkb is tagged.
 [package.metadata.release]
 tag = false
+
 [dependencies]
 anyhow = "1"
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 serde_json.workspace = true
-safetensors = "0.8"
-memmap2 = "0.9"
-half = "2"
-rayon = "1"
 sha2.workspace = true
 ureq.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "0.11", features = ["metal"] }
-candle-nn = { version = "0.11", features = ["metal"] }
+candle-core = { version = "0.11", features = ["metal", "accelerate"] }
+candle-nn = { version = "0.11", features = ["metal", "accelerate"] }
+candle-transformers = { version = "0.11", features = ["metal", "accelerate"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-gemm = "0.19"
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
 
 [dev-dependencies]
 tempfile.workspace = true

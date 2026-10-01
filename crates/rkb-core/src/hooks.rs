@@ -279,8 +279,11 @@ impl Strength {
     /// From `[hooks]` in `kb.toml` for the backend that ranked; a missing key keeps that backend's default.
     pub fn from_config(cfg: &toml::Table, backend: &str) -> Self {
         let get = |k: &str, default: f64| cfg.get(k).and_then(toml::Value::as_float).unwrap_or(default);
-        let (min, margin) =
-            if backend == "jev" { (JEV_MIN_RELEVANCE, JEV_MIN_MARGIN) } else { (DEFAULT_MIN_RELEVANCE, DEFAULT_MIN_MARGIN) };
+        let (min, margin) = match backend {
+            "jev" => (JEV_MIN_RELEVANCE, JEV_MIN_MARGIN),
+            "bm25-bert" => (BERT_MIN_RELEVANCE, BERT_MIN_MARGIN),
+            _ => (DEFAULT_MIN_RELEVANCE, DEFAULT_MIN_MARGIN),
+        };
         Strength {
             min_relevance: get("min_relevance", min),
             min_margin: get("min_margin", margin),
@@ -356,20 +359,28 @@ pub fn strong_enough(relevance: Option<f32>, next: f64, coverage: impl FnOnce() 
 
 /// Recall adds a lesson only when a model rates it at least this high...
 pub const RECALL_MIN_RELEVANCE: f64 = 0.85;
-/// ...and at least this much above the next lesson: Laya rates general lessons high for many questions,
-/// so a lone clear winner is the signal, not a high score alone.
+/// ...and at least this much above the next lesson: a model rates general lessons high for many
+/// questions, so a lone clear winner is the signal, not a high score alone.
 pub const RECALL_MIN_MARGIN: f64 = 0.10;
 
-/// Jev's scores separate right from wrong lower down than Laya's. On the harder eval set (124
-/// queries, 2026-09-29) Jev recalled 83 right and 0 wrong at 0.75 with a 0.05 lead (the first wrong
-/// one at 0.70 with no lead), against 67 and 0 at Laya's 0.85 and 0.10; Laya at 0.75 gave 38 and 13.
-/// Both hooks use these when Jev ranked, unless `kb.toml` sets its own.
+/// Jev's scores separate right from wrong lower down than the general defaults. On the harder eval
+/// set (124 queries, 2026-09-29) Jev recalled 83 right and 0 wrong at 0.75 with a 0.05 lead (the first
+/// wrong one at 0.70 with no lead). Both hooks use these when Jev ranked, unless `kb.toml` sets its own.
 pub const JEV_MIN_RELEVANCE: f64 = 0.75;
 pub const JEV_MIN_MARGIN: f64 = 0.05;
 
+/// `bm25-bert` reports a raw cosine, which sits lower than a rating. On 184 real failures (33 with a
+/// matching lesson) 0.55 with a 0.08 lead injected 13 right lessons and 6 wrong ones out of 148 with none.
+pub const BERT_MIN_RELEVANCE: f64 = 0.55;
+pub const BERT_MIN_MARGIN: f64 = 0.08;
+
 /// Prompt recall's default `(min_relevance, margin)` for the backend that ranked.
 pub fn recall_defaults(backend: &str) -> (f64, f64) {
-    if backend == "jev" { (JEV_MIN_RELEVANCE, JEV_MIN_MARGIN) } else { (RECALL_MIN_RELEVANCE, RECALL_MIN_MARGIN) }
+    match backend {
+        "jev" => (JEV_MIN_RELEVANCE, JEV_MIN_MARGIN),
+        "bm25-bert" => (BERT_MIN_RELEVANCE, BERT_MIN_MARGIN),
+        _ => (RECALL_MIN_RELEVANCE, RECALL_MIN_MARGIN),
+    }
 }
 
 /// Whether recall adds the top lesson: rated at least `min`, and at least `margin` above the next one.
@@ -699,7 +710,12 @@ mod tests {
         assert_eq!((jev.min_relevance, jev.min_margin), (JEV_MIN_RELEVANCE, JEV_MIN_MARGIN));
         let set: toml::Table = toml::from_str("min_relevance = 0.9").unwrap();
         assert_eq!(Strength::from_config(&set, "jev").min_relevance, 0.9, "kb.toml wins");
-        assert_eq!(recall_defaults("laya (gpu)"), (RECALL_MIN_RELEVANCE, RECALL_MIN_MARGIN));
+        assert_eq!(recall_defaults("bm25"), (RECALL_MIN_RELEVANCE, RECALL_MIN_MARGIN));
+        assert_eq!(recall_defaults("bm25-bert"), (0.55, 0.08));
+        let bert = Strength::from_config(&toml::Table::new(), "bm25-bert");
+        assert_eq!((bert.min_relevance, bert.min_margin), (0.55, 0.08));
+        assert_eq!(Strength::from_config(&set, "bm25-bert").min_relevance, 0.9, "kb.toml wins");
+        assert!(clear_winner(0.60, 0.50, 0.55, 0.08) && !clear_winner(0.60, 0.55, 0.55, 0.08) && !clear_winner(0.50, 0.0, 0.55, 0.08));
         assert!(!strong_enough(Some(0.62), 0.0, || 1.0, &t));
         assert!(strong_enough(Some(0.91), 0.0, || 0.0, &t));
         assert!(!strong_enough(Some(0.86), 0.81, || 1.0, &t), "no clear winner");
@@ -709,7 +725,7 @@ mod tests {
 
     #[test]
     fn recall_needs_a_clear_winner() {
-        // Top and second scores seen on real lessons with Laya (2026-09-27).
+        // Top and second scores seen on real lessons with a model (2026-09-27).
         assert!(clear_winner(0.93, 0.86, 0.85, 0.05), "right lesson, clear lead");
         assert!(clear_winner(0.89, 0.0, 0.85, 0.05), "right lesson, alone");
         assert!(!clear_winner(0.86, 0.83, 0.85, 0.05), "wrong lesson on top, no clear lead");

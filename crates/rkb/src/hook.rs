@@ -301,7 +301,7 @@ fn ranked_search(
         hooks::log_ranking(state, hook, &ranked, start.elapsed().as_millis() as u64);
     }
     if let Some(scores) = &ranked.scores {
-        search::apply_relevance(&mut found.hits, scores);
+        search::apply_relevance(&mut found.hits, scores, ranked.order.as_deref());
     }
     Ok((found.hits, ranked, place))
 }

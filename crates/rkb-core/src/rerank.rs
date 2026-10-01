@@ -10,10 +10,14 @@ use crate::error::{Error, Result};
 
 /// A model that scores how well each item fits a query.
 pub trait Reranker: Send {
-    /// Where it runs, such as `gpu` or `cpu`.
-    fn device(&self) -> Option<String>;
     /// Relevance of each item in [0, 1], in the items' order.
     fn score(&self, query: &str, items: &[String]) -> std::result::Result<Vec<f32>, String>;
+
+    /// The sort key of each item, given its relevance, when the order is not the relevance's; `None`
+    /// sorts by relevance. The items arrive in BM25 order.
+    fn order(&self, _relevance: &[f32]) -> Option<Vec<f32>> {
+        None
+    }
 }
 
 /// Opens a backend by name, or says why it cannot run.
@@ -28,13 +32,11 @@ pub struct Settings {
     pub timeout_ms: u64,
     /// How many BM25 candidates a model scores.
     pub top: usize,
-    /// `cpu` forces the CPU engine; anything else lets the backend choose.
-    pub device: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { chain: vec![BM25.into()], strict: false, timeout_ms: 2000, top: 20, device: None }
+        Settings { chain: vec![BM25.into()], strict: false, timeout_ms: 2000, top: 20 }
     }
 }
 
@@ -56,7 +58,6 @@ impl Settings {
         if let Some(v) = t.get("top").and_then(|v| v.as_integer()) {
             s.top = v.max(1) as usize;
         }
-        s.device = t.get("device").and_then(|v| v.as_str()).map(str::to_string);
         s
     }
 }
@@ -65,25 +66,23 @@ impl Settings {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ranked {
     pub backend: String,
-    pub device: Option<String>,
     /// One relevance per item from a model; `None` when BM25 ranked them. An item the model was not
     /// allowed to see has no relevance.
     pub scores: Option<Vec<Option<f32>>>,
+    /// The sort key of each item when it is not its relevance.
+    pub order: Option<Vec<f32>>,
     /// Backends tried before, with the reason each was skipped.
     pub skipped: Vec<(String, String)>,
 }
 
 impl Ranked {
     fn bm25(skipped: Vec<(String, String)>) -> Self {
-        Ranked { backend: BM25.into(), device: None, scores: None, skipped }
+        Ranked { backend: BM25.into(), scores: None, order: None, skipped }
     }
 
-    /// `laya (gpu)`, or `bm25 (laya: timeout after 2000 ms)`.
+    /// `jev`, or `bm25 (jev: timeout after 2000 ms)`.
     pub fn describe(&self) -> String {
-        let mut out = match &self.device {
-            Some(d) => format!("{} ({d})", self.backend),
-            None => self.backend.clone(),
-        };
+        let mut out = self.backend.clone();
         if !self.skipped.is_empty() {
             let why: Vec<String> = self.skipped.iter().map(|(b, r)| format!("{b}: {r}")).collect();
             out.push_str(&format!(" ({})", why.join("; ")));
@@ -120,8 +119,9 @@ pub fn run(
         let reason = match blocked.get(&name) {
             Some(reason) => reason.clone(),
             None => match ask(&name, opener, query, items, timeout) {
-                Ok((scores, device)) => {
-                    return Ok(Ranked { backend: name, device, scores: Some(scores.into_iter().map(Some).collect()), skipped });
+                Ok((scores, order)) => {
+                    let scores = scores.into_iter().map(Some).collect();
+                    return Ok(Ranked { backend: name, scores: Some(scores), order, skipped });
                 }
                 Err(reason) => reason,
             },
@@ -142,7 +142,7 @@ fn ask(
     query: &str,
     items: &[String],
     timeout: Duration,
-) -> std::result::Result<(Vec<f32>, Option<String>), String> {
+) -> std::result::Result<(Vec<f32>, Option<Vec<f32>>), String> {
     let (tx, rx) = std::sync::mpsc::channel();
     let (opener, name_owned, query, items) = (opener.clone(), name.to_string(), query.to_string(), items.to_vec());
     // The worker is never joined: a model cannot be interrupted, and the process ends with the command.
@@ -152,7 +152,8 @@ fn ask(
             if scores.len() != items.len() {
                 return Err(format!("returned {} scores for {} items", scores.len(), items.len()));
             }
-            Ok((scores, r.device()))
+            let order = r.order(&scores);
+            Ok((scores, order))
         });
         let _ = tx.send(answer);
     });
@@ -172,9 +173,6 @@ mod tests {
     }
 
     impl Reranker for Fake {
-        fn device(&self) -> Option<String> {
-            Some("cpu".into())
-        }
         fn score(&self, _: &str, items: &[String]) -> std::result::Result<Vec<f32>, String> {
             std::thread::sleep(self.delay);
             if self.fail { Err("model crashed".into()) } else { Ok((0..items.len()).map(|i| i as f32 / 10.0).collect()) }
@@ -214,7 +212,7 @@ mod tests {
         .unwrap();
         assert_eq!(r.backend, "fast");
         assert_eq!(r.scores.as_deref(), Some(&[Some(0.0), Some(0.1), Some(0.2)][..]));
-        assert_eq!(r.describe(), "fast (cpu) (missing: not configured; broken: model crashed)");
+        assert_eq!(r.describe(), "fast (missing: not configured; broken: model crashed)");
     }
 
     #[test]
@@ -244,13 +242,9 @@ mod tests {
     #[test]
     fn settings_from_kb_toml() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("kb.toml"), "[rerank]\nchain = [\"laya\", \"bm25\"]\nstrict = true\ntop = 15\ndevice = \"cpu\"\n")
-            .unwrap();
+        std::fs::write(dir.path().join("kb.toml"), "[rerank]\nchain = [\"jev\", \"bm25\"]\nstrict = true\ntop = 15\n").unwrap();
         let s = Settings::load(dir.path());
-        assert_eq!(
-            (s.chain.clone(), s.strict, s.timeout_ms, s.top, s.device.as_deref()),
-            (vec!["laya".to_string(), BM25.to_string()], true, 2000, 15, Some("cpu"))
-        );
+        assert_eq!((s.chain.clone(), s.strict, s.timeout_ms, s.top), (vec!["jev".to_string(), BM25.to_string()], true, 2000, 15));
         assert_eq!(Settings::load(&dir.path().join("none")), Settings::default());
     }
 }

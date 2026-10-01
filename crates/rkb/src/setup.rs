@@ -156,9 +156,6 @@ pub fn install(env: &Env, names: Vec<String>, list_only: bool, uninstall: bool) 
     if changes.iter().all(|c| c.effect == Effect::Unchanged) {
         human.push_str("Nothing changed; everything was already in place.\n");
     }
-    if !uninstall && let Some(line) = crate::rerankers::warm_after_install() {
-        human.push_str(&format!("{line}\n"));
-    }
     let plugin = format!("claude plugin {}", install::PLUGIN);
     let restart = changes.iter().any(|c| c.path.display().to_string() == plugin && c.effect != Effect::Unchanged);
     let rows: Vec<serde_json::Value> = changes.iter().map(|c| json!({ "path": tilde(&c.path), "effect": c.effect })).collect();

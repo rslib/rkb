@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rkb", "crates/rkb-core", "crates/rkb-rerank"]
+members = ["crates/rkb", "crates/rkb-core", "crates/rkb-embed"]
 
 [workspace.package]
 version = "0.0.12"
@@ -11,7 +11,7 @@ publish = false
 
 [workspace.dependencies]
 rkb-core = { path = "crates/rkb-core" }
-rkb-rerank = { path = "crates/rkb-rerank" }
+rkb-embed = { path = "crates/rkb-embed" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

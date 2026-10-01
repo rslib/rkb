@@ -1,4 +1,4 @@
-//! The pinned Laya files: where they live, how they are checked, and how they are fetched.
+//! The pinned model files: where they live, how they are checked, and how they are fetched.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -6,27 +6,29 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
-pub const REPO: &str = "convaiinnovations/laya";
-pub const REVISION: &str = "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851";
+pub const REPO: &str = "nomic-ai/modernbert-embed-base";
+pub const REVISION: &str = "d556a88e332558790b210f7bdbe87da2fa94a8d8";
 
 /// (path in the repository, SHA-256, size in bytes).
 pub type File = (&'static str, &'static str, u64);
 
-pub const FILES: [File; 5] = [
-    ("model.safetensors", "891102d372688fc2a094dac56a384bc537b87c63f21f9f3dac0be2b7cbc8d86c", 842_609_210),
-    ("tokenizer/tokenizer.json", "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30", 3_583_228),
-    ("tokenizer/tokenizer_config.json", "50044de60daaa73df97d262e15a40d4faf0160e7d742df64b377877a1320dd12", 308),
-    ("encoder/config.json", "bf3ab80598fdccf414855a2ce80f22859e4492d06ca8a62ddd1cfb63972f8979", 2_083),
-    ("rl_agent_config.json", "ae287b56bbcf5f8c4f4541ae9dfd00c914c4c48b940b8398c3058af37ba92bbd", 745),
+pub const FILES: [File; 3] = [
+    ("model.safetensors", "69f22ccd1ee0971b6173678c4fcadd29a49a3f5b6b8a6927002418abe4bd5b9c", 596_070_136),
+    ("tokenizer.json", "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30", 3_583_228),
+    ("config.json", "dea4708ed1a6df7306b483037750464a96e77ccb0c7e88f4f61a0116944a71dd", 1_261),
 ];
 
-/// `$XDG_DATA_HOME/rkb/models/laya`, or `~/.local/share/rkb/models/laya`.
+/// `$XDG_DATA_HOME/rkb/models/modernbert-embed-base`, or `~/.local/share/rkb/models/modernbert-embed-base`.
 pub fn default_dir() -> PathBuf {
     let base = match std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
         Some(v) => PathBuf::from(v),
         None => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"),
     };
-    base.join("rkb/models/laya")
+    base.join("rkb/models/modernbert-embed-base")
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn hash_file(path: &Path) -> Result<String> {
@@ -40,19 +42,14 @@ fn hash_file(path: &Path) -> Result<String> {
         }
         h.update(&buf[..n]);
     }
-    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Ok(hex(&h.finalize()))
 }
 
-/// The stamp that records a file's size and modification time when its hash last matched,
-/// so a load does not hash 843 MB every time.
+/// Records a file's size and modification time when its hash last matched, so a load does not hash 596 MB every time.
 fn stamp(path: &Path) -> Option<String> {
     let m = std::fs::metadata(path).ok()?;
     let mtime = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
     Some(format!("{} {mtime}", m.len()))
-}
-
-fn stamp_path(dir: &Path, name: &str) -> PathBuf {
-    dir.join(".verified").join(name.replace('/', "__"))
 }
 
 /// Whether one file is present and matches its pinned hash, hashing only when it changed since the last match.
@@ -62,16 +59,14 @@ fn verified(dir: &Path, name: &str, sha: &str, size: u64) -> Result<bool> {
     if !now.starts_with(&format!("{size} ")) {
         return Ok(false);
     }
-    let sp = stamp_path(dir, name);
+    let sp = dir.join(".verified").join(name);
     if std::fs::read_to_string(&sp).is_ok_and(|s| s == now) {
         return Ok(true);
     }
     if hash_file(&path)? != sha {
         return Ok(false);
     }
-    if let Some(parent) = sp.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    std::fs::create_dir_all(sp.parent().expect("under .verified"))?;
     std::fs::write(&sp, now)?;
     Ok(true)
 }
@@ -106,8 +101,8 @@ pub fn fetch(dir: &Path, base: &str) -> Result<Fetched> {
     fetch_files(dir, base, &FILES)
 }
 
-/// The shared HTTP agent. Verifies against the OS trust store, so a TLS-intercepting proxy
-/// whose CA is installed on the system (but not in webpki roots) stops failing with UnknownIssuer.
+/// Verifies against the OS trust store, so a TLS-intercepting proxy whose CA is installed on the
+/// system (but not in webpki roots) stops failing with UnknownIssuer.
 fn agent() -> &'static ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     AGENT.get_or_init(|| {
@@ -120,6 +115,7 @@ fn agent() -> &'static ureq::Agent {
 
 fn fetch_files(dir: &Path, base: &str, files: &[File]) -> Result<Fetched> {
     let mut out = Fetched::default();
+    std::fs::create_dir_all(dir)?;
     for &(name, sha, size) in files {
         if verified(dir, name, sha, size)? {
             out.present.push(name.to_string());
@@ -127,9 +123,7 @@ fn fetch_files(dir: &Path, base: &str, files: &[File]) -> Result<Fetched> {
         }
         let url = format!("{}/{REPO}/resolve/{REVISION}/{name}", base.trim_end_matches('/'));
         let target = dir.join(name);
-        let parent = target.parent().expect("files live in the model folder");
-        std::fs::create_dir_all(parent)?;
-        let part = parent.join(format!(".{}.part", target.file_name().unwrap().to_string_lossy()));
+        let part = dir.join(format!(".{name}.part"));
         let mut resp = agent().get(&url).call().map_err(|e| anyhow::anyhow!("{url}: {e}"))?;
         let mut reader = resp.body_mut().as_reader();
         let mut file = std::fs::File::create(&part)?;
@@ -146,7 +140,7 @@ fn fetch_files(dir: &Path, base: &str, files: &[File]) -> Result<Fetched> {
             n_total += n as u64;
         }
         file.sync_all()?;
-        let got: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let got = hex(&h.finalize());
         if got != sha {
             let _ = std::fs::remove_file(&part);
             bail!("{name}: downloaded file does not match its pinned hash (got {got})");
@@ -163,10 +157,6 @@ fn fetch_files(dir: &Path, base: &str, files: &[File]) -> Result<Fetched> {
 mod tests {
     use super::*;
     use std::io::BufRead;
-
-    fn sha(bytes: &[u8]) -> String {
-        Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
-    }
 
     /// Serves `files` (request path suffix, body) over HTTP on a local port; returns the base URL.
     fn serve(files: Vec<(String, Vec<u8>)>) -> String {
@@ -199,12 +189,12 @@ mod tests {
     fn fetch_twice_and_a_corrupt_file() {
         let dir = tempfile::tempdir().unwrap();
         let (a, b) = (b"weights".to_vec(), b"{\"tokens\": 1}".to_vec());
-        let (sa, sb) = (sha(&a), sha(&b));
+        let (sa, sb) = (hex(&Sha256::digest(&a)), hex(&Sha256::digest(&b)));
         let files: Vec<File> = vec![
             ("model.safetensors", Box::leak(sa.into_boxed_str()), a.len() as u64),
-            ("tokenizer/tokenizer.json", Box::leak(sb.into_boxed_str()), b.len() as u64),
+            ("tokenizer.json", Box::leak(sb.into_boxed_str()), b.len() as u64),
         ];
-        let base = serve(vec![("/model.safetensors".into(), a.clone()), ("/tokenizer/tokenizer.json".into(), b.clone())]);
+        let base = serve(vec![("/model.safetensors".into(), a.clone()), ("/tokenizer.json".into(), b.clone())]);
         let e = check_files(dir.path(), &files).unwrap_err().to_string();
         assert!(e.starts_with("not configured"), "{e}");
         let first = fetch_files(dir.path(), &base, &files).unwrap();

@@ -236,18 +236,26 @@ pub fn rerank_items(root: &Path, hits: &[Hit]) -> Vec<String> {
         .collect()
 }
 
-/// Gives the first `scores.len()` hits their relevance and sorts them by it; the rest keep their BM25 order.
-/// Sets each hit's relevance and sorts the rated hits among their own places, highest first. A hit
-/// the model did not rate keeps its BM25 place and has no relevance.
-pub fn apply_relevance(hits: &mut [Hit], scores: &[Option<f32>]) {
+/// The rerank text of every active lesson, for filling a model's cache ahead of searches.
+pub fn active_rerank_items(root: &Path) -> Result<Vec<String>> {
+    let (lessons, _) = Snapshot::from_dir(root)?.lessons();
+    let hits: Vec<Hit> = lessons.iter().filter(|l| l.frontmatter.status == Status::Active).map(|l| hit(l, 0.0, None)).collect();
+    Ok(rerank_items(root, &hits))
+}
+
+/// Gives the first `scores.len()` hits their relevance and sorts the rated ones among their own
+/// places, highest first by `order` (a sort key per hit) when a backend gave one, else by relevance.
+/// A hit the model did not rate keeps its BM25 place and has no relevance.
+pub fn apply_relevance(hits: &mut [Hit], scores: &[Option<f32>], order: Option<&[f32]>) {
     let n = scores.len().min(hits.len());
     for (h, s) in hits.iter_mut().zip(scores) {
         h.relevance = *s;
     }
+    let key = |i: usize, h: &Hit| order.and_then(|o| o.get(i).copied()).or(h.relevance).unwrap_or(0.0);
     let places: Vec<usize> = (0..n).filter(|&i| hits[i].relevance.is_some()).collect();
-    let mut rated: Vec<Hit> = places.iter().map(|&i| hits[i].clone()).collect();
-    rated.sort_by(|a, b| b.relevance.unwrap_or(0.0).total_cmp(&a.relevance.unwrap_or(0.0)));
-    for (i, h) in places.into_iter().zip(rated) {
+    let mut rated: Vec<(f32, Hit)> = places.iter().map(|&i| (key(i, &hits[i]), hits[i].clone())).collect();
+    rated.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for (i, (_, h)) in places.into_iter().zip(rated) {
         hits[i] = h;
     }
 }
@@ -686,9 +694,15 @@ mod tests {
             verified_how: String::new(),
         };
         let mut hits = vec![h("a"), h("b"), h("c"), h("d")];
-        apply_relevance(&mut hits, &[Some(0.2), None, Some(0.9)]);
+        apply_relevance(&mut hits, &[Some(0.2), None, Some(0.9)], None);
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
         assert_eq!(ids, ["c", "b", "a", "d"], "b keeps place 2, and d was never rated");
         assert_eq!(hits.iter().map(|h| h.relevance).collect::<Vec<_>>(), [Some(0.9), None, Some(0.2), None]);
+
+        let mut hits = vec![h("a"), h("b"), h("c")];
+        apply_relevance(&mut hits, &[Some(0.5), Some(0.6), Some(0.4)], Some(&[0.7, 0.65, 0.4]));
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"], "the order key decides, not the relevance");
+        assert_eq!(hits.iter().map(|h| h.relevance).collect::<Vec<_>>(), [Some(0.5), Some(0.6), Some(0.4)]);
     }
 }

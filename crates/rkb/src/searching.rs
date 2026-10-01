@@ -51,7 +51,7 @@ pub fn rerank_hits(
     let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(settings.timeout_ms));
     let ranked = crate::rerankers::run(&env.root, &settings, only, query, &r.hits[..n], timeout)?;
     if let Some(scores) = &ranked.scores {
-        search::apply_relevance(&mut r.hits, scores);
+        search::apply_relevance(&mut r.hits, scores, ranked.order.as_deref());
     }
     r.hits.truncate(limit);
     Ok(ranked)
@@ -262,12 +262,12 @@ pub fn eval(
         let ranked = crate::rerankers::run(&env.root, &settings, Some(backend), q, &r.hits[..n], std::time::Duration::from_secs(120))?;
         if ranked.backend != backend {
             return Err(rkb_core::Error::Refused(format!(
-                "rerank backend {backend} did not run ({}); unset RKB_NO_MODEL, or run `rkb models fetch`",
+                "rerank backend {backend} did not run ({}); unset RKB_NO_MODEL",
                 ranked.describe()
             )));
         }
         if let Some(scores) = &ranked.scores {
-            search::apply_relevance(&mut r.hits, scores);
+            search::apply_relevance(&mut r.hits, scores, ranked.order.as_deref());
         }
         ranked_by = ranked.describe();
         Ok(())
@@ -413,7 +413,7 @@ pub fn replay(env: &Env, days: u64, min_recall: Option<f64>, backend: Option<&st
         let mut res = search::search(&env.root, &place, &facts, &Mode::Ranked(r.query.clone()), &opts)?;
         let ranked = crate::rerankers::run(&env.root, &settings, backend, &r.query, &res.hits, timeout)?;
         if let Some(scores) = &ranked.scores {
-            search::apply_relevance(&mut res.hits, scores);
+            search::apply_relevance(&mut res.hits, scores, ranked.order.as_deref());
         }
         ranked_by = ranked.describe();
         let expect = written.get(&r.session);
