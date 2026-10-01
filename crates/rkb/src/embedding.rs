@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use rkb_core::doctor::{Check, Level};
 use rkb_core::rerank::Reranker;
@@ -18,6 +19,10 @@ pub const NAME: &str = "bm25-bert";
 /// Measured offline on 184 real failures: a cosine plus this share of the BM25 place breaks near
 /// ties toward BM25's order. It sorts only; the relevance a hook reads is the cosine alone.
 const PRIOR: f32 = 0.05;
+
+/// A search embeds at most this many missing lessons itself; more means a bulk change (a sync, a new
+/// KB), which a background `rkb models warm` fills so the hook's time limit is not spent on it.
+const INLINE_MISSES: usize = 3;
 
 pub trait Embed {
     fn embed(&self, text: &str) -> Result<Vec<f32>, String>;
@@ -81,6 +86,37 @@ fn decode(hex: &str) -> Option<Vec<f32>> {
 struct Bert<E> {
     embedder: E,
     cache: PathBuf,
+    /// Starts the background warm-up.
+    warm: fn(),
+}
+
+fn warm_lock() -> PathBuf {
+    paths::cache_dir().join("embeddings-warm.lock")
+}
+
+/// Runs `rkb models warm` detached, one at a time: the lock file is created exclusively and `models warm`
+/// removes it; a lock older than ten minutes belongs to a warm-up that died.
+fn spawn_warm() {
+    let lock = warm_lock();
+    let stale = std::fs::metadata(&lock)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|e| e > Duration::from_secs(600));
+    if stale {
+        let _ = std::fs::remove_file(&lock);
+    }
+    let created =
+        std::fs::create_dir_all(paths::cache_dir()).is_ok() && std::fs::OpenOptions::new().write(true).create_new(true).open(&lock).is_ok();
+    if !created {
+        return;
+    }
+    let spawned = std::env::current_exe().and_then(|exe| {
+        Command::new(exe).args(["models", "warm"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+    });
+    if spawned.is_err() {
+        let _ = std::fs::remove_file(&lock);
+    }
 }
 
 /// Embeds what the cache lacks, appending each vector as it is made so a search cut short by its timeout still leaves progress.
@@ -98,8 +134,13 @@ fn fill(embedder: &impl Embed, cache: &mut Cache, items: &[String]) -> Result<()
 impl<E: Embed + Send> Reranker for Bert<E> {
     /// The cosine of each item to the query, cut to [0, 1].
     fn score(&self, query: &str, items: &[String]) -> Result<Vec<f32>, String> {
-        let q = self.embedder.embed(&format!("{QUERY_PREFIX}{query}"))?;
         let mut cache = Cache::open(self.cache.clone());
+        let missing = items.iter().filter(|it| !cache.vectors.contains_key(&key(&document(it)))).count();
+        if missing > INLINE_MISSES {
+            (self.warm)();
+            return Err(format!("{missing} of {} lessons are not embedded yet; embedding them in the background", items.len()));
+        }
+        let q = self.embedder.embed(&format!("{QUERY_PREFIX}{query}"))?;
         fill(&self.embedder, &mut cache, items)?;
         Ok(items
             .iter()
@@ -119,7 +160,7 @@ pub fn open() -> Result<Box<dyn Reranker>, String> {
     // A search embeds one query, which the CPU does as fast as Metal, without Metal's shader compile on a cold start.
     let cpu = std::env::var("RKB_EMBED_DEVICE").map_or(true, |v| v != "gpu");
     let embedder = Embedder::open(&files::default_dir(), cpu).map_err(|e| format!("{e:#}"))?;
-    Ok(Box::new(Bert { embedder, cache: cache_path() }))
+    Ok(Box::new(Bert { embedder, cache: cache_path(), warm: spawn_warm }))
 }
 
 /// `rkb doctor`: the model files and the cache of lesson vectors.
@@ -132,7 +173,7 @@ pub fn checks(root: &Path) -> Vec<Check> {
     let cache = Cache::open(cache_path());
     let missing = items.iter().filter(|i| !cache.vectors.contains_key(&key(&document(i)))).count();
     if missing > 0 {
-        let detail = format!("{missing} of {} active lessons are not embedded yet, so searches embed them first", items.len());
+        let detail = format!("{missing} of {} active lessons are not embedded yet, so searches embed them in the background", items.len());
         return check(Level::Warn, detail, Some("rkb models warm"));
     }
     check(Level::Ok, format!("model present; {} lessons embedded", items.len()), None)
@@ -172,6 +213,12 @@ pub fn models_fetch(colored: bool) -> Result<Output, CliError> {
 }
 
 pub fn models_warm(root: &Path) -> Result<Output, CliError> {
+    let out = warm(root);
+    let _ = std::fs::remove_file(warm_lock());
+    out
+}
+
+fn warm(root: &Path) -> Result<Output, CliError> {
     let start = Instant::now();
     let embedder = Embedder::open(&files::default_dir(), std::env::var("RKB_EMBED_DEVICE").is_ok_and(|v| v == "cpu"))
         .map_err(|e| io_error("the model did not load", format!("{e:#}"), "run `rkb models fetch`"))?;
@@ -210,7 +257,7 @@ mod tests {
     }
 
     fn bert(dir: &Path) -> Bert<Words> {
-        Bert { embedder: Words, cache: dir.join("cache.txt") }
+        Bert { embedder: Words, cache: dir.join("cache.txt"), warm: || {} }
     }
 
     fn items(texts: &[&str]) -> Vec<String> {
@@ -239,7 +286,8 @@ mod tests {
     fn the_chain_sorts_by_blend_and_reports_cosine() {
         let dir = tempfile::tempdir().unwrap();
         let cache = dir.path().join("cache.txt");
-        let opener: Opener = Arc::new(move |_: &str| Ok(Box::new(Bert { embedder: Words, cache: cache.clone() }) as Box<dyn Reranker>));
+        let opener: Opener =
+            Arc::new(move |_: &str| Ok(Box::new(Bert { embedder: Words, cache: cache.clone(), warm: || {} }) as Box<dyn Reranker>));
         let it = items(&["slurm binding cpu", "linker vtable undefined", "linker vtable"]);
         let r =
             rerank::run(&Settings::default(), Some(NAME), &opener, "linker vtable", &it, Duration::from_secs(5), &BTreeMap::new()).unwrap();
@@ -274,7 +322,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let n = Counting(Default::default());
-        let b = Bert { embedder: &n, cache: dir.path().join("c.txt") };
+        let b = Bert { embedder: &n, cache: dir.path().join("c.txt"), warm: || {} };
         let it = items(&["a b", "c d", "e f"]);
         b.score("a", &it).unwrap();
         assert_eq!(n.0.load(std::sync::atomic::Ordering::SeqCst), 4, "query plus three lessons when cold");
@@ -291,7 +339,26 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        let b = Bert { embedder: Broken, cache: dir.path().join("c.txt") };
+        let b = Bert { embedder: Broken, cache: dir.path().join("c.txt"), warm: || {} };
         assert_eq!(b.score("q", &items(&["a"])).unwrap_err(), "out of memory");
+    }
+
+    #[test]
+    fn a_bulk_miss_starts_the_background_warm_up_and_skips_the_backend() {
+        static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = tempfile::tempdir().unwrap();
+        let b = Bert {
+            embedder: Words,
+            cache: dir.path().join("c.txt"),
+            warm: || {
+                STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        };
+        let err = b.score("q", &items(&["a", "b", "c", "d"])).unwrap_err();
+        assert!(err.starts_with("4 of 4 lessons are not embedded yet"), "{err}");
+        assert_eq!(STARTED.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!dir.path().join("c.txt").exists(), "nothing was embedded inline");
+        b.score("q", &items(&["a", "b", "c"])).unwrap();
+        assert_eq!(STARTED.load(std::sync::atomic::Ordering::SeqCst), 1, "three misses are embedded inline");
     }
 }
