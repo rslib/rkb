@@ -1848,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "rkb"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "clap",
  "jiff",
@@ -1866,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "rkb-core"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "getrandom 0.4.3",
  "globset",
@@ -1884,7 +1884,7 @@ dependencies = [
 
 [[package]]
 name = "rkb-embed"
-version = "0.0.13"
+version = "0.0.14"
 dependencies = [
  "anyhow",
  "candle-core",
