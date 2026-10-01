@@ -29,6 +29,7 @@ pub struct Secret {
     pub id: String,
     pub title: String,
     pub tags: Vec<String>,
+    pub queries: Vec<String>,
     pub path: String,
 }
 
@@ -268,6 +269,7 @@ pub fn collect_holding(root: &Path, usable: impl Fn(&str) -> bool, held: &BTreeS
                     id: id.clone(),
                     title: graph::title(l),
                     tags: l.frontmatter.tags.clone(),
+                    queries: l.frontmatter.queries.clone(),
                     path: l.path.clone(),
                 });
                 site.groups.insert(id.clone(), group.clone());
@@ -320,6 +322,7 @@ fn row(
         "scope": parts[0],
         "topic": kb::topic_of(&l.path).unwrap_or_default(),
         "tags": fm.tags,
+        "queries": fm.queries,
         "when": fm.when,
         "verified": fm.verified.to_string(),
         "verified_how": fm.verified_how,

@@ -139,7 +139,7 @@
   }
 
   function prepare(e) {
-    e.fields = [words(e.title), words(arr(e.tags).join(" ") + " " + e.topic), words(e.text)].map((ws) => {
+    e.fields = [words(e.title), words(arr(e.queries).join(" ")), words(arr(e.tags).join(" ") + " " + e.topic), words(e.text)].map((ws) => {
       const uniq = [...new Set(ws)];
       return { ws: uniq, stems: uniq.map(stem) };
     });
@@ -154,10 +154,10 @@
     return index.concat(extra);
   }
 
-  // A word in the title scores 5, in the tags or topic 3, in the text 1, times 1 for the same word,
+  // A word in the title scores 5, in an example query 4, in the tags or topic 3, in the text 1, times 1 for the same word,
   // 0.5 for a word start, 0.4 for another form of the word and 0.25 for one typo (query words of five
   // or more letters). Returns the score and the index words to mark.
-  const PTS = [5, 3, 1];
+  const PTS = [5, 4, 3, 1];
   function score(e, q) {
     let total = 0;
     const marks = new Set();

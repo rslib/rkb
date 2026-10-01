@@ -170,6 +170,11 @@ h2:hover .anchor, .anchor:focus { opacity: 1; }
 .facts dt { color: var(--muted); }
 .facts dd { margin: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 6px; overflow-wrap: anywhere; }
 .facts code { font-size: 12px; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+.queries { margin: 28px 0 0; padding-top: 16px; border-top: 1px solid var(--line-soft); }
+.queries .label { margin: 0; }
+.queries ul { margin: 10px 0 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 8px; }
+.queries li { display: flex; align-items: baseline; gap: 6px; padding: 5px 12px 5px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--ink-2); font-size: 13px; }
+.queries li::before { content: "\201C"; font-family: Georgia, "Times New Roman", serif; font-size: 20px; line-height: 0; position: relative; top: 4px; color: var(--c, var(--muted)); }
 .side .facts .dot { background: var(--c); }
 .tag { font-family: var(--mono); font-size: 12px; padding: 1px 7px; border-radius: 5px; background: var(--code-bg); color: var(--ink-2); }
 .tag:hover { text-decoration: none; color: var(--accent); }

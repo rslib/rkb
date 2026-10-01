@@ -289,6 +289,10 @@ local function lesson_html(l, locked)
       table.insert(tags, '<a class="tag" href="/tags/' .. slug(tag) .. '/">' .. esc(tag) .. "</a>")
     end
   end
+  local queries = {}
+  for _, q in ipairs(l.queries or {}) do
+    table.insert(queries, "<li>" .. esc(q) .. "</li>")
+  end
   local c = around[l.id] or {}
   local nav = ""
   if c.prev or c.next then
@@ -312,6 +316,7 @@ local function lesson_html(l, locked)
     "</div>",
     '<div class="type-note">' .. svg(ICONS[l.type] and l.type or "fact", 18) .. "<span><strong>" .. esc(t.name) .. ".</strong> " .. esc(t.note) .. "</span></div>",
     '<div class="prose">' .. html .. "</div>",
+    #queries > 0 and ('<section class="queries"><h2 class="label">Also found by searching</h2><ul>' .. table.concat(queries) .. "</ul></section>") or "",
     nav,
     "</article>",
     '<aside class="side t-' .. esc(l.type) .. '">',
@@ -358,6 +363,7 @@ local function entry(l)
     topic = l.topic,
     place = place(l),
     tags = l.tags or {},
+    queries = l.queries or {},
     url = l.url,
     text = plain(l),
   }
