@@ -135,6 +135,25 @@ pub fn coverage(error: &str, text: &str) -> f64 {
     key_lines(error).into_iter().map(|l| line_coverage(l, &t)).fold(0.0, f64::max)
 }
 
+static WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\w.\-]+").expect("valid regex"));
+static QUOTE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`\n]{8,})`").expect("valid regex"));
+
+/// The words of `text`, lowercase and joined by single spaces, so two texts compare whole word by word.
+fn words(text: &str) -> String {
+    let lower = text.to_lowercase();
+    WORD.find_iter(&lower).map(|m| m.as_str()).collect::<Vec<_>>().join(" ")
+}
+
+/// Whether the failure holds a string the lesson quotes in backticks (an error message or a command) of
+/// two or more words, as whole words. A lesson that quotes the error it fixes is the strongest match there is.
+pub fn quotes_error(error: &str, lesson: &str) -> bool {
+    let error = format!(" {} ", words(error));
+    QUOTE.captures_iter(lesson).any(|c| {
+        let quote = words(&c[1]);
+        quote.contains(' ') && error.contains(&format!(" {quote} "))
+    })
+}
+
 const MIN_LINE_TERMS: usize = 4;
 
 fn line_coverage(line: &str, text: &HashSet<String>) -> f64 {
@@ -273,6 +292,8 @@ pub struct Strength {
     pub min_relevance: f64,
     pub min_margin: f64,
     pub min_coverage: f64,
+    /// Add the top lesson only when it quotes an error the failure shows, whatever its score.
+    pub literal_gate: bool,
 }
 
 impl Strength {
@@ -288,6 +309,7 @@ impl Strength {
             min_relevance: get("min_relevance", min),
             min_margin: get("min_margin", margin),
             min_coverage: get("min_coverage", DEFAULT_MIN_COVERAGE),
+            literal_gate: cfg.get("literal_gate").and_then(toml::Value::as_bool).unwrap_or(backend == "bm25-bert"),
         }
     }
 }
@@ -299,7 +321,12 @@ pub fn would_inject<'a>(hits: &'a [Hit], text_of: impl FnOnce(&str) -> String, e
     // A stale lesson (flagged, often after it failed) is never pushed into a session unasked.
     let top = hits.first().filter(|h| h.applies != Verdict::No && h.status == crate::lesson::Status::Active)?;
     let next = hits.get(1).and_then(|h| h.relevance).map_or(0.0, f64::from);
-    strong_enough(top.relevance, next, || coverage(error, &text_of(&top.id)), t).then_some(top)
+    let strong = if t.literal_gate {
+        quotes_error(error, &text_of(&top.id))
+    } else {
+        strong_enough(top.relevance, next, || coverage(error, &text_of(&top.id)), t)
+    };
+    strong.then_some(top)
 }
 
 pub const REPLAYS: &str = "replays.jsonl";
@@ -371,6 +398,8 @@ pub const JEV_MIN_MARGIN: f64 = 0.05;
 
 /// `bm25-bert` reports a raw cosine, which sits lower than a rating. On 184 real failures (33 with a
 /// matching lesson) 0.55 with a 0.08 lead injected 13 right lessons and 6 wrong ones out of 148 with none.
+/// Prompt recall uses these; the failed-command hook uses `Strength::literal_gate` instead, which on the
+/// same failures injected 16 right and 1 wrong (2026-10-01).
 pub const BERT_MIN_RELEVANCE: f64 = 0.55;
 pub const BERT_MIN_MARGIN: f64 = 0.08;
 
@@ -705,7 +734,7 @@ mod tests {
 
     #[test]
     fn model_relevance_overrides_coverage() {
-        let t = Strength { min_relevance: 0.8, min_margin: 0.1, min_coverage: 0.6 };
+        let t = Strength { min_relevance: 0.8, min_margin: 0.1, min_coverage: 0.6, literal_gate: false };
         let jev = Strength::from_config(&toml::Table::new(), "jev");
         assert_eq!((jev.min_relevance, jev.min_margin), (JEV_MIN_RELEVANCE, JEV_MIN_MARGIN));
         let set: toml::Table = toml::from_str("min_relevance = 0.9").unwrap();
@@ -721,6 +750,25 @@ mod tests {
         assert!(!strong_enough(Some(0.86), 0.81, || 1.0, &t), "no clear winner");
         assert!(strong_enough(None, 0.79, || 0.7, &t));
         assert!(!strong_enough(None, 0.0, || 0.5, &t));
+    }
+
+    #[test]
+    fn a_lesson_that_quotes_the_error_passes_the_literal_gate() {
+        let lesson = "# Fix\n\nThe linker prints `undefined reference to vtable` when a virtual method has no body.\nRun `ld`.";
+        assert!(
+            quotes_error("g++ main.o: error: Undefined reference to vtable for Foo", lesson),
+            "case and surrounding words do not matter"
+        );
+        assert!(!quotes_error("undefined reference to `foo'", lesson), "a different error");
+        assert!(!quotes_error("ld: command not found", lesson), "a one-word quote is too common to mean anything");
+        assert!(!quotes_error("xundefined reference to vtable", lesson), "whole words only");
+        assert!(Strength::from_config(&toml::Table::new(), "bm25-bert").literal_gate);
+        assert!(
+            !Strength::from_config(&toml::Table::new(), "jev").literal_gate
+                && !Strength::from_config(&toml::Table::new(), "bm25").literal_gate
+        );
+        let off: toml::Table = toml::from_str("literal_gate = false").unwrap();
+        assert!(!Strength::from_config(&off, "bm25-bert").literal_gate, "kb.toml wins");
     }
 
     #[test]
