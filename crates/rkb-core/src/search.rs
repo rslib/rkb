@@ -247,9 +247,9 @@ pub fn rerank_queries(root: &Path, hits: &[Hit]) -> Vec<Vec<String>> {
 }
 
 /// The rerank text and example queries of every active lesson, for filling a model's cache ahead of searches.
-pub fn active_rerank_items(root: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+pub fn current_rerank_items(root: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
     let (lessons, _) = Snapshot::from_dir(root)?.lessons();
-    let hits: Vec<Hit> = lessons.iter().filter(|l| l.frontmatter.status == Status::Active).map(|l| hit(l, 0.0, None)).collect();
+    let hits: Vec<Hit> = lessons.iter().filter(|l| l.frontmatter.status.is_current()).map(|l| hit(l, 0.0, None)).collect();
     Ok((rerank_items(root, &hits), rerank_queries(root, &hits)))
 }
 
@@ -624,6 +624,23 @@ mod tests {
         let after = search(r, &place(None), &facts, &q, &opts()).unwrap();
         assert_eq!(ids(&after)[0], other, "the lesson that worked three times ranks first");
         assert_eq!(after.hits.len(), 2, "nothing is hidden");
+    }
+
+    #[test]
+    fn the_cache_warm_up_covers_stale_lessons_but_not_archived_ones() {
+        let kb = tempfile::tempdir().unwrap();
+        let r = kb.path();
+        write(r, "general/a/a.md", "0000000001", "Active note", "", "Words.");
+        write(r, "general/a/s.md", "0000000002", "Stale note", "", "Words.");
+        write(r, "general/a/o.md", "0000000003", "Archived note", "", "Words.");
+        for (f, from, to) in [("s", "active", "stale"), ("o", "active", "archived")] {
+            let p = r.join(format!("general/a/{f}.md"));
+            let text = std::fs::read_to_string(&p).unwrap().replace(&format!("status: {from}"), &format!("status: {to}"));
+            std::fs::write(&p, text).unwrap();
+        }
+        let (items, _) = current_rerank_items(r).unwrap();
+        assert!(items.iter().any(|i| i.contains("Active note")) && items.iter().any(|i| i.contains("Stale note")));
+        assert!(!items.iter().any(|i| i.contains("Archived note")));
     }
 
     #[test]

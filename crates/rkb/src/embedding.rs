@@ -183,7 +183,7 @@ pub fn checks(root: &Path) -> Vec<Check> {
     if let Err(e) = files::check(&files::default_dir()) {
         return check(Level::Warn, format!("{e:#}"), Some("rkb models fetch"));
     }
-    let Ok((items, queries)) = search::active_rerank_items(root) else { return vec![] };
+    let Ok((items, queries)) = search::current_rerank_items(root) else { return vec![] };
     let cache = Cache::open(cache_path());
     let wanted = texts(&items, &queries);
     let missing = wanted.iter().filter(|t| !cache.vectors.contains_key(&key(t))).count();
@@ -240,7 +240,7 @@ fn warm(root: &Path) -> Result<Output, CliError> {
     let start = Instant::now();
     let embedder = Embedder::open(&files::default_dir(), std::env::var("RKB_EMBED_DEVICE").is_ok_and(|v| v == "cpu"))
         .map_err(|e| io_error("the model did not load", format!("{e:#}"), "run `rkb models fetch`"))?;
-    let (items, queries) = search::active_rerank_items(root)?;
+    let (items, queries) = search::current_rerank_items(root)?;
     let wanted = texts(&items, &queries);
     let mut cache = Cache::open(cache_path());
     let before = cache.vectors.len();
