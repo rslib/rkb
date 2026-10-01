@@ -758,7 +758,7 @@ pub(crate) fn add(
     Ok(Ok(Prepared { kind: "add", id, path, title, text: lesson::write(&fm, &body_text), extra, notes, message: None }))
 }
 
-/// Where a write comes from: the harness, its session and the date, and the inbox item when given.
+/// Where a write comes from: the harness and the date, and the inbox item when given.
 fn origin(date: Date, inbox: Option<&str>) -> Mapping {
     let mut m = Mapping::new();
     let harness = if std::env::var("CLAUDECODE").is_ok_and(|v| v == "1") {
@@ -768,9 +768,6 @@ fn origin(date: Date, inbox: Option<&str>) -> Mapping {
     };
     if let Some(h) = harness {
         m.insert("harness".into(), h.into());
-    }
-    if let Some(s) = crate::usage::env_session() {
-        m.insert("session".into(), s.into());
     }
     m.insert("date".into(), date.to_string().into());
     if let Some(i) = inbox {
@@ -1361,6 +1358,9 @@ pub(crate) fn finish(ctx: &Ctx, mut snap: Snapshot, p: Prepared) -> Result<Outco
     git::commit_paths(ctx.root, &message, &paths)?;
     let commit = String::from_utf8_lossy(&git::run(ctx.root, &["rev-parse", "--short", "HEAD"])?).trim().to_string();
     let diff = String::from_utf8_lossy(&git::run(ctx.root, &["show", "--format=", &commit])?).into_owned();
+    if p.kind == "add" {
+        crate::hooks::log_written(ctx.state, &p.id);
+    }
     Ok(Outcome::Written(Written { kind: p.kind, id: p.id, path: p.path, title: p.title, commit, diff, notes: p.notes }))
 }
 

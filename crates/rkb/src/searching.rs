@@ -363,7 +363,7 @@ pub fn eval(
 }
 
 /// `rkb eval --replay`: reruns this machine's logged failure queries with the failure hook's own rule.
-/// Ground truth is a heuristic: a lesson written in a session (its `meta.source.session`) most likely
+/// Ground truth is a heuristic: a lesson written in a session (in `written.jsonl`, or an older lesson's `meta.source.session`) most likely
 /// fixes one of that session's failures.
 pub fn replay(env: &Env, days: u64, min_recall: Option<f64>, backend: Option<&str>) -> Result<Output, CliError> {
     use rkb_core::hooks;
@@ -379,9 +379,12 @@ pub fn replay(env: &Env, days: u64, min_recall: Option<f64>, backend: Option<&st
     let (lessons, _) = snap.lessons();
     let by_id: HashMap<&str, &rkb_core::lesson::Lesson> = lessons.iter().map(|l| (l.frontmatter.id.as_str(), l)).collect();
     let mut written: HashMap<String, BTreeSet<String>> = HashMap::new();
-    for l in &lessons {
-        let Some(session) = l.frontmatter.meta.get("source").and_then(|s| s.get("session")).and_then(|s| s.as_str()) else { continue };
-        let mut now = l;
+    let legacy = lessons.iter().filter_map(|l| {
+        let session = l.frontmatter.meta.get("source").and_then(|s| s.get("session")).and_then(|s| s.as_str())?;
+        Some((session.to_string(), l.frontmatter.id.clone()))
+    });
+    for (session, id) in hooks::written(&env.state).into_iter().chain(legacy) {
+        let Some(mut now) = by_id.get(id.as_str()).copied() else { continue };
         for _ in 0..10 {
             match (now.frontmatter.status, now.frontmatter.superseded_by.as_deref().and_then(|n| by_id.get(n))) {
                 (Status::Superseded, Some(next)) => now = next,
@@ -389,7 +392,7 @@ pub fn replay(env: &Env, days: u64, min_recall: Option<f64>, backend: Option<&st
             }
         }
         if now.frontmatter.status.is_current() {
-            written.entry(session.to_string()).or_default().insert(now.frontmatter.id.clone());
+            written.entry(session).or_default().insert(now.frontmatter.id.clone());
         }
     }
     let irrelevant: BTreeSet<(String, String)> = rkb_core::usage::records(&env.root)

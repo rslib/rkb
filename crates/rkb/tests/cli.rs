@@ -563,9 +563,14 @@ fn writes_record_provenance() {
     let (id, path) = (v["id"].as_str().unwrap().to_string(), v["path"].as_str().unwrap().to_string());
     let text = front(&env, &path);
     let today = jiff::Zoned::now().date().to_string();
-    for part in ["meta:", "source:", "harness: claude-code", "session: s1", &format!("date: {today}"), "inbox: 0a1b2c3d4e"] {
+    for part in ["meta:", "source:", "harness: claude-code", &format!("date: {today}"), "inbox: 0a1b2c3d4e"] {
         assert!(text.contains(part), "{part} missing:\n{text}");
     }
+    assert!(!text.contains("session"), "the session stays out of the lesson:\n{text}");
+    let log = std::fs::read_to_string(env.dir.path().join("state/rkb/written.jsonl")).unwrap();
+    let rec: Vec<serde_json::Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!((rec.len(), rec[0]["id"].as_str(), rec[0]["session"].as_str()), (1, Some(id.as_str()), Some("s1")), "{log}");
+    assert!(rec[0]["time"].as_u64().is_some());
 
     let (text, hash) = current(&env, &id);
     let (v, _) = env.json(&["edit", &id, "--base", &hash], &text);
@@ -2103,6 +2108,15 @@ fn recall_needs_a_model() {
 
 #[test]
 fn eval_replays_logged_failures() {
+    eval_replay(false);
+}
+
+#[test]
+fn eval_replay_finds_sessions_through_written_log() {
+    eval_replay(true);
+}
+
+fn eval_replay(by_log: bool) {
     let env = search_kb();
     let o = env.rkb(&["eval", "--replay"]);
     assert_eq!(o.status.code(), Some(0));
@@ -2110,7 +2124,15 @@ fn eval_replays_logged_failures() {
 
     let lesson = env.kb().join("general/cpp/undefined-vtable-means-missing-virtual.md");
     let text = std::fs::read_to_string(&lesson).unwrap();
-    std::fs::write(&lesson, text.replacen("---\n\n", "meta:\n  source:\n    session: s1\n---\n\n", 1)).unwrap();
+    if by_log {
+        let id = text.lines().find_map(|l| l.strip_prefix("id: ")).unwrap().trim().to_string();
+        assert!(!text.contains("session"), "{text}");
+        std::fs::create_dir_all(env.dir.path().join("state/rkb")).unwrap();
+        let rec = serde_json::json!({ "time": 1, "id": id, "session": "s1" });
+        std::fs::write(env.dir.path().join("state/rkb/written.jsonl"), format!("junk\n{rec}\n")).unwrap();
+    } else {
+        std::fs::write(&lesson, text.replacen("---\n\n", "meta:\n  source:\n    session: s1\n---\n\n", 1)).unwrap();
+    }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let line = |session: &str, query: &str| {
         serde_json::json!({ "time": now - 3600, "session": session, "project": null, "system": null, "query": query, "injected": null })

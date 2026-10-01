@@ -56,6 +56,7 @@ pub fn read(state: &Path, session: &str) -> Vec<Value> {
 pub fn cleanup(state: &Path) {
     prune_log(state, REPLAYS);
     prune_log(state, RANKINGS);
+    prune_log(state, WRITTEN);
     let Ok(entries) = std::fs::read_dir(sessions_dir(state)) else { return };
     let limit = Duration::from_secs(SESSION_DAYS * 24 * 3600);
     for e in entries.flatten() {
@@ -345,6 +346,25 @@ pub struct Replay {
 
 pub fn log_replay(state: &Path, r: &Replay) -> Result<()> {
     lock::append_line(&state.join(REPLAYS), &serde_json::to_string(r).expect("replay serializes"))
+}
+
+pub const WRITTEN: &str = "written.jsonl";
+
+/// Records that `id` was written in this harness session, kept on this machine for `rkb eval --replay`. Best effort.
+pub fn log_written(state: &Path, id: &str) {
+    let Some(session) = crate::usage::env_session() else { return };
+    let rec = serde_json::json!({ "time": crate::request::now(), "id": id, "session": session });
+    let _ = lock::append_line(&state.join(WRITTEN), &rec.to_string());
+}
+
+/// Session id to the lessons written in it, from `written.jsonl`. Malformed lines are skipped.
+pub fn written(state: &Path) -> Vec<(String, String)> {
+    std::fs::read_to_string(state.join(WRITTEN))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| Some((v["session"].as_str()?.to_string(), v["id"].as_str()?.to_string())))
+        .collect()
 }
 
 /// The logged failures of the last `days` days, oldest first. Malformed lines are skipped.
@@ -719,6 +739,17 @@ mod tests {
         assert_eq!(left[0].system.as_deref(), Some("hpc1"));
         cleanup(dir.path());
         assert_eq!(replays(dir.path(), 365).len(), 1);
+    }
+
+    #[test]
+    fn written_is_pruned_after_90_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = crate::request::now();
+        let line = |t: u64, id: &str| format!("{{\"time\":{t},\"id\":\"{id}\",\"session\":\"s\"}}\n");
+        std::fs::write(dir.path().join(WRITTEN), line(now - 91 * 86400, "old") + &line(now, "new") + "junk\n").unwrap();
+        assert_eq!(written(dir.path()).len(), 2);
+        cleanup(dir.path());
+        assert_eq!(written(dir.path()), [("s".to_string(), "new".to_string())]);
     }
 
     #[test]
