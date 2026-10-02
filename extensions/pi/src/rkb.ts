@@ -4,6 +4,7 @@
 // replies back into results. All rkb logic lives in the rkb binary; this file only maps.
 import { spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // rkb install fills in the harness, the binary, the prompts and the tool definitions.
@@ -58,7 +59,7 @@ interface Ran {
 }
 
 /** Runs rkb with `input` on stdin; undefined when it cannot start or takes longer than `timeoutMs`. */
-function runRkb(args: string[], input: string, timeoutMs: number): Promise<Ran | undefined> {
+function runRkb(args: string[], input: string, timeoutMs: number, cwd?: string): Promise<Ran | undefined> {
   return new Promise((resolve) => {
     let out = "";
     let done = false;
@@ -71,7 +72,7 @@ function runRkb(args: string[], input: string, timeoutMs: number): Promise<Ran |
     };
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(RKB, args, { stdio: ["pipe", "pipe", "ignore"] });
+      child = spawn(RKB, args, { stdio: ["pipe", "pipe", "ignore"], cwd });
     } catch {
       return finish();
     }
@@ -168,10 +169,582 @@ function safe(fn: (event: any, ctx: any) => Promise<any>) {
   };
 }
 
+// The UI below only calls `rkb ... --format json` and draws what it prints; pi and omp share this file, so
+// every UI call goes through `ui`, which is empty without a UI or when the harness lacks the method.
+const UI_TIMEOUT_MS = 5000;
+// A job step parses notes and writes the inbox item, and a prepare reads the transcript.
+const JOB_TIMEOUT_MS = 30000;
+const NOTES_MAX_TOKENS = 4096;
+const SEP = " | ";
+const KIND: Record<string, string> = { transcript: "extract", observed: "observed", note: "note" };
+const LEVEL: Record<number, { label: string; color: string }> = {
+  3: { label: "high", color: "error" },
+  2: { label: "med", color: "warning" },
+  1: { label: "low", color: "muted" },
+};
+const TYPE_COLOR: Record<string, string> = { pitfall: "error", recipe: "success", fact: "accent", decision: "warning", preference: "muted" };
+const APPLIES_COLOR: Record<string, string> = { yes: "success", likely: "success", unlikely: "warning", no: "error" };
+
+type Json = Record<string, any>;
+type Tui = typeof import("@earendil-works/pi-tui");
+interface Request {
+  id: string;
+  question: string;
+  options: string[];
+}
+interface Injected {
+  id: string;
+  title: string | null;
+  hook: string | null;
+}
+interface Status {
+  inbox: number;
+  high: number;
+  curate: number;
+  requests: Request[];
+  injected: Injected[];
+}
+interface Row {
+  id: string;
+  kind: string;
+  priority: number;
+  age: string;
+  preview: string;
+  verdicts: { keep: number; known: number; unsure: number; drop: number } | null;
+}
+interface Hit {
+  id: string;
+  title: string;
+  relevance: string | null;
+  kind: string;
+  summary: string;
+  applies: string;
+}
+interface Doc {
+  id: string;
+  title: string;
+  body: string;
+  kind: string;
+  meta: string;
+  color?: string;
+}
+type Tone = "ok" | "fail" | "busy";
+type View = "search" | "inbox" | "item" | "lesson" | "requests";
+type Outcome = { do: "close" } | { do: "send"; name: "retro" | "distill" | "curate" } | { do: "answer"; id: string };
+interface Pane {
+  view: View;
+  typing: boolean;
+  query: string;
+  note: string;
+  hits: Hit[];
+  hitAt: number;
+  rows: Row[];
+  rowAt: number;
+  reqAt: number;
+  doc?: Doc;
+  scroll: number;
+  notice?: { tone: Tone; text: string };
+}
+interface Actions {
+  search(query: string): Promise<void>;
+  lesson(id: string): Promise<void>;
+  item(row: Row): Promise<void>;
+  inbox(): Promise<void>;
+  triage(): Promise<void>;
+  used(id: string, result: "worked" | "irrelevant"): Promise<void>;
+}
+
+/** Runs rkb with JSON output; `ok` is false when rkb is missing, failed or printed no JSON. */
+async function rkbJson(args: string[], cwd?: string, input = "", timeoutMs = UI_TIMEOUT_MS): Promise<{ ok: boolean; data: Json | undefined }> {
+  const r = await runRkb([...args, "--format", "json"], input, timeoutMs, cwd);
+  let data: Json | undefined;
+  try {
+    data = r ? JSON.parse(r.out) : undefined;
+  } catch {}
+  return { ok: r?.code === 0 && data !== undefined, data };
+}
+
+/** The UI method `method`, bound; undefined without a UI or when this harness lacks it. */
+function ui(ctx: any, method: string): ((...args: any[]) => any) | undefined {
+  try {
+    const u = ctx?.hasUI ? ctx.ui : undefined;
+    return u && typeof u[method] === "function" ? u[method].bind(u) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function tell(ctx: any, text: string, type: "info" | "error" = "info") {
+  try {
+    ui(ctx, "notify")?.(text, type);
+  } catch {}
+}
+
+function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
+function parseStatus(d: Json): Status {
+  return {
+    inbox: d.inbox?.total ?? 0,
+    high: d.inbox?.priority?.["3"] ?? 0,
+    curate: d.curate ?? 0,
+    requests: (d.requests ?? []).map((q: Json) => ({ id: q.id, question: q.question, options: q.options ?? [] })),
+    injected: (d.injected ?? []).map((i: Json) => ({ id: i.id, title: i.title ?? null, hook: i.hook ?? null })),
+  };
+}
+
+function statusLine(s: Status): string | undefined {
+  const parts: string[] = [];
+  if (s.inbox > 0) parts.push(`${s.inbox} inbox${s.high > 0 ? ` (${s.high} high)` : ""}`);
+  if (s.curate > 0) parts.push(`${s.curate} curate`);
+  if (s.requests.length > 0) parts.push(plural(s.requests.length, "request"));
+  return parts.length === 0 ? undefined : `rkb: ${parts.join(SEP)}`;
+}
+
+function newPane(): Pane {
+  return { view: "search", typing: false, query: "", note: "", hits: [], hitAt: 0, rows: [], rowAt: 0, reqAt: 0, scroll: 0 };
+}
+
+/** `lines` cut to `room` lines around line `sel`. */
+function windowed(lines: string[], sel: number, room: number): string[] {
+  if (lines.length <= room) return lines;
+  const start = Math.min(Math.max(0, sel - Math.floor(room / 2)), lines.length - room);
+  return lines.slice(start, start + room);
+}
+
+function verdictText(v: Row["verdicts"]): string {
+  if (!v) return "";
+  return (
+    [
+      [v.keep, "keep"],
+      [v.known, "known"],
+      [v.unsure, "unsure"],
+      [v.drop, "drop"],
+    ] as const
+  )
+    .filter(([n]) => n > 0)
+    .map(([n, w]) => `${n} ${w}`)
+    .join(SEP);
+}
+
+function bar(relevance: number): string {
+  const fill = Math.max(0, Math.min(10, Math.round(relevance * 10)));
+  return "#".repeat(fill) + "-".repeat(10 - fill);
+}
+
+/**
+ * The popup: one component that holds the current view and redraws on a key. Everything it changes goes
+ * through `act`, which calls rkb; `done` closes it with what the command handler does next.
+ */
+function paneComponent(T: Tui, tui: any, theme: any, done: (o: Outcome) => void, p: Pane, act: Actions, status: () => Status | undefined): Component & { focused: boolean } {
+  const input = new T.Input({ placeholder: "Search lessons: an error, a symptom or a tool" });
+  input.setValue(p.query);
+  let page = 10;
+  const redraw = () => tui?.requestRender?.();
+  const go = (work: Promise<void>) => {
+    redraw();
+    work.catch(() => {}).finally(redraw);
+  };
+  input.onSubmit = (q) => {
+    p.typing = false;
+    go(act.search(q));
+  };
+  const k = (data: string, ...ids: string[]) => ids.some((id) => T.matchesKey(data, id as never));
+  const fg = (c: string, s: string) => theme.fg(c, s);
+  const move = (at: number, n: number, data: string) => (k(data, "up") ? Math.max(0, at - 1) : k(data, "down") ? Math.min(Math.max(0, n - 1), at + 1) : at);
+
+  /** Scrolls the open text and says whether `data` was a scroll key. */
+  function scroll(data: string): boolean {
+    if (k(data, "up", "k")) p.scroll -= 1;
+    else if (k(data, "down", "j")) p.scroll += 1;
+    else if (k(data, "pageUp", "u")) p.scroll -= page;
+    else if (k(data, "pageDown", "space", "f")) p.scroll += page;
+    else if (data === "G" || k(data, "end", "shift+g")) p.scroll = Number.MAX_SAFE_INTEGER;
+    else if (k(data, "home", "g")) p.scroll = 0;
+    else return false;
+    return true;
+  }
+
+  function handleInput(data: string) {
+    if (k(data, "escape")) return done({ do: "close" });
+    if (p.view === "search" && p.typing) {
+      if (k(data, "tab") && p.hits.length > 0) p.typing = false;
+      else input.handleInput(data);
+    } else if (k(data, "s")) {
+      p.view = "search";
+      p.typing = true;
+    } else if (k(data, "i")) {
+      p.view = "inbox";
+      go(act.inbox());
+    } else if (k(data, "r")) {
+      p.view = "requests";
+    } else if (p.view === "search") {
+      p.hitAt = move(p.hitAt, p.hits.length, data);
+      const hit = p.hits[p.hitAt];
+      if (k(data, "/")) p.typing = true;
+      else if (hit && k(data, "enter", "o")) go(act.lesson(hit.id));
+    } else if (p.view === "inbox") {
+      p.rowAt = move(p.rowAt, p.rows.length, data);
+      const row = p.rows[p.rowAt];
+      if (row && k(data, "enter", "o")) go(act.item(row));
+      else if (k(data, "g")) go(act.triage());
+      else if (k(data, "d")) return done({ do: "send", name: "distill" });
+      else if (k(data, "c")) return done({ do: "send", name: "curate" });
+      else if (k(data, "t")) return done({ do: "send", name: "retro" });
+    } else if (p.view === "item") {
+      if (!scroll(data) && k(data, "b")) p.view = "inbox";
+    } else if (p.view === "lesson") {
+      if (scroll(data)) {
+        // scrolled
+      } else if (k(data, "w") && p.doc) go(act.used(p.doc.id, "worked"));
+      else if (k(data, "x") && p.doc) go(act.used(p.doc.id, "irrelevant"));
+      else if (k(data, "b")) p.view = "search";
+    } else {
+      const open = status()?.requests ?? [];
+      p.reqAt = move(p.reqAt, open.length, data);
+      const q = open[p.reqAt];
+      if (q && k(data, "enter", "a")) return done({ do: "answer", id: q.id });
+    }
+    redraw();
+  }
+
+  /** The wrapped text from line `p.scroll`, `room` lines of it, a position line and, while more follows, a note naming the rkb command that shows all of it. */
+  function block(text: string, more: string, w: number, room: number): string[] {
+    const t = text.replace(/\r\n/g, "\n").replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
+    const lines = T.wrapTextWithAnsi(t, w);
+    page = room;
+    p.scroll = Math.min(Math.max(0, p.scroll), Math.max(0, lines.length - room));
+    const end = Math.min(lines.length, p.scroll + room);
+    if (lines.length <= room) return lines;
+    const out = [...lines.slice(p.scroll, end), fg("dim", `lines ${p.scroll + 1}-${end} of ${lines.length}`)];
+    if (end < lines.length) out.push(...T.wrapTextWithAnsi(fg("dim", `... ${lines.length - end} more lines. ${more}`), w));
+    return out;
+  }
+
+  function render(width: number): string[] {
+    const w = Math.max(20, width);
+    // pi keeps its footer, status and widgets around a custom component, so the whole popup stays well under the screen.
+    const rows = Number(tui?.terminal?.rows) || 24;
+    const room = () => Math.max(5, rows - 8 - out.length - 3);
+    const s = status();
+    const badge = (label: string, color?: string) => fg(color ?? "muted", theme.bold(`[${label.toUpperCase()}]`));
+    const mark = (on: boolean) => (on ? fg("accent", ">") : " ");
+    // `right` stays whole; `left` is cut to leave room for it.
+    const side = (left: string, right: string) => {
+      const r = T.visibleWidth(right);
+      const l = T.truncateToWidth(left, Math.max(10, w - r - 2), "...");
+      return `${l}${" ".repeat(Math.max(2, w - T.visibleWidth(l) - r))}${right}`;
+    };
+    const tab = (label: string, on: boolean) => (on ? theme.bold(fg("accent", `[${label}]`)) : fg("muted", ` ${label} `));
+    const out: string[] = [];
+    out.push(`${theme.bold(fg("accent", "rkb"))}${s ? fg("muted", `  ${s.inbox} inbox${SEP}${s.high} high${SEP}${s.curate} curate`) : ""}`);
+    out.push(
+      [
+        tab("Search", p.view === "search" || p.view === "lesson"),
+        tab(`Inbox ${s?.inbox ?? 0}`, p.view === "inbox" || p.view === "item"),
+        tab(`Requests ${s?.requests.length ?? 0}`, p.view === "requests"),
+      ].join("  "),
+    );
+    if (p.notice) out.push(fg(p.notice.tone === "fail" ? "error" : p.notice.tone === "ok" ? "success" : "warning", p.notice.text));
+    out.push("");
+    let hint = "";
+    if (p.view === "search") {
+      out.push(...input.render(w));
+      if (p.note) out.push(fg("dim", p.note));
+      else if (p.hits.length === 0) out.push(fg("dim", "Press s, then paste an error message or name a tool or a symptom."));
+      const lines: string[] = [];
+      let sel = 0;
+      p.hits.forEach((h, i) => {
+        if (i === p.hitAt) sel = lines.length;
+        const score = h.relevance === null ? NaN : Number(h.relevance);
+        const on = i === p.hitAt && !p.typing;
+        lines.push(side(`${mark(on)} ${badge(h.kind || "lesson", TYPE_COLOR[h.kind])} ${theme.bold(h.title)}`, fg("dim", h.id)));
+        const scored = Number.isFinite(score) ? `${fg(score >= 0.8 ? "success" : score >= 0.5 ? "warning" : "dim", `${bar(score)} ${score.toFixed(2)}`)}${SEP}` : "";
+        lines.push(`    ${scored}${fg("dim", "applies ")}${fg(APPLIES_COLOR[h.applies] ?? "dim", h.applies || "unknown")}`);
+        if (h.summary) lines.push(`    ${fg("dim", h.summary.replace(/\s+/g, " ").trim())}`);
+      });
+      out.push(...windowed(lines, sel, room()));
+      hint = p.typing ? "Enter search | Tab results | Esc close" : "s or / type a search | Up/Down select | Enter open | i inbox | r requests | Esc close";
+    } else if (p.view === "inbox") {
+      out.push(fg("dim", `g Triage${SEP}d Distill${SEP}c Curate ${s?.curate ?? 0}${SEP}t Retro`));
+      if (p.rows.length === 0) out.push("", "The inbox is empty.", fg("dim", "Notes and session extracts wait here until distill turns them into lessons."));
+      const lines: string[] = [];
+      let sel = 0;
+      for (const prio of [3, 2, 1]) {
+        const group = p.rows.filter((r) => r.priority === prio);
+        if (group.length === 0) continue;
+        const level = LEVEL[prio]!;
+        lines.push(fg(level.color, `* ${level.label} ${group.length}`));
+        for (const r of group) {
+          if (r === p.rows[p.rowAt]) sel = lines.length;
+          const right = fg("dim", [verdictText(r.verdicts), r.age].filter(Boolean).join(SEP));
+          const left = `${mark(r === p.rows[p.rowAt])} ${fg("dim", (KIND[r.kind] ?? r.kind).padEnd(8))} ${r.preview.replace(/\s+/g, " ").trim()}`;
+          lines.push(side(left, right));
+        }
+      }
+      out.push(...windowed(lines, sel, room()));
+      hint = "Up/Down select | Enter open | s search | r requests | Esc close";
+    } else if (p.view === "item" || p.view === "lesson") {
+      const d = p.doc;
+      if (!d) out.push("Nothing open.");
+      else {
+        out.push(side(`${badge(d.kind, d.color ?? TYPE_COLOR[d.kind])} ${theme.bold(d.title)}`, fg("dim", d.id)));
+        out.push(fg("dim", d.meta));
+        out.push("");
+        out.push(...block(d.body, p.view === "item" ? `Run \`rkb inbox show ${d.id}\` to read all.` : `Run \`rkb show ${d.id}\` to read all.`, w, Math.max(5, room() - 3)));
+      }
+      hint = p.view === "item" ? "j/k line | Space/u page | g/G top/bottom | b back | Esc close" : "j/k line | Space/u page | g/G top/bottom | w Worked | x Irrelevant | b back | Esc close";
+    } else {
+      const open = s?.requests ?? [];
+      if (open.length === 0) out.push("No open requests.", fg("dim", "A question rkb or a background agent leaves for you shows here."));
+      const lines: string[] = [];
+      let sel = 0;
+      open.forEach((q, i) => {
+        if (i === p.reqAt) sel = lines.length;
+        lines.push(side(`${mark(i === p.reqAt)} ${fg("warning", theme.bold("needs you"))}`, fg("dim", q.id)));
+        lines.push(`    ${q.question}`);
+        lines.push(`    ${fg("dim", q.options.join(" / "))}`);
+      });
+      out.push(...windowed(lines, sel, room()));
+      hint = "Up/Down select | Enter or a answer | s search | i inbox | Esc close";
+    }
+    out.push("", ...T.wrapTextWithAnsi(fg("dim", hint), w));
+    return out.map((l) => T.truncateToWidth(l, w));
+  }
+
+  return {
+    render,
+    handleInput,
+    invalidate: () => input.invalidate(),
+    get focused() {
+      return input.focused;
+    },
+    set focused(v: boolean) {
+      input.focused = v;
+    },
+  };
+}
+
 export default function rkb(pi: ExtensionAPI) {
   let startContext: string | undefined;
   // Lessons recalled for the user's message, added to the context of that turn.
   let recallContext: string | undefined;
+
+  let status: Status | undefined;
+  // The lessons rkb injected since the last prompt, and every id shown so far.
+  let band: Injected[] = [];
+  const seen = new Set<string>();
+  let observing = false;
+
+  /** Runs `work` after the current dispatch, so a turn never waits for it; a failure only shows a toast. */
+  function later(ctx: any, work: () => Promise<void>) {
+    setTimeout(() => {
+      work().catch(() => tell(ctx, "rkb: a background step failed", "error"));
+    }, 0);
+  }
+
+  function showBand(ctx: any) {
+    ui(ctx, "setWidget")?.("rkb", band.length === 0 ? undefined : band.map((i) => `rkb ${i.hook ?? "hook"}: ${i.title ?? i.id} (${i.id})`), { placement: "aboveEditor" });
+  }
+
+  /** Reads `rkb status` for the footer entry, the widget and the popup; clears the entry when rkb cannot run. */
+  async function refresh(ctx: any) {
+    if (!ctx?.hasUI) return;
+    const id = String(base(ctx).session_id);
+    const r = await rkbJson(["status", ...(id ? ["--session", id] : [])], String(ctx.cwd));
+    status = r.ok && r.data ? parseStatus(r.data) : undefined;
+    ui(ctx, "setStatus")?.("rkb", status ? statusLine(status) : undefined);
+    const fresh = (status?.injected ?? []).filter((i) => !seen.has(i.id));
+    if (fresh.length === 0) return;
+    for (const i of fresh) seen.add(i.id);
+    band = [...band, ...fresh];
+    showBand(ctx);
+  }
+
+  /** The model a chain entry names (`provider/id`) answers `text` through the session's registry. */
+  async function ask(ctx: any, spec: string, text: string): Promise<{ text?: string; reason?: string }> {
+    try {
+      const reg = ctx?.modelRegistry;
+      const at = spec.indexOf("/");
+      const model = at > 0 ? reg?.find?.(spec.slice(0, at), spec.slice(at + 1)) : reg?.getAll?.().find((m: any) => m.id === spec);
+      if (!model) return { reason: `no model ${spec}` };
+      if (typeof reg.complete !== "function") return { reason: "the model registry cannot complete" };
+      const msg = await reg.complete(model, { messages: [{ role: "user", content: text, timestamp: Date.now() }] }, { maxTokens: NOTES_MAX_TOKENS });
+      if (msg?.stopReason === "error" || msg?.stopReason === "aborted") return { reason: msg.errorMessage ?? msg.stopReason };
+      const parts = Array.isArray(msg?.content) ? msg.content : [];
+      return { text: parts.filter((c: any) => c?.type === "text").map((c: any) => c.text).join("") };
+    } catch (e) {
+      return { reason: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  /** One model job: rkb prepares each part, the session's registry answers it and rkb handles the answer. */
+  async function runJob(ctx: any, prepare: string[]): Promise<Json | undefined> {
+    const m = ctx?.model;
+    if (!m) return undefined;
+    const model = `${m.provider}/${m.id}`;
+    const cwd = String(ctx.cwd);
+    let step = (await rkbJson([...prepare, "--model", model], cwd, "", JOB_TIMEOUT_MS)).data;
+    while (step?.job && step.prompt) {
+      const finish = ["job", "finish", step.job, "--part", String(step.part)];
+      const failures: string[] = [];
+      let next: Json | undefined;
+      let answered = false;
+      for (const e of step.models as { entry: string; model: string | null }[]) {
+        const r = await ask(ctx, e.model ?? model, step.prompt);
+        if (r.text !== undefined) {
+          next = (await rkbJson([...finish, "--model", e.entry], cwd, r.text, JOB_TIMEOUT_MS)).data;
+          answered = true;
+          break;
+        }
+        failures.push(`${e.entry}: ${r.reason}`);
+      }
+      if (!answered) {
+        await rkbJson([...finish, "--failed", failures.join("; ")], cwd);
+        return undefined;
+      }
+      step = next;
+    }
+    return step;
+  }
+
+  /** One observer run over the new part of the session, then triage of the inbox and of what it left unsure. */
+  async function observe(ctx: any) {
+    const { session_id: id, cwd } = base(ctx) as { session_id: string; cwd: string };
+    const file = transcript(ctx);
+    if (file && id) {
+      const done = await runJob(ctx, ["job", "prepare", "observe", "--session", id, "--transcript", file, "--harness", HARNESS, "--cwd", cwd]);
+      if (done?.outcome === "added") tell(ctx, `rkb: ${plural(Number(done.notes), "note")} for the inbox`);
+    }
+    await rkbJson(["inbox", "triage"], cwd, "", JOB_TIMEOUT_MS);
+    await runJob(ctx, ["job", "prepare", "triage", "--harness", HARNESS]);
+  }
+
+  /** Asks the person to answer an open request and runs `rkb confirm`; a dismissed dialog leaves it open. */
+  async function answer(ctx: any, q: Request) {
+    let choice: string | undefined;
+    try {
+      choice = await ui(ctx, "select")?.(q.question.endsWith("?") ? q.question : `${q.question}?`, q.options);
+    } catch {}
+    if (!choice) return;
+    const r = await rkbJson(["confirm", q.id, "--choice", choice], String(ctx.cwd));
+    if (r.ok) tell(ctx, `rkb: ${q.id}: ${choice}`);
+    else tell(ctx, r.data?.error?.message ?? `rkb confirm ${q.id} failed`, "error");
+    await refresh(ctx);
+  }
+
+  /** The popup's rkb calls; each sets the notice and the data of the pane. */
+  function actions(ctx: any, p: Pane): Actions {
+    const cwd = String(ctx.cwd);
+    const say = (tone: Tone, text: string) => (p.notice = { tone, text });
+    const failed = (r: { data?: Json }, text: string) => say("fail", r.data?.error?.message ?? text);
+    const inbox = async () => {
+      const r = await rkbJson(["inbox"], cwd);
+      p.rows = (r.data?.items ?? []).map((i: Json) => ({ id: i.id, kind: i.kind, priority: i.priority, age: i.age, preview: i.preview, verdicts: i.verdicts ?? null }));
+      p.rowAt = Math.min(p.rowAt, Math.max(0, p.rows.length - 1));
+      if (!r.ok) failed(r, "rkb inbox failed");
+      else p.notice = undefined;
+    };
+    return {
+      inbox,
+      async search(query) {
+        if (!query.trim()) return;
+        say("busy", "Searching...");
+        const r = await rkbJson(["search", query], cwd);
+        p.query = query;
+        p.hitAt = 0;
+        p.hits = (r.data?.results ?? []).map((h: Json) => ({ id: h.id, title: h.title, relevance: h.relevance ?? null, kind: h.type ?? "", summary: h.summary ?? "", applies: h.applies ?? "" }));
+        p.note = r.ok ? `${plural(p.hits.length, "result")} for "${query}"` : "";
+        if (r.ok) p.notice = undefined;
+        else failed(r, "rkb search failed");
+      },
+      async lesson(id) {
+        const r = await rkbJson(["show", id], cwd);
+        if (!r.ok || !r.data) return void failed(r, `Cannot show ${id}.`);
+        const d = r.data;
+        p.doc = {
+          id,
+          title: d.title ?? id,
+          body: String(d.body ?? "").replace(/^# .*\n+/, ""),
+          kind: d.frontmatter?.type ?? "lesson",
+          meta: [d.frontmatter?.status, d.applies?.result ? `applies ${d.applies.result}` : "", d.path].filter(Boolean).join(SEP),
+        };
+        p.scroll = 0;
+        p.view = "lesson";
+        p.notice = undefined;
+      },
+      async item(row) {
+        const r = await rkbJson(["inbox", "show", row.id], cwd);
+        if (!r.ok || !r.data) return void failed(r, `Cannot show inbox item ${row.id}.`);
+        const level = LEVEL[row.priority] ?? LEVEL[1]!;
+        p.doc = {
+          id: row.id,
+          title: row.preview,
+          body: String(r.data.body ?? ""),
+          kind: KIND[row.kind] ?? row.kind,
+          color: level.color,
+          meta: [`${level.label} priority`, row.age, r.data.meta?.cwd].filter(Boolean).join(SEP),
+        };
+        p.scroll = 0;
+        p.view = "item";
+        p.notice = undefined;
+      },
+      async triage() {
+        say("busy", "Triaging the inbox...");
+        const r = await rkbJson(["inbox", "triage"], cwd, "", JOB_TIMEOUT_MS);
+        const t = r.data?.total;
+        await inbox();
+        if (r.ok && t) {
+          say("ok", `Triaged: ${t.keep} keep, ${t.known} known, ${t.unsure} unsure, ${t.drop} drop`);
+          tell(ctx, `rkb: triaged ${t.keep + t.known + t.unsure + t.drop} inbox items (${t.keep} keep, ${t.drop} drop)`);
+        } else {
+          failed(r, "rkb inbox triage failed");
+          tell(ctx, "rkb inbox triage failed", "error");
+        }
+        later(ctx, () => refresh(ctx));
+      },
+      async used(id, result) {
+        const sid = String(base(ctx).session_id);
+        const r = await rkbJson(["used", `--${result}`, id, ...(sid ? ["--session", sid] : [])], cwd);
+        if (r.ok) say("ok", `Recorded ${id} as ${result}.`);
+        else failed(r, "rkb used failed");
+        later(ctx, () => refresh(ctx));
+      },
+    };
+  }
+
+  /** `/rkb-status`: the popup, reopened after a request answer; the `rkb status` text without one. */
+  async function statusCommand(ctx: any) {
+    const custom = ui(ctx, "custom");
+    let T: Tui | undefined;
+    if (custom) {
+      try {
+        // pi gives extensions its own pi-tui; a harness without it gets the text below.
+        T = await import("@earendil-works/pi-tui");
+      } catch {}
+    }
+    if (!custom || !T) {
+      const r = await runRkb(["status"], "", UI_TIMEOUT_MS, String(ctx?.cwd ?? process.cwd()));
+      const text = r?.code === 0 ? r.out.trim() : "rkb did not run: check that the rkb command is installed (`rkb doctor` in a terminal).";
+      const notify = ui(ctx, "notify");
+      if (notify) notify(text, "info");
+      else console.log(text);
+      return;
+    }
+    await refresh(ctx);
+    const p = newPane();
+    const lib = T;
+    for (;;) {
+      const out = (await custom((tui: any, theme: any, _keys: any, done: (o: Outcome) => void) => paneComponent(lib, tui, theme, done, p, actions(ctx, p), () => status))) as Outcome | undefined;
+      if (out?.do === "send") pi.sendUserMessage(prompt({ retro: RETRO, distill: DISTILL, curate: CURATE }[out.name], ""));
+      const q = out?.do === "answer" ? status?.requests.find((r) => r.id === out.id) : undefined;
+      if (!q) return;
+      await answer(ctx, q);
+      p.view = "requests";
+      p.reqAt = 0;
+    }
+  }
 
   // pi 1.0 reads the output schema, annotations and namespace (a codemode script then gets the JSON);
   // omp ignores them.
@@ -202,6 +775,7 @@ export default function rkb(pi: ExtensionAPI) {
   pi.on(
     "session_start",
     safe(async (event, ctx) => {
+      later(ctx, () => refresh(ctx));
       startContext = await hook("session-start", { ...base(ctx), source: String(event?.reason ?? "startup") });
     }),
   );
@@ -235,19 +809,27 @@ export default function rkb(pi: ExtensionAPI) {
     }
   });
 
+  async function toolResult(event: any, ctx: any) {
+    const command = bash(event);
+    if (command === undefined) return undefined;
+    const payload = { ...base(ctx), tool_name: "Bash", tool_input: { command } };
+    if (!event.isError) {
+      await hook("tool-ok", payload);
+      return undefined;
+    }
+    const note = additional(await hook("tool-failed", { ...payload, error: errorText(event.content) }));
+    if (!note) return undefined;
+    return { content: [...(Array.isArray(event.content) ? event.content : []), { type: "text", text: note }] };
+    }
+
   pi.on(
     "tool_result",
     safe(async (event, ctx) => {
+      const reply = await toolResult(event, ctx);
       const command = bash(event);
-      if (command === undefined) return undefined;
-      const payload = { ...base(ctx), tool_name: "Bash", tool_input: { command } };
-      if (!event.isError) {
-        await hook("tool-ok", payload);
-        return undefined;
-      }
-      const note = additional(await hook("tool-failed", { ...payload, error: errorText(event.content) }));
-      if (!note) return undefined;
-      return { content: [...(Array.isArray(event.content) ? event.content : []), { type: "text", text: note }] };
+      const ran = String(event?.toolName ?? "").startsWith("rkb_") || command?.includes("rkb") || (command !== undefined && event?.isError);
+      if (ran) later(ctx, () => refresh(ctx));
+      return reply;
     }),
   );
 
@@ -283,16 +865,43 @@ export default function rkb(pi: ExtensionAPI) {
     });
   }
 
+  pi.registerCommand("rkb-status", {
+    description: "Search lessons, read the inbox and answer rkb requests",
+    handler: async (_args: string, ctx: any) => {
+      await statusCommand(ctx);
+    },
+  });
+
   pi.on(
     "input",
     safe(async (event, ctx) => {
       continuedByRkb = false;
+      band = [];
+      showBand(ctx);
       recallContext = additional(await hook("prompt", { ...base(ctx), prompt: String(event?.text ?? "") }));
+      later(ctx, () => refresh(ctx));
       return HARNESS === "pi" ? { action: "continue" } : undefined;
     }),
   );
 
   if (HARNESS === "pi") {
+    // In the background: refresh the status, then observe the turn and triage the inbox. omp has no such event
+    // and observes at session end.
+    pi.on(
+      "agent_settled",
+      safe(async (_event, ctx) => {
+        later(ctx, async () => {
+          await refresh(ctx);
+          if (process.env.RKB_OBSERVER || observing) return;
+          observing = true;
+          try {
+            await observe(ctx);
+          } finally {
+            observing = false;
+          }
+        });
+      }),
+    );
     pi.on(
       "agent_before_settle",
       safe(async (event, ctx) => {
@@ -325,6 +934,7 @@ export default function rkb(pi: ExtensionAPI) {
         const payload: Record<string, unknown> = { ...base(ctx), stop_hook_active: Boolean(event?.stop_hook_active) };
         if (event?.session_id) payload.session_id = String(event.session_id);
         const reason = blockReason(await hook("stop", payload));
+        later(ctx, () => refresh(ctx));
         return reason ? { continue: true, additionalContext: reason } : undefined;
       }),
     );

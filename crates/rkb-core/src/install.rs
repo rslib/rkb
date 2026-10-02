@@ -1048,6 +1048,14 @@ mod tests {
     }
 
     #[test]
+    fn omp_extension_has_the_status_command() {
+        let (_d, home, cfg) = setup();
+        apply(&test_plan(&home, &cfg, &[Harness::Omp], false), "S").unwrap();
+        let text = std::fs::read_to_string(home.join(".omp/agent/extensions/rkb.ts")).unwrap();
+        assert!(text.contains("const HARNESS: string = \"omp\"") && text.contains("\"rkb-status\"") && !text.contains("__HARNESS__"));
+    }
+
+    #[test]
     fn extension_install_and_uninstall() {
         let (d, home, cfg) = setup();
         let ext = home.join(".pi/agent/extensions/rkb.ts");
@@ -1057,6 +1065,7 @@ mod tests {
             text.starts_with(EXTENSION_MARKER)
                 && text.contains("const HARNESS: string = \"pi\"")
                 && text.contains("const TOOLS_JSON: string = \"[")
+                && text.contains("\"rkb-status\"")
                 && !text.contains("__HARNESS__")
         );
         assert_eq!(extension_status(Harness::Pi, &home), Some((true, true)));
