@@ -23,9 +23,17 @@ repos:
         pass_filenames: false
         always_run: true
       - id: extension-check
-        name: extension type check
-        # Runs once `npm install` has run in extensions/pi; the Rust tests drive the extension itself.
-        entry: sh -c '[ ! -d extensions/pi/node_modules ] || npm --prefix extensions/pi run --silent check'
+        name: pi extension type check
+        # Against the installed pi's own types, so a pi update that changes the API fails here. Runs once
+        # `npm install` has run in extensions/pi; the Rust tests drive the extension itself.
+        entry: sh -c '[ ! -d extensions/pi/node_modules ] || scripts/check-pi-extension.sh'
         language: system
         pass_filenames: false
         always_run: true
+      - id: claude-mod-check
+        name: claude mod check
+        # Validates, type-checks and tests the mod against the installed `claude`; skipped without it.
+        entry: sh -c 'command -v claude >/dev/null || exit 0; scripts/check-claude-mod.sh'
+        language: system
+        pass_filenames: false
+        files: ^(extensions/claude/|scripts/check-claude-mod\.sh$|skills/rkb/SKILL\.md$)
