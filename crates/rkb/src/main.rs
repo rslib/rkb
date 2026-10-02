@@ -392,8 +392,11 @@ enum Cmd {
     /// Run one agent tool with its arguments as JSON on stdin, as the harness integrations do.
     #[command(after_help = "Example:\n  echo '{\"query\": \"cmake cannot find hdf5\"}' | rkb tool rkb_search")]
     Tool {
-        /// rkb_search, rkb_show, rkb_add or rkb_note.
+        /// rkb_search, rkb_show, rkb_add, rkb_note, rkb_used, rkb_flag or rkb_edit.
         name: String,
+        /// Print `{"text": <TOON>, "json": <JSON>}` from one run, for a harness that needs both forms.
+        #[arg(long)]
+        both: bool,
     },
     /// Save a short finding to the inbox, to turn into a lesson later with /rkb-distill. Changes no lesson.
     #[command(after_help = "Example:\n  rkb note \"the linker wants -lz after -lhdf5 on tuolumne\"\n  echo \"...\" | rkb note")]
@@ -639,8 +642,14 @@ fn main() -> ExitCode {
         mcp::serve();
         return ExitCode::SUCCESS;
     }
-    if let Some(Cmd::Tool { name }) = &cli.cmd {
-        let (text, exit) = agent::from_stdin(name);
+    if let Some(Cmd::Tool { name, both }) = &cli.cmd {
+        // Only an explicit flag changes the form; RKB_FORMAT is for people at a terminal.
+        let form = match (*both, cli.format) {
+            (true, _) => agent::Form::Both,
+            (false, Some(Format::Json)) => agent::Form::Json,
+            _ => agent::Form::Toon,
+        };
+        let (text, exit) = agent::from_stdin(name, form);
         println!("{text}");
         return ExitCode::from(exit);
     }

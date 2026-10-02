@@ -4968,3 +4968,105 @@ fn command_hooks_stay_quiet_for_the_session_the_mod_handles() {
     assert!(env.dir.path().join("state/rkb/heartbeat/pi").exists(), "a pi session inside a Claude Code shell still runs");
     assert!(run(&["hook", "session-start"], "s2", "s1").contains("rkb search"), "another session runs");
 }
+
+#[test]
+fn tool_results_as_json_and_both() {
+    let env = search_kb();
+    let run = |args: &[&str], input: &serde_json::Value| {
+        let o = env.rkb_in(args, &input.to_string());
+        (String::from_utf8_lossy(&o.stdout).into_owned(), o.status.code())
+    };
+    let query = serde_json::json!({ "query": "undefined reference to vtable" });
+    let (json, code) = run(&["tool", "rkb_search", "--format", "json"], &query);
+    let (search, _) = env.json(&["search", "undefined reference to vtable"], "");
+    assert_eq!((serde_json::from_str::<serde_json::Value>(&json).unwrap(), code), (search, Some(0)));
+
+    let (err, code) = run(&["tool", "rkb_show", "--format", "json"], &serde_json::json!({}));
+    let err: serde_json::Value = serde_json::from_str(&err).unwrap();
+    assert_eq!((err["error"]["code"].as_str(), code), (Some("usage"), Some(2)), "{err}");
+    assert!(err["error"]["message"].as_str().unwrap().contains("id"), "{err}");
+
+    let (both, _) = run(&["tool", "rkb_search", "--both"], &query);
+    let both: serde_json::Value = serde_json::from_str(&both).unwrap();
+    assert_eq!(both["text"].as_str().unwrap(), tool(&env, "rkb_search", &query).0.trim_end(), "the same TOON as the plain call");
+    assert_eq!(both["json"], env.json(&["search", "undefined reference to vtable"], "").0, "the same JSON as the command");
+
+    let before = stdout(&env.git(&["log", "--oneline"])).lines().count();
+    let pitfall = serde_json::json!({
+        "type": "pitfall", "title": "Ninja ignores CFLAGS changes until a reconfigure", "topic": "cmake",
+        "symptom": "A changed CFLAGS has no effect.", "cause": "CMake caches the flags at configure time.",
+        "fix": "Run `cmake --fresh -B build`.", "evidence": "The next build used the new flags.",
+    });
+    let (both, code) = run(&["tool", "rkb_add", "--both"], &pitfall);
+    let both: serde_json::Value = serde_json::from_str(&both).unwrap();
+    assert_eq!(code, Some(0), "{both}");
+    assert_eq!(stdout(&env.git(&["log", "--oneline"])).lines().count(), before + 1, "one run, one lesson");
+    assert!(both["text"].as_str().unwrap().contains("status: written"), "{both}");
+    assert_eq!(both["json"]["status"], "written", "{both}");
+}
+
+/// The keys `schema` requires are in `value`, and each listed property has its JSON type.
+fn matches_schema(schema: &serde_json::Value, value: &serde_json::Value) -> Result<(), String> {
+    let type_ok = |t: &serde_json::Value, v: &serde_json::Value| {
+        let one = |t: &str| match t {
+            "string" => v.is_string(),
+            "number" => v.is_number(),
+            "integer" => v.is_i64() || v.is_u64(),
+            "object" => v.is_object(),
+            "array" => v.is_array(),
+            "null" => v.is_null(),
+            _ => true,
+        };
+        match t {
+            serde_json::Value::String(s) => one(s),
+            serde_json::Value::Array(ts) => ts.iter().any(|t| t.as_str().is_some_and(one)),
+            _ => true,
+        }
+    };
+    if !type_ok(&schema["type"], value) {
+        return Err(format!("{value} is not {}", schema["type"]));
+    }
+    for k in schema["required"].as_array().into_iter().flatten().filter_map(|k| k.as_str()) {
+        if value.get(k).is_none() {
+            return Err(format!("missing {k} in {value}"));
+        }
+    }
+    for (k, sub) in schema["properties"].as_object().into_iter().flatten() {
+        if let Some(v) = value.get(k) {
+            matches_schema(sub, v)?;
+        }
+    }
+    if let (Some(items), Some(list)) = (schema.get("items"), value.as_array()) {
+        list.iter().try_for_each(|v| matches_schema(items, v))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn tool_metadata_and_output_schemas() {
+    let env = search_kb();
+    let (v, _) = env.json(&["tools"], "");
+    let def = |name: &str| v["tools"].as_array().unwrap().iter().find(|t| t["name"] == name).unwrap().clone();
+    assert_eq!(def("rkb_search")["annotations"]["readOnlyHint"], true);
+    assert_eq!(def("rkb_edit")["annotations"]["destructiveHint"], true);
+    assert_eq!(def("rkb_add")["annotations"]["readOnlyHint"], false);
+    assert_eq!(v["namespace"]["name"], "rkb");
+    assert!(v["namespace"]["instructions"].as_str().unwrap().contains("rkb_used"), "{v}");
+
+    let query = serde_json::json!({ "query": "undefined reference to vtable" });
+    let o = env.rkb_in(&["tool", "rkb_search", "--format", "json"], &query.to_string());
+    let search: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(!search["results"].as_array().unwrap().is_empty());
+    matches_schema(&def("rkb_search")["outputSchema"], &search).unwrap();
+    let id = search["results"][0]["id"].as_str().unwrap();
+    let o = env.rkb_in(&["tool", "rkb_show", "--format", "json"], &serde_json::json!({ "id": id }).to_string());
+    matches_schema(&def("rkb_show")["outputSchema"], &serde_json::from_slice(&o.stdout).unwrap()).unwrap();
+    assert!(matches_schema(&def("rkb_show")["outputSchema"], &serde_json::json!({ "id": "x" })).is_err(), "the check can fail");
+
+    let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+    let o = env.rkb_in(&["mcp"], &format!("{list}\n"));
+    let reply: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let tools = reply["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 7);
+    assert!(tools.iter().all(|t| t.get("outputSchema").is_none() && t.get("annotations").is_some()), "{reply}");
+}

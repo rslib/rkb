@@ -191,15 +191,20 @@ pub fn render(format: Format, out: &Output) -> String {
     }
 }
 
-/// The error record as TOON, for callers that return text instead of printing it.
-pub fn render_error_toon(e: &CliError) -> String {
+/// The error record, as every format prints it.
+pub fn error_record(e: &CliError) -> Value {
     let mut record = json!({ "error": { "code": e.code.as_str(), "message": e.message, "fix": e.fix } });
     if let Some(Value::Object(extra)) = e.extra.as_deref() {
         for (k, v) in extra {
             record["error"][k] = v.clone();
         }
     }
-    expand(&record)
+    record
+}
+
+/// The error record as TOON, for callers that return text instead of printing it.
+pub fn render_error_toon(e: &CliError) -> String {
+    expand(&error_record(e))
 }
 
 pub fn print(format: Format, out: &Output) {

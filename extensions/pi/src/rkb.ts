@@ -24,12 +24,31 @@ const TOOLS_JSON: string = "__TOOLS__";
 // A tool runs a search or a write, which may load a model, so it gets longer than a hook.
 const TOOL_TIMEOUT_MS = 60000;
 
+const NAMESPACE_JSON: string = "__NAMESPACE__";
+
 interface ToolDef {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+  annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean };
+}
+interface Namespace {
+  name: string;
+  description?: string;
+  instructions?: string;
 }
 const TOOLS: ToolDef[] = TOOLS_JSON.startsWith("[") ? JSON.parse(TOOLS_JSON) : [];
+const NAMESPACE: Namespace | undefined = NAMESPACE_JSON.startsWith("{") ? JSON.parse(NAMESPACE_JSON) : undefined;
+
+/** Splits `rkb tool --both` output into the model's TOON text and the JSON for codemode scripts. */
+function bothForms(out: string): { text: string; json: unknown } {
+  try {
+    const v = JSON.parse(out) as { text?: unknown; json?: unknown };
+    if (typeof v.text === "string") return { text: v.text, json: v.json };
+  } catch {}
+  return { text: out.trim(), json: undefined };
+}
 
 process.env.RKB_HARNESS = HARNESS;
 
@@ -154,20 +173,26 @@ export default function rkb(pi: ExtensionAPI) {
   // Lessons recalled for the user's message, added to the context of that turn.
   let recallContext: string | undefined;
 
+  // pi 1.0 reads the output schema, annotations and namespace (a codemode script then gets the JSON);
+  // omp ignores them.
   for (const tool of TOOLS) {
     pi.registerTool({
       name: tool.name,
       label: tool.name,
       description: tool.description,
       promptSnippet: tool.description.split(". ")[0],
+      promptGuidelines: tool.name === "rkb_search" && NAMESPACE?.instructions ? [NAMESPACE.instructions] : undefined,
       parameters: Type.Unsafe(tool.inputSchema),
+      outputSchema: tool.outputSchema ? Type.Unsafe(tool.outputSchema) : undefined,
+      annotations: tool.annotations,
+      namespace: NAMESPACE,
       async execute(_id: string, params: unknown) {
-        const r = await runRkb(["tool", tool.name], JSON.stringify(params ?? {}), TOOL_TIMEOUT_MS);
+        const r = await runRkb(["tool", tool.name, "--both"], JSON.stringify(params ?? {}), TOOL_TIMEOUT_MS);
         if (!r) throw new Error("rkb did not run: check that the rkb command is installed (`rkb doctor` in a terminal).");
-        const text = r.out.trim();
+        const { text, json } = bothForms(r.out);
         // Exit 3 is a question for the user, which the agent passes on; 1 and 2 are failures.
         if (r.code === 1 || r.code === 2) throw new Error(text || `rkb exited with ${r.code}`);
-        return { content: [{ type: "text", text }], details: {} };
+        return { content: [{ type: "text", text }], details: {}, structuredContent: json as never };
       },
     });
   }

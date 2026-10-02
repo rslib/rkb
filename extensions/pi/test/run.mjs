@@ -127,6 +127,15 @@ assert.match(tools.rkb_search.description, /before a web search/i);
 assert.equal(tools.rkb_search.parameters.properties.query.type, "string");
 const found = await tools.rkb_search.execute("t1", { query: "undefined reference to vtable" });
 assert.match(found.content[0].text, /1a00000012/);
+// The same run's JSON is the structured result a pi codemode script reads.
+assert.ok(found.structuredContent.results.some((r) => r.id === "1a00000012"));
+assert.ok(!found.content[0].text.startsWith("{"), "the model reads TOON, not JSON");
+assert.equal(tools.rkb_search.namespace.name, "rkb");
+assert.equal(tools.rkb_search.annotations.readOnlyHint, true);
+assert.equal(tools.rkb_edit.annotations.destructiveHint, true);
+assert.equal(tools.rkb_search.outputSchema.properties.results.type, "array");
+assert.match(tools.rkb_search.promptGuidelines[0], /rkb_used/);
+assert.equal(tools.rkb_show.promptGuidelines, undefined);
 await assert.rejects(tools.rkb_show.execute("t2", {}), /`id` is required/);
 
 // A recall reply goes into the next turn's context, hidden, with the session-start lines.

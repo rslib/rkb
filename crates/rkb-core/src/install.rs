@@ -256,6 +256,7 @@ impl Harness {
                 &serde_json::to_string(&serde_json::to_string(&crate::tools::definitions()).expect("definitions serialize"))
                     .expect("a string serializes"),
             )
+            .replace("\"__NAMESPACE__\"", &serde_json::to_string(&crate::tools::namespace().to_string()).expect("a string serializes"))
     }
 }
 

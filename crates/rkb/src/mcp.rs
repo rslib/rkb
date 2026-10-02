@@ -48,7 +48,8 @@ pub fn handle(line: &str) -> Option<Value> {
             })
         }
         "ping" => json!({}),
-        "tools/list" => json!({ "tools": rkb_core::tools::definitions() }),
+        // An MCP server that declares an output schema must return structured results; this one returns text.
+        "tools/list" => json!({ "tools": rkb_core::tools::definitions().into_iter().map(without_output_schema).collect::<Vec<_>>() }),
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let (text, exit) = crate::agent::call(name, &params["arguments"]);
@@ -58,4 +59,11 @@ pub fn handle(line: &str) -> Option<Value> {
         _ => return Some(error(id, -32601, "method not found")),
     };
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+}
+
+fn without_output_schema(mut def: Value) -> Value {
+    if let Some(o) = def.as_object_mut() {
+        o.remove("outputSchema");
+    }
+    def
 }

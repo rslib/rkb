@@ -33,8 +33,79 @@ fn section_fields() -> Vec<(String, Vec<&'static str>)> {
     out
 }
 
-/// The tool definitions: `name`, `description`, and a JSON Schema as `inputSchema`.
+/// The tool definitions: `name`, `description`, a JSON Schema as `inputSchema`, a JSON Schema of the
+/// `--format json` result as `outputSchema`, and MCP-style `annotations`.
 pub fn definitions() -> Vec<Value> {
+    let mut defs = inputs();
+    for d in &mut defs {
+        let name = d["name"].as_str().unwrap_or_default().to_string();
+        d["outputSchema"] = output_schema(&name);
+        d["annotations"] = match name.as_str() {
+            "rkb_search" | "rkb_show" => json!({ "readOnlyHint": true }),
+            "rkb_edit" => json!({ "readOnlyHint": false, "destructiveHint": true }),
+            _ => json!({ "readOnlyHint": false, "destructiveHint": false }),
+        };
+    }
+    defs
+}
+
+/// The group every harness shows the tools under, with the rules an agent needs even when it never
+/// loads the skill.
+pub fn namespace() -> Value {
+    json!({
+        "name": "rkb",
+        "description": "The user's knowledge base of lessons learned: pitfalls, recipes, facts, decisions and preferences.",
+        "instructions": "Search with rkb_search before a web search or a guess about an error or problem. After you act on a lesson, report it with rkb_used. A result with status needs_user holds a question for the user: show it to them and never answer it yourself.",
+    })
+}
+
+/// The JSON Schema of a tool's `--format json` result: detailed for the reads, which scripts filter,
+/// and the common fields for the writes, whose result varies with the outcome.
+fn output_schema(name: &str) -> Value {
+    let any = json!({});
+    match name {
+        "rkb_search" => json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" },
+                "mode": { "type": "string" },
+                "results": { "type": "array", "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }, "type": { "type": "string" }, "title": { "type": "string" },
+                        "path": { "type": "string" }, "status": { "type": "string" }, "applies": { "type": "string" },
+                        "relevance": { "type": ["number", "null"] }, "summary": { "type": "string" },
+                        "worked": { "type": "integer" }, "failed": { "type": "integer" },
+                        "injected": { "type": "integer" }, "irrelevant": { "type": "integer" },
+                    },
+                    "required": ["id", "type", "title", "path", "status", "applies", "summary"],
+                } },
+                "ranked_by": { "type": "string" },
+            },
+            "required": ["results"],
+        }),
+        "rkb_show" => json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" }, "path": { "type": "string" }, "title": { "type": "string" },
+                "hash": { "type": "string" }, "body": { "type": "string" }, "frontmatter": { "type": "object" },
+                "usage": { "type": "object" }, "applies": { "type": "object" }, "related": { "type": "array", "items": any },
+            },
+            "required": ["id", "path", "title", "hash", "body", "frontmatter"],
+        }),
+        _ => json!({
+            "type": "object",
+            "properties": {
+                "status": { "type": "string", "description": "written, recorded, needs_user and so on" },
+                "id": { "type": "string" },
+                "request": { "type": "string", "description": "The request id when status is needs_user" },
+                "question": { "type": "string" },
+            },
+        }),
+    }
+}
+
+fn inputs() -> Vec<Value> {
     let mut add_props = json!({
         "type": { "type": "string", "enum": TYPES, "description": "pitfall: an error and its fix; recipe: steps that work; fact: something true here; decision: a choice and why; preference: how the user wants things done" },
         "title": { "type": "string", "description": "What the lesson says, as a short sentence, such as `CMake cannot find HDF5 unless HDF5_ROOT is set`" },

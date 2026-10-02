@@ -6,16 +6,35 @@ use serde_json::{Value, json};
 use crate::output::{self, CliError, ErrorCode, Format, Output};
 use crate::{Cmd, run};
 
-/// Runs one tool and returns its text (TOON, as the matching command prints with `--toon`) and exit code.
+/// How `rkb tool` prints a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Form {
+    /// As the matching command prints with `--toon`.
+    Toon,
+    /// As the matching command prints with `--format json`.
+    Json,
+    /// `{"text": <TOON>, "json": <JSON>}` from one run, for a harness that needs both.
+    Both,
+}
+
+/// Runs one tool and returns its TOON text and exit code.
 pub fn call(name: &str, args: &Value) -> (String, u8) {
+    call_as(name, args, Form::Toon)
+}
+
+/// Runs one tool once and returns its result in `form` and the exit code.
+pub fn call_as(name: &str, args: &Value, form: Form) -> (String, u8) {
     let result = tools::check(name, args).map_err(|m| CliError::new(ErrorCode::Usage, m, fix(name))).and_then(|()| run_tool(name, args));
-    match result {
-        Ok(out) => (output::render(Format::Toon, &out), out.exit),
-        Err(e) => {
-            let code = if e.code == ErrorCode::Usage { 2 } else { 1 };
-            (output::render_error_toon(&e), code)
-        }
-    }
+    let (toon, data, exit) = match result {
+        Ok(out) => (output::render(Format::Toon, &out), out.data.clone(), out.exit),
+        Err(e) => (output::render_error_toon(&e), output::error_record(&e), if e.code == ErrorCode::Usage { 2 } else { 1 }),
+    };
+    let text = match form {
+        Form::Toon => toon,
+        Form::Json => data.to_string(),
+        Form::Both => json!({ "text": toon, "json": data }).to_string(),
+    };
+    (text, exit)
 }
 
 fn fix(name: &str) -> String {
@@ -83,14 +102,19 @@ pub fn list() -> Output {
         .map(|d| format!("{}  {}", d["name"].as_str().unwrap_or(""), d["description"].as_str().unwrap_or("")))
         .collect::<Vec<_>>()
         .join("\n\n");
-    Output { data: json!({ "tools": defs }), human, exit: 0, raw: false }
+    Output { data: json!({ "tools": defs, "namespace": tools::namespace() }), human, exit: 0, raw: false }
 }
 
 /// `rkb tool <name>`: the arguments come as one JSON object on stdin.
-pub fn from_stdin(name: &str) -> (String, u8) {
+pub fn from_stdin(name: &str, form: Form) -> (String, u8) {
+    let usage = |e: CliError| match form {
+        Form::Toon => output::render_error_toon(&e),
+        Form::Json => output::error_record(&e).to_string(),
+        Form::Both => json!({ "text": output::render_error_toon(&e), "json": output::error_record(&e) }).to_string(),
+    };
     let mut input = String::new();
     if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input) {
-        return (output::render_error_toon(&CliError::new(ErrorCode::Usage, format!("cannot read stdin: {e}"), fix(name))), 2);
+        return (usage(CliError::new(ErrorCode::Usage, format!("cannot read stdin: {e}"), fix(name))), 2);
     }
     let args: Value = if input.trim().is_empty() {
         json!({})
@@ -98,10 +122,9 @@ pub fn from_stdin(name: &str) -> (String, u8) {
         match serde_json::from_str(&input) {
             Ok(v) => v,
             Err(e) => {
-                let e = CliError::new(ErrorCode::Usage, format!("the arguments are not JSON: {e}"), fix(name));
-                return (output::render_error_toon(&e), 2);
+                return (usage(CliError::new(ErrorCode::Usage, format!("the arguments are not JSON: {e}"), fix(name))), 2);
             }
         }
     };
-    call(name, &args)
+    call_as(name, &args, form)
 }
