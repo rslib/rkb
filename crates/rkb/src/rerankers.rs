@@ -64,6 +64,10 @@ struct JevBackend {
 }
 
 fn jev() -> Result<Box<dyn Reranker>, String> {
+    Ok(Box::new(jev_client()?))
+}
+
+fn jev_client() -> Result<JevBackend, String> {
     let key = jev_key()?;
     let root = rkb_core::kb::home();
     let cfg = std::fs::read_to_string(root.join("kb.toml"))
@@ -71,12 +75,12 @@ fn jev() -> Result<Box<dyn Reranker>, String> {
         .and_then(|t| config::parse::<KbConfig>(&t).ok())
         .and_then(|c| c.jev)
         .unwrap_or_default();
-    Ok(Box::new(JevBackend {
+    Ok(JevBackend {
         key,
         url: std::env::var("RKB_JEV_URL").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| JEV_URL.into()),
         model: cfg.get("model").and_then(|v| v.as_str()).unwrap_or("jev-latest").to_string(),
         batch: cfg.get("batch").and_then(|v| v.as_bool()).unwrap_or(true),
-    }))
+    })
 }
 
 /// Where the Jev key comes from, for `rkb doctor`, without the key itself.
@@ -157,6 +161,18 @@ impl JevBackend {
     fn ask(&self, state: String, keys: &[String], instructions: &[String]) -> Result<Vec<f32>, String> {
         let questions: serde_json::Map<String, serde_json::Value> =
             keys.iter().zip(instructions).map(|(k, i)| (k.clone(), serde_json::json!({ "type": "noul", "instructions": i }))).collect();
+        let v = self.post(&state, questions)?;
+        keys.iter()
+            .map(|k| match v["answers"][k]["noul"].as_f64() {
+                Some(p) if (0.0..=1.0).contains(&p) => Ok(p as f32),
+                Some(p) => Err(format!("answer {k} is {p}, outside 0 to 1")),
+                None => Err(format!("the answer has no noul for {k}")),
+            })
+            .collect()
+    }
+
+    /// One request with any questions; the answer as JSON.
+    fn post(&self, state: &str, questions: serde_json::Map<String, serde_json::Value>) -> Result<serde_json::Value, String> {
         let body = serde_json::json!({ "model": self.model, "state": state, "questions": questions }).to_string();
         // The chain's own time limit ends the search sooner; this only stops a stuck socket.
         let agent: ureq::Agent =
@@ -172,15 +188,97 @@ impl JevBackend {
             return Err(format!("HTTP {status}"));
         }
         let text = resp.body_mut().read_to_string().map_err(|e| format!("reading the answer failed: {e}"))?;
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| "the answer is not JSON".to_string())?;
-        keys.iter()
-            .map(|k| match v["answers"][k]["noul"].as_f64() {
-                Some(p) if (0.0..=1.0).contains(&p) => Ok(p as f32),
-                Some(p) => Err(format!("answer {k} is {p}, outside 0 to 1")),
-                None => Err(format!("the answer has no noul for {k}")),
-            })
-            .collect()
+        serde_json::from_str(&text).map_err(|_| "the answer is not JSON".to_string())
     }
+}
+
+/// The lesson types the triage choice offers, with what each means; `not_a_lesson` is the rest.
+const KINDS: [(&str, &str); 6] = [
+    ("pitfall", "an error or trap and the fix that worked"),
+    ("recipe", "steps that get something done"),
+    ("fact", "something verified about a tool, an API or an environment"),
+    ("decision", "a design choice with its reason"),
+    ("preference", "how the user wants work done"),
+    ("not_a_lesson", "chatter, task status, a plan, or something that will change within weeks"),
+];
+
+/// Why an inbox item of `project` (or `general`) may not go to Jev: no `[sinks.jev]`, or labels it does
+/// not allow. Every path that sends inbox text to Jev, the novelty search included, asks this first.
+pub fn item_jev_guard(root: &Path, project: Option<&str>) -> Result<(), String> {
+    let kb: KbConfig = std::fs::read_to_string(root.join("kb.toml")).ok().and_then(|t| config::parse(&t).ok()).unwrap_or_default();
+    let Some(sink) = kb.sinks.get(JEV) else { return Err("kb.toml has no [sinks.jev]".into()) };
+    let Ok(snap) = Snapshot::from_dir(root) else { return Err("the labels could not be read".into()) };
+    // The item's labels are those a lesson of its place would get.
+    let folder = project.map_or_else(|| "general/inbox.md".to_string(), |p| format!("projects/{p}/inbox.md"));
+    let labels = rkb_core::write::effective_at(&snap, &folder);
+    if config::sink_allows(&sink.allow, &labels) {
+        return Ok(());
+    }
+    let shown: Vec<String> = labels.values().cloned().collect();
+    Err(format!("label {}", shown.join(", ")))
+}
+
+/// Asks Jev, in one request, the worth questions about the candidates of one inbox item. The first
+/// element is the backend's name; a candidate the guard keeps from Jev gets the reason instead.
+pub fn jev_worth(root: &Path, project: Option<&str>, texts: &[&str]) -> Option<(String, Vec<Result<rkb_core::triage::Worth, String>>)> {
+    if !Settings::load(root).chain.iter().any(|b| b == JEV) {
+        return None;
+    }
+    let every = |why: String| Some((JEV.to_string(), texts.iter().map(|_| Err(why.clone())).collect()));
+    let client = match jev_client() {
+        Ok(c) => c,
+        Err(why) => return every(why),
+    };
+    if let Err(why) = item_jev_guard(root, project) {
+        return every(why);
+    }
+    let kb: KbConfig = std::fs::read_to_string(root.join("kb.toml")).ok().and_then(|t| config::parse(&t).ok()).unwrap_or_default();
+    let env = rkb_core::lint::LintEnv::from_process();
+    let scanner = LeakScanner::new(&kb.leak, env.user.as_deref(), env.home.as_deref());
+    let sent: Vec<usize> = (0..texts.len()).filter(|&i| scanner.scan(texts[i]).is_empty()).collect();
+    let mut state = String::from("Notes from coding sessions, each a possible entry in a knowledge base of lessons learned:");
+    let mut questions = serde_json::Map::new();
+    let criteria: serde_json::Map<String, serde_json::Value> = KINDS.iter().map(|(k, m)| (k.to_string(), serde_json::json!(m))).collect();
+    for (n, &i) in sent.iter().enumerate() {
+        state.push_str(&format!("\n\n[{n}]\n{}", texts[i].chars().take(4000).collect::<String>()));
+        for (key, ask) in [
+            ("durable", "Would note [N] still help in a different session months from now?"),
+            ("general", "Does note [N] hold beyond the one file or task it came from?"),
+            ("mistake", "Does note [N] record a mistake and the fix that worked?"),
+            ("preference", "Does note [N] state how the user wants work done?"),
+        ] {
+            questions.insert(format!("{key}_{n}"), serde_json::json!({ "type": "noul", "instructions": ask.replace('N', &n.to_string()) }));
+        }
+        questions.insert(
+            format!("kind_{n}"),
+            serde_json::json!({ "type": "choice", "instructions": format!("What kind of lesson is note [{n}]?"), "criteria": criteria }),
+        );
+    }
+    let answer = if sent.is_empty() { Ok(serde_json::Value::Null) } else { client.post(&state, questions) };
+    let worth = |n: usize, v: &serde_json::Value| -> Result<rkb_core::triage::Worth, String> {
+        let noul = |key: &str| {
+            v["answers"][format!("{key}_{n}")]["noul"].as_f64().filter(|p| (0.0..=1.0).contains(p)).ok_or(format!("no {key} answer"))
+        };
+        let probs = &v["answers"][format!("kind_{n}")]["probabilities"];
+        let kind = v["answers"][format!("kind_{n}")]["choice"]
+            .as_str()
+            .map(|c| (c.to_string(), probs["not_a_lesson"].as_f64().unwrap_or(if c == "not_a_lesson" { 1.0 } else { 0.0 })));
+        Ok(rkb_core::triage::Worth {
+            durable: noul("durable")?,
+            general: noul("general")?,
+            mistake: noul("mistake")?,
+            preference: noul("preference")?,
+            kind,
+        })
+    };
+    let answers = (0..texts.len())
+        .map(|i| match (&answer, sent.iter().position(|&s| s == i)) {
+            (_, None) => Err("leak scan".to_string()),
+            (Err(why), _) => Err(why.clone()),
+            (Ok(v), Some(n)) => worth(n, v),
+        })
+        .collect();
+    Some((JEV.to_string(), answers))
 }
 
 impl Reranker for JevBackend {

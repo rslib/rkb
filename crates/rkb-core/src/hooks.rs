@@ -87,6 +87,7 @@ pub fn cleanup(state: &Path) {
     prune_log(state, REPLAYS);
     prune_log(state, RANKINGS);
     prune_log(state, WRITTEN);
+    prune_log(state, crate::triage::LOG);
     let Ok(entries) = std::fs::read_dir(sessions_dir(state)) else { return };
     let limit = Duration::from_secs(SESSION_DAYS * 24 * 3600);
     for e in entries.flatten() {
@@ -409,7 +410,8 @@ pub fn replays(state: &Path, days: u64) -> Vec<Replay> {
 }
 
 /// Drops log lines older than 90 days. Reads only the first line when nothing is that old.
-fn prune_log(state: &Path, name: &str) {
+/// Drops the lines of a state log older than 90 days.
+pub(crate) fn prune_log(state: &Path, name: &str) {
     let path = state.join(name);
     let Ok(text) = std::fs::read_to_string(&path) else { return };
     let cutoff = crate::request::now().saturating_sub(REPLAY_DAYS * 86400);

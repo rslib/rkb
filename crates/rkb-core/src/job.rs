@@ -19,6 +19,7 @@ pub const EXPIRY_S: u64 = 3600;
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Job {
     Observe(observer::Run),
+    Triage(crate::triage::Ask),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -215,12 +215,34 @@ pub struct ObserverConfig {
     pub chains: Vec<(String, Vec<String>)>,
     pub timeout_secs: u64,
     pub min_prompts: usize,
+    /// The small models that decide unsure triage candidates, per harness, from `[triage]`; only for
+    /// harnesses with an observer chain, since the same approval covers both. Claude Code gets `haiku`
+    /// when `[triage]` names none.
+    pub triage: Vec<(String, Vec<String>)>,
 }
 
 impl Default for ObserverConfig {
     fn default() -> Self {
-        ObserverConfig { chains: vec![], timeout_secs: 600, min_prompts: 3 }
+        ObserverConfig { chains: vec![], timeout_secs: 600, min_prompts: 3, triage: vec![] }
     }
+}
+
+/// `[triage] claude-code`, `pi` and `omp`: a model or a list of models; other keys are thresholds.
+fn triage_chains(machine: &toml::Table, observed: &[(String, Vec<String>)]) -> Vec<(String, Vec<String>)> {
+    let table = machine.get("triage").and_then(|v| v.as_table());
+    observed
+        .iter()
+        .filter_map(|(h, _)| {
+            let models: Vec<String> = match table.and_then(|t| t.get(h.as_str())) {
+                Some(toml::Value::String(m)) => vec![m.trim().to_string()],
+                Some(toml::Value::Array(ms)) => ms.iter().filter_map(|m| m.as_str().map(|m| m.trim().to_string())).collect(),
+                _ if h == "claude-code" => vec!["haiku".into()],
+                _ => vec![],
+            };
+            let models: Vec<String> = models.into_iter().filter(|m| !m.is_empty()).collect();
+            (!models.is_empty()).then(|| (h.clone(), models))
+        })
+        .collect()
 }
 
 impl ObserverConfig {
@@ -240,10 +262,12 @@ impl ObserverConfig {
                 chains.push((h.to_string(), models));
             }
         }
+        let triage = triage_chains(machine, &chains);
         Ok(ObserverConfig {
             chains,
             timeout_secs: t.timeout_secs.unwrap_or(d.timeout_secs),
             min_prompts: t.min_prompts.unwrap_or(d.min_prompts),
+            triage,
         })
     }
 
@@ -253,8 +277,16 @@ impl ObserverConfig {
     }
 
     /// What the user approves: every chain, one line per harness, such as `pi = openai-codex/gpt-5.6-luna, session`.
+    /// The triage models for `harness`, empty when it has none.
+    pub fn triage_chain(&self, harness: &str) -> &[String] {
+        self.triage.iter().find(|(h, _)| h == harness).map_or(&[], |(_, m)| m)
+    }
+
+    /// What the approval shows and hashes: every chain that receives session or inbox text.
     pub fn summary(&self) -> String {
-        self.chains.iter().map(|(h, m)| format!("{h} = {}", m.join(", "))).collect::<Vec<_>>().join("\n")
+        let observer = self.chains.iter().map(|(h, m)| format!("{h} = {}", m.join(", ")));
+        let triage = self.triage.iter().map(|(h, m)| format!("triage {h} = {}", m.join(", ")));
+        observer.chain(triage).collect::<Vec<_>>().join("\n")
     }
 }
 
@@ -323,7 +355,18 @@ mod tests {
         assert_eq!(o.chain("pi"), ["openai-codex/gpt-5.6-luna", "session"]);
         assert!(o.chain("omp").is_empty(), "an empty list is off");
         assert_eq!((o.timeout_secs, o.min_prompts), (600, 5));
-        assert_eq!(o.summary(), "claude-code = sonnet\npi = openai-codex/gpt-5.6-luna, session");
+        assert_eq!(o.summary(), "claude-code = sonnet\npi = openai-codex/gpt-5.6-luna, session\ntriage claude-code = haiku");
+        assert!(o.triage_chain("pi").is_empty(), "only Claude Code has a default");
+        let set: toml::Table = toml::from_str(
+            "[observer]\nclaude-code = \"sonnet\"\npi = \"session\"\n[triage]\nclaude-code = [\"claude-haiku-4-5\"]\npi = \"x/small\"\nomp = \"y\"\nkeep = 0.7\n",
+        )
+        .unwrap();
+        let set = ObserverConfig::from_table(&set).unwrap();
+        assert_eq!(
+            (set.triage_chain("claude-code"), set.triage_chain("pi")),
+            (&["claude-haiku-4-5".to_string()][..], &["x/small".to_string()][..])
+        );
+        assert!(set.triage_chain("omp").is_empty(), "no observer chain for omp, so no triage chain");
         let off = ObserverConfig::from_table(&toml::Table::new()).unwrap();
         assert_eq!(off, ObserverConfig::default());
         assert!(off.chains.is_empty());

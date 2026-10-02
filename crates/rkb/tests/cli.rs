@@ -4707,6 +4707,8 @@ fn observe_needs_approval_and_saves_notes() {
 fn session_end_starts_the_observer_in_the_background() {
     let env = observer_env(2);
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/pi.jsonl");
+    // macOS checks a newly linked binary on its first run, which can take a second; time the hook, not that.
+    assert!(env.rkb(&["--version"]).status.success());
     let end = |id: &str, harness: &str| {
         let payload = serde_json::json!({ "session_id": id, "transcript_path": fixture, "cwd": env.dir.path(), "model": "openai/sol" });
         let start = std::time::Instant::now();
@@ -5079,4 +5081,327 @@ fn tool_metadata_and_output_schemas() {
     let tools = reply["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 7);
     assert!(tools.iter().all(|t| t.get("outputSchema").is_none() && t.get("annotations").is_some()), "{reply}");
+}
+
+/// Writes an inbox item file as rkb writes one; `signals` and the body are the item's.
+fn inbox_item(env: &Env, id: &str, kind: &str, signals: &[&str], body: &str) {
+    let dir = env.dir.path().join("state/rkb/inbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let signals: String = signals.iter().map(|s| format!("- {s}\n")).collect();
+    let signals = if signals.is_empty() { String::new() } else { format!("signals:\n{signals}") };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    std::fs::write(dir.join(format!("{id}.md")), format!("---\nkind: {kind}\ntime: {now}\n{signals}---\n\n{body}\n")).unwrap();
+}
+
+#[test]
+fn inbox_triage_splits_and_applies_the_rules() {
+    let env = search_kb();
+    inbox_item(
+        &env,
+        "0000000001",
+        "observed",
+        &[],
+        "- 2026-10-02 [med] (fact; project) rkb is at version 0.0.14\n- 2026-10-02 [high] (pitfall; general) `cargo install --path` on a workspace root fails with `found a virtual manifest`; pass the member crate.\n- 2026-10-02 [low] (decision; project) Keep the confirm gate in the pre-tool hook, because only its input has permission_mode.",
+    );
+    inbox_item(&env, "0000000002", "transcript", &["fixed cd", "fixed ls"], "[user] list the files");
+    inbox_item(&env, "0000000003", "transcript", &["fixed ls", "remember"], "[user] remember that ninja is faster here");
+    let (v, code) = env.json(&["inbox", "triage"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(v["total"], serde_json::json!({ "keep": 1, "known": 0, "unsure": 2, "drop": 2 }), "{v}");
+    let show = |id: &str| env.json(&["inbox", "show", id], "").0["meta"]["candidates"].clone();
+    let observed = show("0000000001");
+    assert_eq!(observed.as_array().unwrap().len(), 3, "one candidate per note: {observed}");
+    assert_eq!((observed[0]["verdict"].as_str(), observed[0]["reason"].as_str()), (Some("drop"), Some("rule")), "{observed}");
+    assert_eq!(observed[1]["line"], 1);
+    assert_eq!((show("0000000002")[0]["verdict"].as_str(), show("0000000002")[0]["reason"].as_str()), (Some("drop"), Some("rule")));
+    assert_eq!((show("0000000003")[0]["verdict"].as_str(), show("0000000003")[0]["reason"].as_str()), (Some("keep"), Some("remember")));
+    let human = stdout(&env.rkb(&["inbox", "show", "0000000001", "--format", "human"]));
+    assert!(human.contains("verdicts:") && human.contains("0 drop (rule) - 2026-10-02 [med] (fact; project) rkb is at version"), "{human}");
+    let (list, _) = env.json(&["inbox"], "");
+    let row = list["items"].as_array().unwrap().iter().find(|r| r["id"] == "0000000001").unwrap().clone();
+    assert_eq!(row["verdicts"], serde_json::json!({ "keep": 0, "known": 0, "unsure": 2, "drop": 1 }), "{row}");
+    assert!(stdout(&env.rkb(&["inbox", "--format", "human"])).contains("2 unsure, 1 drop"));
+    let (again, _) = env.json(&["inbox", "triage"], "");
+    assert!(again["items"].as_array().unwrap().is_empty(), "triaged items are not triaged again: {again}");
+}
+
+#[test]
+fn inbox_triage_marks_what_a_lesson_already_says() {
+    let env = search_kb();
+    set_chain(&env, "chain = [\"jev\", \"bm25\"]");
+    jev_config(&env, "[jev]\napi_key = \"k\"\n", 0o600);
+    let (url, _log) = fake_jev(|body| {
+        let answers: serde_json::Map<String, serde_json::Value> = body["questions"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| (k.clone(), serde_json::json!({ "type": "noul", "noul": if k == "lesson_0" { 0.91 } else { 0.10 } })))
+            .collect();
+        (200, serde_json::json!({ "answers": answers }).to_string())
+    });
+    inbox_item(
+        &env,
+        "0000000004",
+        "note",
+        &[],
+        "undefined reference to vtable for Widget: a virtual function was declared but never defined",
+    );
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_JEV_URL", &url);
+    let o = rkb_with(c, &["inbox", "triage", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(v["total"]["known"], 1, "{v}");
+    let (show, _) = env.json(&["inbox", "show", "0000000004"], "");
+    let c = &show["meta"]["candidates"][0];
+    assert_eq!((c["verdict"].as_str(), c["reason"].as_str()), (Some("known"), Some("known")), "{show}");
+    let (top, _) =
+        jev_search(&env, &url, "undefined reference to vtable for Widget: a virtual function was declared but never defined", &[]);
+    assert_eq!(c["lesson"], top["results"][0]["id"], "the lesson Jev rated highest: {show}");
+}
+
+#[test]
+fn inbox_triage_asks_jev_whether_a_note_is_worth_a_lesson() {
+    let env = search_kb();
+    set_chain(&env, "chain = [\"jev\", \"bm25\"]");
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    if !toml.contains("[sinks.jev]") {
+        env.write("kb.toml", &format!("{toml}\n[sinks.jev]\nallow = {{ sensitivity = [\"public\", \"internal\"] }}\n"));
+    }
+    jev_config(&env, "[jev]\napi_key = \"k\"\n", 0o600);
+    let (url, log) = fake_jev(|body| {
+        let answers: serde_json::Map<String, serde_json::Value> = body["questions"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| {
+                let a = match k.as_str() {
+                    "durable_0" => serde_json::json!({ "type": "noul", "noul": 0.95 }),
+                    "general_0" => serde_json::json!({ "type": "noul", "noul": 0.9 }),
+                    "durable_1" | "general_1" => serde_json::json!({ "type": "noul", "noul": 0.9 }),
+                    "kind_0" => serde_json::json!({ "type": "choice", "choice": "pitfall", "probabilities": { "pitfall": 0.9, "not_a_lesson": 0.05 } }),
+                    "kind_1" => serde_json::json!({ "type": "choice", "choice": "not_a_lesson", "probabilities": { "fact": 0.1, "not_a_lesson": 0.85 } }),
+                    _ => serde_json::json!({ "type": "noul", "noul": 0.1 }),
+                };
+                (k.clone(), a)
+            })
+            .collect();
+        (200, serde_json::json!({ "answers": answers }).to_string())
+    });
+    inbox_item(
+        &env,
+        "0000000005",
+        "observed",
+        &[],
+        "- 2026-10-02 [high] (pitfall; general) `cargo install --path` on a workspace root fails with `found a virtual manifest`; pass the member crate.\n- 2026-10-02 [med] (fact; general) The meeting about the release moved to the afternoon slot this week.",
+    );
+    let triage = |env: &Env| {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.env("RKB_JEV_URL", &url);
+        let o = rkb_with(c, &["inbox", "triage", "--format", "json"], "");
+        serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)))
+    };
+    let v = triage(&env);
+    assert_eq!(v["total"], serde_json::json!({ "keep": 1, "known": 0, "unsure": 0, "drop": 1 }), "{v}");
+    let (show, _) = env.json(&["inbox", "show", "0000000005"], "");
+    let c = show["meta"]["candidates"].clone();
+    assert_eq!(
+        (c[0]["verdict"].as_str(), c[0]["reason"].as_str(), c[0]["score"].as_f64(), c[0]["kind"].as_str()),
+        (Some("keep"), Some("jev"), Some(0.855), Some("pitfall")),
+        "{c}"
+    );
+    assert_eq!((c[1]["verdict"].as_str(), c[1]["kind"].as_str()), (Some("drop"), Some("not_a_lesson")), "not a lesson: {c}");
+    let worth = log.lock().unwrap().iter().filter(|(_, b)| b["questions"].get("kind_0").is_some()).count();
+    assert_eq!(worth, 1, "one worth request for the item");
+
+    set_chain(&env, "chain = [\"bm25\"]");
+    inbox_item(&env, "0000000006", "note", &[], "the linker wants -lz after -lhdf5 on this cluster");
+    let v = triage(&env);
+    assert_eq!(v["total"], serde_json::json!({ "keep": 0, "known": 0, "unsure": 1, "drop": 0 }), "no scorer: {v}");
+}
+
+#[test]
+fn inbox_triage_keeps_internal_notes_from_jev() {
+    let env = search_kb();
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write(
+        "kb.toml",
+        &toml
+            .replace(
+                "[sinks.jev]\nallow = { sensitivity = [\"public\", \"internal\"] }",
+                "[sinks.jev]\nallow = { sensitivity = [\"public\"] }",
+            )
+            .replace("chain = [\"bm25\"]", "chain = [\"jev\", \"bm25\"]"),
+    );
+    env.write(
+        "projects/dftracer/README.md",
+        "---\nremotes:\n  - github.com/llnl/dftracer\nlabels:\n  sensitivity: internal\n---\n\n# dftracer\n",
+    );
+    // Public lessons, so a search for the note's text would call Jev without the item's own guard.
+    env.write("general/README.md", "---\nlabels:\n  sensitivity: public\n---\n\n# General\n");
+    assert!(
+        env.git(&["add", "-A"]).status.success()
+            && env.git(&["-c", "user.name=T", "-c", "user.email=t@example.org", "commit", "-q", "-m", "p"]).status.success()
+    );
+    let repo = project_repo(&env, "git@github.com:llnl/dftracer.git");
+    jev_config(&env, "[jev]\napi_key = \"k\"\n", 0o600);
+    let (url, log) = fake_jev(jev_answers);
+    let secret = "CMake cannot find HDF5 on the dftracer staging cluster behind the second VPN gateway unless HDF5_ROOT is set.";
+    inbox_item(&env, "0000000007", "note", &[], secret);
+    let path = env.dir.path().join("state/rkb/inbox/0000000007.md");
+    let text = std::fs::read_to_string(&path).unwrap().replacen("---\n\n", &format!("cwd: {}\n---\n\n", repo.display()), 1);
+    std::fs::write(&path, text).unwrap();
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_JEV_URL", &url);
+    let o = rkb_with(c, &["inbox", "triage", "--format", "json"], "");
+    assert!(o.status.success(), "{}", stdout(&o));
+    let (show, _) = env.json(&["inbox", "show", "0000000007"], "");
+    let c = &show["meta"]["candidates"][0];
+    assert_eq!((c["verdict"].as_str(), c["reason"].as_str()), (Some("unsure"), Some("jev: label internal")), "{show}");
+    assert!(log.lock().unwrap().iter().all(|(_, body)| !body.to_string().contains("second VPN gateway")), "the note never reached Jev");
+}
+
+fn approve_as_claude(env: &Env) {
+    let (v, code) = env.json(&["approve", "observer"], "");
+    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{v}");
+    env.trust_claude();
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("CLAUDECODE", "1");
+    let o = rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", "approve observer", "--format", "json"], "");
+    assert!(o.status.success(), "{}", stdout(&o));
+}
+
+#[test]
+fn unsure_candidates_go_to_the_triage_models() {
+    let env = search_kb();
+    let config = env.dir.path().join("config/rkb/config.toml");
+    env.write_abs(&config, "[observer]\nclaude-code = \"sonnet\"\npi = \"session\"\n\n[triage]\npi = \"small\"\n");
+    inbox_item(&env, "0000000008", "note", &[], "the linker wants -lz after -lhdf5 on this cluster");
+    inbox_item(&env, "0000000009", "note", &[], "the meeting moved to the afternoon");
+    let (v, _) = env.json(&["inbox", "triage"], "");
+    assert_eq!(v["total"]["unsure"], 2, "no scorer in the fixture chain: {v}");
+    let (none, _) = env.json(&["job", "prepare", "triage"], "");
+    assert!(none["job"].is_null() && none["skipped"].as_str().unwrap().contains("not approved"), "{none}");
+    approve_as_claude(&env);
+    let (job, _) = env.json(&["job", "prepare", "triage"], "");
+    assert_eq!(
+        (job["kind"].as_str(), job["models"][0]["entry"].as_str()),
+        (Some("triage"), Some("haiku")),
+        "claude-code defaults to haiku: {job}"
+    );
+    let prompt = job["prompt"].as_str().unwrap();
+    assert!(prompt.contains("[0]\nthe linker wants -lz") && prompt.contains("[1]\nthe meeting moved"), "{prompt}");
+    let id = job["job"].as_str().unwrap();
+    let (done, code) =
+        env.json(&["job", "finish", id, "--part", "0", "--model", "haiku"], "0 keep a link order that fails\n1 drop chatter\n");
+    assert_eq!((done["counts"]["keep"].as_u64(), done["counts"]["drop"].as_u64(), code), (Some(1), Some(1), Some(0)), "{done}");
+    let (show, _) = env.json(&["inbox", "show", "0000000008"], "");
+    assert_eq!(show["meta"]["candidates"][0]["reason"], "haiku: a link order that fails", "{show}");
+
+    // A changed [triage] chain needs a new approval.
+    env.write_abs(&config, "[observer]\nclaude-code = \"sonnet\"\npi = \"session\"\n\n[triage]\nclaude-code = \"opus\"\npi = \"small\"\n");
+    let (v, code) = env.json(&["approve", "observer"], "");
+    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{v}");
+    assert!(v["question"].as_str().unwrap().contains("triage claude-code = opus"), "{v}");
+
+    // `--ask` runs the harness's own CLI with the triage model.
+    approve_as_claude(&env);
+    let fake = env.dir.path().join("fake/pi");
+    env.write_abs(&fake, "#!/bin/sh\necho \"$*\" > \"$FAKE_CLAUDE_HOME/args.txt\"\ncat > /dev/null\necho '0 keep a cluster setting'\n");
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    inbox_item(&env, "000000000a", "note", &[], "the scheduler needs --exclusive for the GPU jobs");
+    let o = rkb_with(with_pi(&env), &["inbox", "triage", "--ask", "pi", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(v["asked"]["counts"]["keep"], 1, "{v}");
+    assert!(std::fs::read_to_string(env.dir.path().join("args.txt")).unwrap().contains("--model small"));
+}
+
+#[test]
+fn inbox_done_records_outcomes_for_triage() {
+    let env = search_kb();
+    inbox_item(
+        &env,
+        "000000000b",
+        "observed",
+        &[],
+        "- 2026-10-02 [high] (pitfall; general) `rsync -a src dst` copies the folder into dst/src; a trailing slash copies the contents.\n- 2026-10-02 [high] (fact; general) `ssh -o BatchMode=yes` fails at once instead of asking for a password.",
+    );
+    env.json(&["inbox", "triage"], "");
+    let (v, code) = env.json(&["inbox", "done", "000000000b", "--outcome", "0=add:c04e11a9f3"], "");
+    assert_eq!((v["items"][0]["removed"].as_bool(), code), (Some(false), Some(0)), "partial outcome: {v}");
+    let (show, _) = env.json(&["inbox", "show", "000000000b"], "");
+    assert_eq!(show["meta"]["candidates"][0]["outcome"], "add:c04e11a9f3");
+    let log = std::fs::read_to_string(env.dir.path().join("state/rkb/triage.jsonl")).unwrap();
+    let lines: Vec<serde_json::Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert!(lines.iter().any(|l| l["item"] == "000000000b" && l["index"] == 0 && l["verdict"].is_string()), "{log}");
+    assert!(
+        lines.iter().any(|l| l["item"] == "000000000b" && l["index"] == 0 && l["outcome"] == "add" && l["lesson"] == "c04e11a9f3"),
+        "outcome joined: {log}"
+    );
+    let (bad, code) = env.json(&["inbox", "done", "000000000b", "--outcome", "1=used"], "");
+    assert_eq!((bad["error"]["code"].as_str(), code), (Some("usage"), Some(2)), "{bad}");
+    let (v, _) = env.json(&["inbox", "done", "000000000b", "--outcome", "1=noop"], "");
+    assert_eq!(v["items"][0]["removed"], true, "{v}");
+}
+
+#[test]
+fn install_writes_the_distill_and_curate_agents() {
+    let env = Env::new();
+    let home = env.dir.path();
+    std::fs::create_dir_all(home.join(".pi")).unwrap();
+    std::fs::create_dir_all(home.join(".omp")).unwrap();
+    env.write_abs(&home.join("config/rkb/config.toml"), "[distill]\nomp = \"anthropic/claude-sonnet-5-5\"\n");
+    let (v, code) = json_with_auto(&env, Some("install"), &["install", "pi", "omp"]);
+    assert_eq!(code, Some(0), "{v}");
+    let omp = std::fs::read_to_string(home.join(".omp/agent/agents/rkb-distill.md")).unwrap();
+    assert!(omp.starts_with("---\nname: rkb-distill\n") && omp.contains("model: anthropic/claude-sonnet-5-5\n"), "pinned model: {omp}");
+    assert!(
+        omp.contains("generated-by: rkb install") && omp.contains("rkb_search") && omp.contains("rkb inbox done <item id> --outcome"),
+        "{omp}"
+    );
+    let pi = std::fs::read_to_string(home.join(".pi/agent/agents/rkb-curate.md")).unwrap();
+    assert!(!pi.contains("model:") && pi.contains("rkb dupes"), "pi keeps the session's model: {pi}");
+
+    let mine = home.join(".pi/agent/agents/rkb-distill.md");
+    std::fs::write(&mine, "---\nname: rkb-distill\n---\n\nmy own agent\n").unwrap();
+    let (v, code) = json_with_auto(&env, Some("uninstall"), &["install", "--uninstall", "pi"]);
+    assert_eq!(code, Some(0), "{v}");
+    assert!(mine.exists(), "a file without rkb's marker stays");
+    assert!(!home.join(".pi/agent/agents/rkb-curate.md").exists(), "rkb's own agent file is removed");
+}
+
+#[test]
+fn automatic_runs_are_off_by_default_and_gated() {
+    let env = search_kb();
+    inbox_item(&env, "000000000c", "transcript", &["remember"], "[user] remember that the cluster needs --exclusive for GPU jobs");
+    env.json(&["inbox", "triage"], "");
+    let (v, _) = env.json(&["status"], "");
+    assert_eq!(v["auto"]["distill"]["due"], false, "{v}");
+    assert!(v["auto"]["distill"]["reason"].as_str().unwrap().starts_with("off"), "off by default: {v}");
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[distill]\nauto = true\nbatch = 5\n");
+    let (v, _) = env.json(&["status"], "");
+    assert_eq!(v["auto"]["distill"]["due"], false, "a kept candidate of priority 1 is under a batch: {v}");
+    let path = env.dir.path().join("state/rkb/inbox/000000000c.md");
+    let text = std::fs::read_to_string(&path).unwrap().replacen("---\n\n", "priority: 3\n---\n\n", 1);
+    std::fs::write(&path, text).unwrap();
+    let (v, _) = env.json(&["status"], "");
+    assert_eq!(v["auto"]["distill"]["due"], true, "{v}");
+    let (c, _) = env.json(&["auto", "claim", "distill"], "");
+    assert_eq!(c["claimed"], true, "{c}");
+    let (gated, _) = env.json(&["auto", "claim", "distill"], "");
+    assert!(gated["claimed"] == false && gated["reason"].as_str().unwrap().contains("under 6 h"), "gated: {gated}");
+}
+
+#[test]
+fn session_start_leaves_the_inbox_to_automatic_runs() {
+    let env = search_kb();
+    for i in 0..5 {
+        inbox_item(&env, &format!("00000000d{i}"), "note", &[], "a note to distill");
+    }
+    let payload = serde_json::json!({ "session_id": "s1", "source": "startup", "cwd": env.kb() });
+    assert!(hook(&env, "session-start", &payload).contains("/rkb:distill"), "the inbox line without auto");
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[distill]\nauto = true\n");
+    let out = hook(&env, "session-start", &payload);
+    assert!(!out.contains("/rkb:distill") && !out.contains("/rkb:curate") && out.contains("rkb search"), "{out}");
+    let o = env.rkb_in(&["hook", "session-start", "--harness", "pi"], &payload.to_string());
+    assert!(stdout(&o).contains("/rkb-distill"), "pi has no automatic runs");
 }

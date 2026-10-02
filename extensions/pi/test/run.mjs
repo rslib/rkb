@@ -118,8 +118,8 @@ await commands["rkb-retro"].handler("the cmake part", ctx());
 assert.match(sent.at(-1), /^Review the work of this session/);
 assert.match(sent.at(-1), /Focus from the user, if any: the cmake part/);
 await commands["rkb-distill"].handler("", ctx());
-assert.match(sent.at(-1), /^Turn rkb inbox items into lessons/);
-assert.match(sent.at(-1), /the ids the user gave: none/);
+assert.match(sent.at(-1), /^Distill the rkb inbox into lessons/);
+assert.match(sent.at(-1), /the item ids the user gave, if any: none/);
 
 // The agent tools run `rkb tool` and return its TOON text; failures throw, as pi expects.
 assert.deepEqual(Object.keys(tools).sort(), ["rkb_add", "rkb_edit", "rkb_flag", "rkb_note", "rkb_search", "rkb_show", "rkb_used"]);

@@ -299,7 +299,7 @@ pub fn run(program: &str, args: &[String], input: &str, timeout: Duration, scrat
 pub enum Observed {
     /// `via` names the models that answered, and any that failed before them.
     Added {
-        item: distill::Item,
+        item: Box<distill::Item>,
         dropped: usize,
         via: String,
     },
@@ -465,8 +465,9 @@ impl Run {
                 signals: vec![],
                 priority: Some(priority(&self.kept)),
                 source: None,
+                candidates: vec![],
             };
-            Observed::Added { item: distill::add(state, meta, &self.kept.join("\n"))?, dropped: self.dropped, via }
+            Observed::Added { item: Box::new(distill::add(state, meta, &self.kept.join("\n"))?), dropped: self.dropped, via }
         };
         crate::hooks::append(state, &self.session, &json!({ "kind": "observed", "offset": self.end }))?;
         record(state, &self.session, self.parts.len(), &o, self.first_dropped.as_deref());
@@ -688,6 +689,7 @@ mod tests {
             signals: vec![],
             priority: None,
             source: None,
+            candidates: vec![],
         };
         let note = "- 2026-09-20 [low] (fact; project) a note";
         distill::add(s, meta("/nowhere/a"), note).unwrap();

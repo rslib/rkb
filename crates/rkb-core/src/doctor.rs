@@ -95,6 +95,7 @@ pub fn run(root: &Path, place: &Place, state_dir: &Path, config_dir: &Path, env:
     }
     out.push(trust_check(config_dir));
     out.push(observer_check(config_dir, state_dir));
+    out.extend(triage_check(state_dir));
     out.extend(recall_check(root, state_dir));
     for (session, g) in crate::write::graces(state_dir) {
         let until =
@@ -426,6 +427,42 @@ pub fn recall_check(root: &Path, state_dir: &Path) -> Option<Check> {
 }
 
 /// The observer: off without a command, a warning when it is not approved or its last 3 runs failed.
+/// How triage did over the last 30 days, from `triage.jsonl`; `None` before the first verdict.
+pub fn triage_check(state_dir: &Path) -> Option<Check> {
+    let since = crate::request::now().saturating_sub(30 * 86400);
+    let text = std::fs::read_to_string(state_dir.join(crate::triage::LOG)).ok()?;
+    let mut verdicts = std::collections::BTreeMap::new();
+    let mut outcomes = std::collections::BTreeMap::new();
+    for v in text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {
+        if v["time"].as_u64().is_none_or(|t| t < since) {
+            continue;
+        }
+        let key = (v["item"].as_str().unwrap_or_default().to_string(), v["index"].as_u64().unwrap_or_default());
+        if let Some(verdict) = v["verdict"].as_str() {
+            verdicts.insert(key, verdict.to_string());
+        } else if let Some(op) = v["outcome"].as_str() {
+            outcomes.insert(key, op.to_string());
+        }
+    }
+    if verdicts.is_empty() {
+        return None;
+    }
+    let total = verdicts.len();
+    let unsure = verdicts.values().filter(|v| *v == "unsure").count();
+    let kept: Vec<_> = verdicts.iter().filter(|(_, v)| *v == "keep").map(|(k, _)| k).collect();
+    let became = kept.iter().filter(|k| outcomes.get(**k).is_some_and(|o| matches!(o.as_str(), "add" | "update" | "supersede"))).count();
+    let detail = format!("{total} candidates in 30 days: {unsure} unsure, {} kept, {became} of them became lessons", kept.len());
+    let fix = "move `keep` and `drop` under [triage] in config.toml closer together; `rkb inbox show <id>` shows the scores";
+    if unsure * 10 > total * 3 {
+        return Some(check("triage", Level::Warn, format!("{detail}; over 30% unsure"), Some(fix.into())));
+    }
+    if kept.len() >= 20 && became * 2 < kept.len() {
+        let fix = "raise `keep` under [triage] in config.toml, since many kept candidates did not become lessons";
+        return Some(check("triage", Level::Warn, format!("{detail}; under half of the kept became lessons"), Some(fix.into())));
+    }
+    Some(check("triage", Level::Ok, detail, None))
+}
+
 pub fn observer_check(config_dir: &Path, state_dir: &Path) -> Check {
     use crate::observer;
     let cfg = match observer::load(config_dir) {
@@ -510,6 +547,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn triage_check_warns_on_a_wide_band() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        assert!(triage_check(state).is_none(), "no line before the first verdict");
+        let now = crate::request::now();
+        let line = |i: usize, v: &str| format!("{{\"time\":{now},\"item\":\"a\",\"index\":{i},\"verdict\":\"{v}\"}}\n");
+        let mut log: String = (0..40).map(|i| line(i, "unsure")).collect();
+        log.extend((40..100).map(|i| line(i, "drop")));
+        std::fs::write(state.join(crate::triage::LOG), &log).unwrap();
+        let c = triage_check(state).unwrap();
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.detail.contains("40 unsure") && c.fix.as_deref().unwrap().contains("`keep` and `drop` under [triage]"), "{c:?}");
+        let mut fine: String = (0..10).map(|i| line(i, "unsure")).collect();
+        fine.extend((10..100).map(|i| line(i, "drop")));
+        std::fs::write(state.join(crate::triage::LOG), &fine).unwrap();
+        assert_eq!(triage_check(state).unwrap().level, Level::Ok);
+    }
+
+    #[test]
     fn hook_check_warns_when_a_session_ran_twice() {
         let dir = tempfile::tempdir().unwrap();
         let (home, state) = (dir.path().join("home"), dir.path().join("state"));
@@ -587,7 +643,7 @@ mod tests {
         crate::approval::add(
             &config,
             crate::approval::Approval {
-                sha256: crate::script::hash("claude-code = sonnet, haiku"),
+                sha256: crate::script::hash("claude-code = sonnet, haiku\ntriage claude-code = haiku"),
                 system: crate::observer::system(),
                 lesson: "observer".into(),
                 kind: "observer".into(),
@@ -595,7 +651,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(observer_check(&config, &state).detail, "claude-code = sonnet, haiku; no run yet");
+        assert_eq!(observer_check(&config, &state).detail, "claude-code = sonnet, haiku; triage claude-code = haiku; no run yet");
         std::fs::create_dir_all(&state).unwrap();
         let line =
             |o: &str, d: &str| format!("{{\"time\":1790000000,\"session\":\"s\",\"parts\":1,\"outcome\":\"{o}\",\"detail\":\"{d}\"}}\n");

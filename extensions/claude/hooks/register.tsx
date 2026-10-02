@@ -119,12 +119,13 @@ async function refresh($: EngineInterface, session: Session): Promise<void> {
   }
 }
 
-/** One observer run through model jobs: rkb prepares each part, the session's own client answers it. */
-async function observe($: EngineInterface, session: Session): Promise<void> {
-  if (!session.transcript) return
+/**
+ * Runs one model job of any kind: rkb prepares each part, the session's own client answers it, and rkb
+ * handles the answer. Returns the last thing rkb printed.
+ */
+async function runJob($: EngineInterface, session: Session, prepare: string[]): Promise<Json | undefined> {
   const model = await $.session.model()
-  const args = ['job', 'prepare', 'observe', '--session', session.id, '--transcript', session.transcript, '--harness', 'claude-code', '--cwd', session.cwd, '--model', model]
-  let step = (await rkb($, args, { cwd: session.cwd, timeoutMs: JOB_TIMEOUT_MS })).data
+  let step = (await rkb($, [...prepare, '--model', model], { cwd: session.cwd, timeoutMs: JOB_TIMEOUT_MS })).data
   while (step?.job && step.prompt) {
     const finish = ['job', 'finish', step.job, '--part', String(step.part)]
     const failures: string[] = []
@@ -141,11 +142,22 @@ async function observe($: EngineInterface, session: Session): Promise<void> {
     }
     if (!answered) {
       await rkb($, [...finish, '--failed', failures.join('; ')], { cwd: session.cwd })
-      return
+      return undefined
     }
-    if (next?.outcome === 'added') $.ui.toast(`rkb: ${plural(next.notes, 'note')} for the inbox`)
     step = next
   }
+  return step
+}
+
+/** One observer run, then triage of the inbox and the small model for what triage left unsure. */
+async function observe($: EngineInterface, session: Session): Promise<void> {
+  if (session.transcript) {
+    const prepare = ['job', 'prepare', 'observe', '--session', session.id, '--transcript', session.transcript, '--harness', 'claude-code', '--cwd', session.cwd]
+    const done = await runJob($, session, prepare)
+    if (done?.outcome === 'added') $.ui.toast(`rkb: ${plural(done.notes, 'note')} for the inbox`)
+  }
+  await rkb($, ['inbox', 'triage'], { cwd: session.cwd, timeoutMs: JOB_TIMEOUT_MS })
+  await runJob($, session, ['job', 'prepare', 'triage', '--harness', 'claude-code'])
 }
 
 async function say($: EngineInterface, tone: Notice['tone'], text: string): Promise<void> {
@@ -189,7 +201,14 @@ async function openItem($: EngineInterface, row: InboxRow): Promise<void> {
 async function show($: EngineInterface, v: View): Promise<void> {
   if (v === 'inbox') {
     const r = await rkb($, ['inbox'])
-    const rows: InboxRow[] = (r.data?.items ?? []).map((i: Json) => ({ id: i.id, kind: i.kind, priority: i.priority, age: i.age, preview: i.preview }))
+    const rows: InboxRow[] = (r.data?.items ?? []).map((i: Json) => ({
+      id: i.id,
+      kind: i.kind,
+      priority: i.priority,
+      age: i.age,
+      preview: i.preview,
+      verdicts: i.verdicts ?? null,
+    }))
     await update($, inbox, () => rows)
   }
   await update($, notice, () => null)
@@ -226,13 +245,61 @@ async function runCommand($: EngineInterface, name: 'distill' | 'curate' | 'retr
   void $.command.run({ command: `rkb:${name}` }).catch(() => say($, 'fail', `Claude Code did not run /rkb:${name}.`))
 }
 
+/** Runs triage on the inbox and redraws it with the verdicts; triage changes no lesson. */
+async function triageNow($: EngineInterface, cwd: string | undefined): Promise<void> {
+  await say($, 'busy', 'Triaging the inbox...')
+  const r = await rkb($, ['inbox', 'triage'], { cwd, timeoutMs: JOB_TIMEOUT_MS })
+  const t = r.data?.total
+  const text = r.ok && t ? `Triaged: ${t.keep} keep, ${t.known} known, ${t.unsure} unsure, ${t.drop} drop` : 'rkb inbox triage failed'
+  await show($, 'inbox')
+  await say($, r.ok ? 'ok' : 'fail', text)
+}
+
+/** `2 keep · 1 drop` for a row's verdicts; nothing before triage. */
+function verdictText(v: InboxRow['verdicts']): string {
+  if (!v) return ''
+  return (
+    [
+      [v.keep, 'keep'],
+      [v.known, 'known'],
+      [v.unsure, 'unsure'],
+      [v.drop, 'drop'],
+    ] as const
+  )
+    .filter(([n]) => n > 0)
+    .map(([n, w]) => `${n} ${w}`)
+    .join(DOT)
+}
+
 /** A 10-cell bar for a relevance from 0 to 1. */
 function bar(relevance: number): string {
   const fill = Math.max(0, Math.min(10, Math.round(relevance * 10)))
   return BAR_FULL.repeat(fill) + BAR_EMPTY.repeat(10 - fill)
 }
 
-type Live = { session?: Session; isOff: boolean; isObserving: boolean; tools: Set<string> }
+// `start` is the session context rkb prints at session start, delivered with the next prompt.
+type Live = { session?: Session; isOff: boolean; isObserving: boolean; tools: Set<string>; start?: Promise<string> }
+type AutoKind = 'distill' | 'curate'
+
+const AUTO_TASK: Record<AutoKind, string> = {
+  distill: 'Distill the triaged rkb inbox into lessons, as your steps say.',
+  curate: 'Curate the rkb knowledge base, as your steps say.',
+}
+
+/**
+ * Starts the agent for an automatic run when rkb says one is due and this session wins the claim. rkb
+ * holds the gates (`[distill] auto`, the gap since the last run) and records the start in the claim.
+ */
+async function autoRun($: EngineInterface, session: Session, kind: AutoKind): Promise<boolean> {
+  const claim = await rkb($, ['auto', 'claim', kind], { cwd: session.cwd })
+  if (claim.data?.claimed !== true) return false
+  const started = await $.agent
+    .spawn({ subagentType: `rkb:${kind}`, description: `rkb ${kind}`, prompt: AUTO_TASK[kind] })
+    .then(r => !r.deny)
+    .catch(() => false)
+  if (started) $.ui.toast(`rkb: ${kind} started in the background`)
+  return started
+}
 
 // Claude Code lists a mod's tool as `mcp__<plugin>__<name>`, so `rkb_search` becomes `mcp__rkb__search`.
 const TOOL_PREFIX = 'mcp__rkb__'
@@ -253,6 +320,14 @@ async function registerTools($: EngineInterface, tools: Set<string>): Promise<vo
     )
     if (ok) tools.add(TOOL_PREFIX + name)
   }
+}
+
+/** The session context started at session start, or '' once `UI_TIMEOUT_MS` passed. */
+async function startContext($: EngineInterface, live: Live): Promise<string> {
+  const start = live.start
+  live.start = undefined
+  if (!start) return ''
+  return Promise.race([start, $.clock.sleep(UI_TIMEOUT_MS).then(() => '')])
 }
 
 /** Runs `rkb tool rkb_<name>` for a call of `mcp__rkb__<name>`; a failure is a refusal the model reads as an error. */
@@ -313,6 +388,7 @@ function turnEnded($: EngineInterface, live: Live, e: { session_id: string; cwd:
     live.isObserving = true
     try {
       await observe($, s)
+      if (!(await autoRun($, s, 'distill'))) await autoRun($, s, 'curate')
     } finally {
       live.isObserving = false
     }
@@ -328,11 +404,14 @@ export const register: Register = on => {
       const s: Session = { id: await $.session.id(), cwd: e.cwd }
       live.session = s
       // `/rkb` belongs to the plugin's skill, so Claude Code refuses it for a mod command.
-      await $.command
-        .register({ name: COMMAND, description: 'Search lessons, read the inbox and answer rkb requests in a pane' })
-        .catch(() => undefined)
-      await registerTools($, live.tools)
-      later($, () => refresh($, s))
+      // Nothing here holds the first prompt: the command, the tools and the status come in the background.
+      later($, async () => {
+        await Promise.all([
+          $.command.register({ name: COMMAND, description: 'Search lessons, read the inbox and answer rkb requests in a pane' }).catch(() => undefined),
+          registerTools($, live.tools),
+          refresh($, s),
+        ])
+      })
     }
     return next(e)
   })
@@ -354,14 +433,18 @@ export const register: Register = on => {
   // Every event but PreToolUse goes to `rkb hook --mod`; the plugin's command hooks of this session then do
   // nothing, because `RKB_MOD` names it. The confirm gate stays a command hook: only its input has
   // `permission_mode`.
+  // The session context is built in the background and goes with the next prompt, the first time the
+  // model runs, so a session never waits for rkb to start.
   on('classic.SessionStart', async ($, e, next) => {
     await $.env.set('RKB_MOD', e.session_id)
-    const r = await next(e)
-    return withReply(r, await hook($, 'session-start', e))
+    let resolve: (text: string) => void = () => undefined
+    live.start = new Promise(r => (resolve = r))
+    later($, async () => resolve(await hook($, 'session-start', e)))
+    return next(e)
   })
 
   on('classic.UserPromptSubmit', async ($, e, next) => {
-    const r = await next(e)
+    const r = withReply(await next(e), await startContext($, live))
     return withReply(r, await hook($, 'prompt', e))
   })
 
@@ -610,9 +693,10 @@ export const register: Register = on => {
       )
     } else if (v === 'inbox') {
       const rows = await read($, inbox)
-      const room = Math.max(10, width - 20)
+      const room = Math.max(10, width - 34)
       const actions = (
         <Box key="actions" gap={3} marginBottom={1}>
+          {button('triage', 'Triage', hot('g'), () => triageNow($, live.session?.cwd), rows.some(row => !row.verdicts))}
           {button('distill', 'Distill', hot('d'), () => runCommand($, 'distill'), rows.length > 0)}
           {button('curate', `Curate ${s?.curate ?? 0}`, hot('c'), () => runCommand($, 'curate'), (s?.curate ?? 0) > 0)}
           {button('retro', 'Retro', hot('t'), () => runCommand($, 'retro'))}
@@ -640,7 +724,9 @@ export const register: Register = on => {
                         </Box>
                         {button(`open-${row.id}`, cut(row.preview, room), undefined, () => openItem($, row))}
                       </Box>
-                      <Text dimColor>{row.age}</Text>
+                      <Text dimColor>
+                        {[verdictText(row.verdicts), row.age].filter(Boolean).join(DOT)}
+                      </Text>
                     </Box>
                   ))}
                 </Box>

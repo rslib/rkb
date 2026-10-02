@@ -201,13 +201,22 @@ test('the observer runs a job after a turn', async ($, on) => {
   })
   const calls: Call[] = []
   const job = { job: 'j-0a1b2c3d', kind: 'observe', models: [{ entry: 'sonnet', model: 'sonnet' }], part: 0, parts: 1, prompt: 'the prompt' }
-  fakeRkb(on, { status: statusOf(), 'job prepare': job, 'job finish': { outcome: 'added', id: 'abc', notes: 1, dropped: 0, via: 'sonnet' } }, calls)
+  fakeRkb(
+    on,
+    {
+      status: statusOf(),
+      'job prepare': (c: Call) => (c.args[2] === 'observe' ? job : { job: null }),
+      'job finish': { outcome: 'added', id: 'abc', notes: 1, dropped: 0, via: 'sonnet' },
+    },
+    calls,
+  )
   await stop($, clock)
   expect(asked).toEqual(['sonnet'])
   const finish = calls.find(c => c.args[1] === 'finish')
   expect(finish?.args).toEqual(['job', 'finish', 'j-0a1b2c3d', '--part', '0', '--model', 'sonnet', '--format', 'json'])
+  expect(calls.some(c => c.args.join(' ') === 'inbox triage --format json')).toBe(true)
   expect(finish?.stdin).toBe('- 2026-10-02 [high] (pitfall; general) note')
-  const prepare = calls.find(c => c.args[1] === 'prepare')
+  const prepare = calls.find(c => c.args[1] === 'prepare' && c.args[2] === 'observe')
   expect(prepare?.args).toContain('/t/s1.jsonl')
   expect(seen.toasts).toContain('rkb: 1 note for the inbox')
 })
@@ -238,7 +247,7 @@ test('recall reaches the prompt through the mod', async ($, on) => {
   expect(JSON.parse(call?.stdin ?? '{}').prompt).toBe('why does cmake not find hdf5')
 })
 
-test('session start names the session in RKB_MOD before the command hooks run', async ($, on) => {
+test('session start names the session in RKB_MOD and its context goes with the first prompt', async ($, on) => {
   world(on)
   const env: Record<string, string | undefined> = {}
   on('env.set', (_$, e) => {
@@ -250,10 +259,17 @@ test('session start names the session in RKB_MOD before the command hooks run', 
     seenByCommandHooks = env.RKB_MOD
     return {}
   })
-  fakeRkb(on, { 'hook session-start': 'rkb: no project, no system' }, [])
+  on('classic.UserPromptSubmit', () => ({}))
+  const clock = mock.clock(on)
+  fakeRkb(on, { 'hook session-start': 'rkb: no project, no system', 'hook prompt': '' }, [])
   const r = await $.classic.SessionStart({ ...STOP, source: 'startup' })
   expect(seenByCommandHooks).toBe('s1')
-  expect(r.additionalContext).toEqual(['rkb: no project, no system'])
+  expect(r.additionalContext).toBe(undefined)
+  await clock.settle()
+  const first = await $.classic.UserPromptSubmit({ ...STOP, prompt: 'hi' })
+  expect(first.additionalContext).toEqual(['rkb: no project, no system'])
+  const second = await $.classic.UserPromptSubmit({ ...STOP, prompt: 'again' })
+  expect(second.additionalContext).toBe(undefined)
 })
 
 test('a stop reply that blocks keeps the reason', async ($, on) => {
@@ -293,9 +309,10 @@ test('the tools register under short names and none confirms', async ($, on) => 
   })
   on('command.register', (_$, e) => ({ value: { command: e.name } }) as never)
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
-  mock.clock(on)
+  const clock = mock.clock(on)
   fakeRkb(on, { tools: TOOLS }, [])
   await $.session.start({ cwd: '/work/demo', surface: 'terminal', isInteractive: true })
+  await clock.settle()
   expect(names).toEqual(['search', 'show', 'add', 'note', 'used', 'flag', 'edit'])
   expect(names.some(n => n.includes('confirm'))).toBe(false)
 })
@@ -305,10 +322,11 @@ test('a tool call runs rkb tool', async ($, on) => {
   on('tool.register', (_$, e) => ({ value: { name: e.name } }) as never)
   on('command.register', (_$, e) => ({ value: { command: e.name } }) as never)
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
-  mock.clock(on)
+  const clock = mock.clock(on)
   const calls: Call[] = []
   fakeRkb(on, { tools: TOOLS, tool: (c: Call) => (c.args[1] === 'rkb_search' ? 'results[1]{id}:\n  7f3a9c2b41' : '') }, calls)
   await $.session.start({ cwd: '/work/demo', surface: 'terminal', isInteractive: true })
+  await clock.settle()
   calls.length = 0
   const r = await $.tool.call({ tool: 'mcp__rkb__search', tool_use_id: 't1', query: 'undefined reference to vtable' } as never)
   expect(r).toMatchObject({ result: 'results[1]{id}:\n  7f3a9c2b41' })
@@ -330,10 +348,11 @@ test('the MCP copies move behind ToolSearch once the mod has its tools', async (
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('tool.describe', (_$, e) => ({ description: `${e.tool} description` }))
   on('tool.call', () => ({ result: 'from the MCP server' }))
-  mock.clock(on)
+  const clock = mock.clock(on)
   const calls: Call[] = []
   fakeRkb(on, { tools: TOOLS }, calls)
   await $.session.start({ cwd: '/work/demo', surface: 'terminal', isInteractive: true })
+  await clock.settle()
   expect((await $.tool.describe({ tool: 'mcp__plugin_rkb_rkb__rkb_search', description: 'd' } as never)).isDeferred).toBe(true)
   expect((await $.tool.describe({ tool: 'mcp__rkb__search', description: 'd' } as never)).isDeferred).toBe(undefined)
   expect((await $.tool.describe({ tool: 'Bash', description: 'd' } as never)).isDeferred).toBe(undefined)
@@ -358,4 +377,111 @@ test('the inbox actions queue the plugin commands', async ($, on) => {
   await clock.settle()
   expect(ran).toEqual(['rkb:distill', 'rkb:curate', 'rkb:retro'])
   expect((await ui.find({ key: 'notice' }))?.text).toContain('Queued /rkb:retro')
+})
+
+test('after the observer, triage runs and the small model answers the unsure candidates', async ($, on) => {
+  const clock = mock.clock(on)
+  world(on)
+  const asked: { model: string; prompt: string }[] = []
+  on('model.complete', (_$, e) => {
+    asked.push({ model: e.model, prompt: e.prompt })
+    const usage = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+    return { value: { isAnswered: true, text: '0 keep a link order that fails', usage } }
+  })
+  const calls: Call[] = []
+  const job = { job: 'j-11112222', kind: 'triage', models: [{ entry: 'haiku', model: 'haiku' }], part: 0, parts: 1, prompt: 'triage prompt' }
+  fakeRkb(
+    on,
+    {
+      status: statusOf(),
+      'job prepare': (c: Call) => (c.args[2] === 'triage' ? job : { job: null }),
+      'job finish': { outcome: 'triaged', counts: { keep: 1, known: 0, unsure: 0, drop: 0 }, via: 'haiku' },
+      inbox: { total: { keep: 0 } },
+    },
+    calls,
+  )
+  await stop($, clock)
+  expect(asked).toEqual([{ model: 'haiku', prompt: 'triage prompt' }])
+  const finish = calls.find(c => c.args[1] === 'finish')
+  expect(finish?.args.slice(0, 7)).toEqual(['job', 'finish', 'j-11112222', '--part', '0', '--model', 'haiku'])
+  expect(finish?.stdin).toBe('0 keep a link order that fails')
+  const order = calls.map(c => c.args.slice(0, 3).join(' '))
+  expect(order.indexOf('inbox triage --format')).toBeLessThan(order.indexOf('job prepare triage'))
+})
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`the inbox shows verdicts and triages from the pane (${surface})`, async ($, on) => {
+    const clock = mock.clock(on)
+    world(on)
+    const calls: Call[] = []
+    let triaged = false
+    const row = (verdicts: Json | undefined) => ({ id: 'aaaaaaaaaa', kind: 'observed', priority: 3, age: '2 h', preview: 'a note', ...(verdicts ? { verdicts } : {}) })
+    fakeRkb(
+      on,
+      {
+        status: statusOf(),
+        'job prepare': { job: null },
+        inbox: (c: Call) =>
+          c.args[1] === 'triage'
+            ? ((triaged = true), { items: [], total: { keep: 2, known: 0, unsure: 0, drop: 1 } })
+            : { items: [row(triaged ? { keep: 2, known: 0, unsure: 0, drop: 1 } : undefined)] },
+      },
+      calls,
+    )
+    await stop($, clock)
+    const ui = await $.ui.mount({
+      plugin: 'rkb',
+      surface,
+      component: 'Pane',
+      requestId: 'rkb',
+      props: { title: 'rkb', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} },
+    })
+    await ui.press({ key: 'view-inbox' })
+    const triages = () => calls.filter(c => c.args.slice(0, 2).join(' ') === 'inbox triage').length
+    const before = triages()
+    expect(before).toBe(1)
+    await ui.press({ key: 'triage' })
+    expect(triages()).toBe(before + 1)
+    expect((await ui.find({ key: 'item-aaaaaaaaaa' }))?.text).toContain('2 keep')
+    expect((await ui.find({ key: 'notice' }))?.text).toContain('2 keep, 0 known, 0 unsure, 1 drop')
+  })
+}
+
+test('a due automatic distill starts its agent', async ($, on) => {
+  const clock = mock.clock(on)
+  const seen = world(on)
+  const spawned: Json[] = []
+  on('agent.spawn', (_$, e) => {
+    // The test loads no agent files, so the engine cannot resolve `rkb:distill`; check what the mod sent.
+    spawned.push({ description: e.description, prompt: e.prompt })
+    return { model: 'sonnet' } as never
+  })
+  const calls: Call[] = []
+  fakeRkb(
+    on,
+    {
+      status: statusOf(),
+      'job prepare': { job: null },
+      inbox: { total: { keep: 0 } },
+      auto: (c: Call) => ({ claimed: c.args[2] === 'distill', reason: 'x' }),
+    },
+    calls,
+  )
+  await stop($, clock)
+  expect(spawned).toEqual([{ description: 'rkb distill', prompt: 'Distill the triaged rkb inbox into lessons, as your steps say.' }])
+  expect(calls.some(c => c.args.slice(0, 3).join(' ') === 'auto claim curate')).toBe(false)
+  expect(seen.toasts).toContain('rkb: distill started in the background')
+})
+
+test('no automatic run without a claim', async ($, on) => {
+  const clock = mock.clock(on)
+  world(on)
+  let spawns = 0
+  on('agent.spawn', () => {
+    spawns += 1
+    return { deny: 'not expected' } as never
+  })
+  fakeRkb(on, { status: statusOf(), 'job prepare': { job: null }, inbox: { total: {} }, auto: { claimed: false, reason: 'off' } }, [])
+  await stop($, clock)
+  expect(spawns).toBe(0)
 })

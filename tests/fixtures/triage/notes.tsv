@@ -1,0 +1,30 @@
+keep	- 2026-09-10 [high] (pitfall; general) `make -j` on a 2 GB CI runner gets killed by the OOM killer with exit 137 and no compiler error; build with `make -j2` there.
+keep	- 2026-09-10 [high] (pitfall; general) In bash, `set -e` does not stop a script when the failing command is on the left of `&&`; check the status explicitly or use `|| exit 1`.
+keep	- 2026-09-11 [med] (fact; general) `git worktree add` refuses a branch that is checked out in another worktree; pass `--detach` or a new branch name.
+keep	- 2026-09-11 [high] (pitfall; general) Python's `subprocess.run(..., capture_output=True)` with a child that writes more than the pipe buffer never deadlocks, but `Popen.wait()` with `stdout=PIPE` does; use `communicate()`.
+keep	- 2026-09-12 [med] (preference; general) The user wants commit subjects in the imperative mood and lowercase, with no trailing period, because the changelog is generated from them.
+keep	- 2026-09-12 [high] (pitfall; general) A YAML value `no` parses as boolean false in YAML 1.1 loaders; quote country codes such as `"NO"`.
+keep	- 2026-09-13 [med] (decision; general) Keep generated files out of the repository and rebuild them in CI, because two hand merges of generated code went wrong; rejected: committing them with a check.
+keep	- 2026-09-13 [high] (pitfall; general) `rsync -a src dst` copies the folder into `dst/src`; with a trailing slash, `src/`, it copies the contents.
+keep	- 2026-09-14 [med] (fact; general) `ssh -o BatchMode=yes` fails at once instead of asking for a password, which keeps scripted logins from hanging.
+keep	- 2026-09-14 [high] (pitfall; general) Docker `COPY . .` before `RUN pip install` reruns the install on every source change; copy the requirements file first so the layer caches.
+keep	- 2026-09-15 [med] (preference; general) The user wants error messages to say what to run next, not only what failed.
+keep	- 2026-09-15 [high] (pitfall; general) `find . -name *.log` lets the shell expand the glob first and fails when one log is in the current folder; quote the pattern.
+keep	- 2026-09-16 [med] (fact; general) `jq -r` prints strings without quotes, so `jq -r .name` is safe to use in a shell variable while `jq .name` is not.
+keep	- 2026-09-16 [high] (pitfall; general) A cron job runs with a minimal PATH, so a command that works in the terminal fails with `command not found`; use absolute paths or set PATH in the crontab.
+keep	- 2026-09-17 [med] (decision; general) Store timestamps as UTC and convert at display time, because local times broke sorting across the daylight saving switch; rejected: storing the offset.
+drop	- 2026-09-18 [low] (fact; project) The release went out this morning and the tag is pushed.
+drop	- 2026-09-18 [low] (fact; project) We have 42 open issues left before the milestone.
+drop	- 2026-09-18 [low] (decision; project) Next step is to look at the flaky test tomorrow.
+drop	- 2026-09-19 [low] (fact; project) The user said thanks and the session ended.
+drop	- 2026-09-19 [low] (fact; project) The build server is busy today, so the job waited ten minutes.
+drop	- 2026-09-19 [low] (fact; project) I renamed the variable `tmp` to `buffer` in parser.rs.
+drop	- 2026-09-20 [low] (fact; project) The meeting about the roadmap moved to Thursday.
+drop	- 2026-09-20 [low] (fact; project) Tests pass now after the change.
+drop	- 2026-09-20 [low] (decision; project) We will maybe revisit the logging format later.
+drop	- 2026-09-21 [low] (fact; project) The file config.yaml has 120 lines.
+drop	- 2026-09-21 [low] (fact; project) The user opened three terminal tabs.
+drop	- 2026-09-21 [low] (fact; project) The function was moved from utils.py to helpers.py as asked.
+drop	- 2026-09-22 [low] (fact; project) Work on the parser is in progress.
+drop	- 2026-09-22 [low] (fact; project) The coffee machine on the third floor is broken.
+drop	- 2026-09-22 [low] (fact; project) The PR got two approvals.

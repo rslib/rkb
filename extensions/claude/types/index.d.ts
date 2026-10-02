@@ -5,7 +5,8 @@ export type Hit = { id: string; title: string; relevance: string | null; kind: s
 export type Lesson = { id: string; title: string; body: string; kind: string; status: string; path: string; applies: string }
 export type Item = { id: string; title: string; body: string; kind: string; priority: number; age: string; cwd: string }
 export type Notice = { tone: 'ok' | 'fail' | 'busy'; text: string }
-export type InboxRow = { id: string; kind: string; priority: number; age: string; preview: string }
+export type Verdicts = { keep: number; known: number; unsure: number; drop: number }
+export type InboxRow = { id: string; kind: string; priority: number; age: string; preview: string; verdicts: Verdicts | null }
 export type View = 'search' | 'lesson' | 'inbox' | 'item' | 'requests'
 
 declare module 'claude-code' {

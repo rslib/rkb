@@ -66,13 +66,30 @@ pub fn waiting(env: &Env, session: Option<&str>) -> Result<Output, CliError> {
             ));
         }
     }
+    let gate = |kind| {
+        let g = rkb_core::auto::gate(&env.state, &rkb_core::paths::config_dir(), kind, curate, rkb_core::request::now());
+        json!({ "due": g.due, "reason": g.reason })
+    };
     let data = json!({
         "inbox": { "total": items.len(), "priority": { "1": by_priority[0], "2": by_priority[1], "3": by_priority[2] } },
         "curate": curate,
         "requests": requests,
         "injected": injected,
+        "auto": { "distill": gate(rkb_core::auto::Kind::Distill), "curate": gate(rkb_core::auto::Kind::Curate) },
     });
     Ok(Output { data, human: human.trim_end().to_string(), exit: 0, raw: false })
+}
+
+/// `rkb auto claim <distill|curate>`: lets one session start an automatic run.
+pub fn auto(env: &Env, kind: &str) -> Result<Output, CliError> {
+    use rkb_core::auto::{self, Kind};
+    let kind = Kind::parse(kind)
+        .ok_or_else(|| CliError::new(crate::output::ErrorCode::Usage, format!("unknown run `{kind}`"), "use distill or curate"))?;
+    kb::open(&env.root)?;
+    let curate = rkb_core::review::curate_count(&env.root, &env.state)?;
+    let g = auto::claim(&env.state, &rkb_core::paths::config_dir(), kind, curate, rkb_core::request::now())?;
+    let human = if g.due { format!("claimed {}: {}", kind.as_str(), g.reason) } else { format!("not now: {}", g.reason) };
+    Ok(Output { data: json!({ "claimed": g.due, "reason": g.reason }), human, exit: 0, raw: false })
 }
 
 /// The live state for `rkb` with no command.

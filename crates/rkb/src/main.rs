@@ -188,6 +188,16 @@ enum Cmd {
     /// Print the current project, system and lesson counts in at most 5 lines, for a session hook.
     #[command(after_help = "Example:\n  rkb context")]
     Context,
+    /// Claim an automatic distill or curate run when one is due; the Claude Code mod starts it.
+    #[command(hide = true, after_help = "Example:\n  rkb auto claim distill")]
+    Auto {
+        /// claim.
+        #[arg(value_parser = ["claim"])]
+        action: String,
+        /// distill or curate.
+        #[arg(value_parser = ["distill", "curate"])]
+        kind: String,
+    },
     /// Print what waits for the user (inbox, curate candidates, open requests) and the lessons a session
     /// injected, in one call, for a harness UI. Changes no lesson, inbox item or request.
     #[command(after_help = "Example:\n  rkb status\n  rkb status --session 3f2a --format json")]
@@ -483,11 +493,24 @@ enum InboxCmd {
     /// Print one inbox item in full.
     #[command(after_help = "Example:\n  rkb inbox show 0a1b2c3d4e")]
     Show { id: String },
+    /// Split new inbox items into candidates and decide which are worth a lesson. Changes no lesson.
+    #[command(after_help = "Example:\n  rkb inbox triage\n  rkb inbox triage --ask pi")]
+    Triage {
+        /// Then ask the approved [triage] models about the unsure candidates through this harness's CLI.
+        #[arg(long, value_name = "HARNESS")]
+        ask: Option<String>,
+    },
     /// Remove items that became lessons or held nothing worth one.
-    #[command(after_help = "Example:\n  rkb inbox done 0a1b2c3d4e 1b2c3d4e5f")]
+    #[command(
+        after_help = "Example:\n  rkb inbox done 0a1b2c3d4e 1b2c3d4e5f\n  rkb inbox done 0a1b2c3d4e --outcome 0=add:c04e11a9f3 --outcome 1=noop"
+    )]
     Done {
         #[arg(required = true, num_args = 1..)]
         ids: Vec<String>,
+        /// What became of one candidate: `<index>=<add|update|supersede|used|noop>[:<lesson id>]`. Repeatable,
+        /// with one item id; the item goes once every candidate that is not dropped has one.
+        #[arg(long, value_name = "INDEX=OP[:ID]")]
+        outcome: Vec<String>,
     },
 }
 
@@ -516,6 +539,16 @@ enum JobCmd {
 
 #[derive(Subcommand)]
 enum PrepareCmd {
+    /// The unsure triage candidates, for the approved [triage] models.
+    #[command(after_help = "Example:\n  rkb job prepare triage --harness claude-code")]
+    Triage {
+        /// claude-code, pi or omp.
+        #[arg(long, default_value = "claude-code")]
+        harness: String,
+        /// The session's model, for a chain entry `session`.
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// The observer over the new part of one session, with the approved [observer] models.
     #[command(after_help = "Example:\n  rkb job prepare observe --session 3f2a --transcript ~/.claude/projects/p/3f2a.jsonl")]
     Observe {
@@ -785,6 +818,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             Ok(session::context(&s))
         }
         Cmd::Status { session } => session::waiting(&env, session.as_deref()),
+        Cmd::Auto { kind, .. } => session::auto(&env, &kind),
         Cmd::Doctor { break_lock } => session::doctor(&env, &env.place.clone().unwrap_or_default(), break_lock),
         Cmd::List { folder } => {
             kb::open(&root)?;
@@ -873,12 +907,16 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Job { action: JobCmd::Prepare { kind: PrepareCmd::Observe { session, transcript, harness, cwd, model } } } => {
             inbox::prepare_observe(&env, &session, &transcript, &harness, cwd.as_deref(), model.as_deref())
         }
+        Cmd::Job { action: JobCmd::Prepare { kind: PrepareCmd::Triage { harness, model } } } => {
+            inbox::prepare_triage(&env, &harness, model.as_deref())
+        }
         Cmd::Job { action: JobCmd::Finish { id, part, model, failed } } => {
             inbox::finish(&env, &id, part, model.as_deref(), failed.as_deref())
         }
         Cmd::Inbox { action: None } => inbox::list(&env),
         Cmd::Inbox { action: Some(InboxCmd::Show { id }) } => inbox::show(&env, &id),
-        Cmd::Inbox { action: Some(InboxCmd::Done { ids }) } => inbox::done(&env, &ids),
+        Cmd::Inbox { action: Some(InboxCmd::Triage { ask }) } => inbox::triage(&env, ask.as_deref()),
+        Cmd::Inbox { action: Some(InboxCmd::Done { ids, outcome }) } => inbox::done(&env, &ids, &outcome),
         Cmd::Models { action: ModelsCmd::Fetch } => models_fetch(env.colored),
         Cmd::Models { action: ModelsCmd::Warm } => {
             kb::open(&root)?;

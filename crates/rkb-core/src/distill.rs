@@ -60,6 +60,59 @@ pub struct Meta {
     /// Where an imported note came from, such as a Claude Code memory file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// What triage decided for each part of the item; empty until `rkb inbox triage` ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<Candidate>,
+}
+
+/// What triage decided about one candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    /// Worth a lesson; distill takes it.
+    Keep,
+    /// Already a lesson; distill records its use or extends it.
+    Known,
+    /// Not decided yet; the small model's job takes it.
+    Unsure,
+    /// Not worth a lesson; kept in the item until it expires, with the reason.
+    Drop,
+}
+
+impl Verdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Keep => "keep",
+            Verdict::Known => "known",
+            Verdict::Unsure => "unsure",
+            Verdict::Drop => "drop",
+        }
+    }
+}
+
+/// One part of an item that becomes at most one lesson: a note line of an `observed` item, or the whole
+/// of a `note` or `transcript` item.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Candidate {
+    pub index: usize,
+    /// The body line (from 0) of an observed note; `None` for the whole item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    pub verdict: Verdict,
+    /// What decided it: `rule`, `remember`, `known`, a scorer such as `jev`, or a model.
+    pub reason: String,
+    /// The worth score from 0 to 1, when a scorer gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    /// The lesson a `known` candidate already is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson: Option<String>,
+    /// The lesson type a scorer thought most likely, such as `pitfall`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// What distill did with it: `add`, `update`, `supersede`, `used` or `noop`, with a lesson id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 impl Meta {
@@ -137,6 +190,19 @@ pub fn add(state: &Path, meta: Meta, body: &str) -> Result<Item> {
     f.sync_all().map_err(io(&tmp))?;
     std::fs::rename(&tmp, file(state, &id)).map_err(io(&tmp))?;
     Ok(item)
+}
+
+/// Writes an existing item again, as `add` writes a new one: a temporary file, then a rename.
+pub fn save(state: &Path, item: &Item) -> Result<()> {
+    if !valid_id(&item.id) {
+        return Err(Error::NotFound(format!("inbox item {}", item.id)));
+    }
+    let d = dir(state);
+    let tmp = d.join(format!(".{}.tmp", item.id));
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).map_err(io(&tmp))?;
+    f.write_all(item.text().as_bytes()).map_err(io(&tmp))?;
+    f.sync_all().map_err(io(&tmp))?;
+    std::fs::rename(&tmp, file(state, &item.id)).map_err(io(&tmp))
 }
 
 /// Every item, oldest first. Files that do not parse are skipped.
@@ -549,6 +615,7 @@ pub fn capture(state: &Path, harness: &str, session: &str, transcript: &Path, cw
             signals: signals.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect(),
             priority: Some(crate::hooks::score(since, &records).clamp(1, 3) as u8),
             source: None,
+            candidates: vec![],
         };
         Some(add(state, meta, &body)?)
     };
@@ -639,6 +706,7 @@ pub fn import_notes(state: &Path, notes: &[(String, String)]) -> Result<(usize, 
             signals: vec![],
             priority: Some(2),
             source: Some(source.clone()),
+            candidates: vec![],
         };
         add(state, meta, text)?;
         crate::lock::append_line(&log, &serde_json::json!({ "hash": hash, "source": source }).to_string())?;
@@ -671,7 +739,54 @@ mod tests {
     }
 
     fn note(time: u64) -> Meta {
-        Meta { kind: Kind::Note, time, harness: None, session: None, cwd: None, signals: vec![], priority: None, source: None }
+        Meta {
+            kind: Kind::Note,
+            time,
+            harness: None,
+            session: None,
+            cwd: None,
+            signals: vec![],
+            priority: None,
+            source: None,
+            candidates: vec![],
+        }
+    }
+
+    #[test]
+    fn candidates_round_trip_and_old_items_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = dir.path();
+        let old = "---\nkind: observed\ntime: 100\npriority: 2\n---\n\n- 2026-10-02 [med] (fact; general) one\n";
+        std::fs::create_dir_all(super::dir(s)).unwrap();
+        std::fs::write(super::dir(s).join("0a1b2c3d4e.md"), old).unwrap();
+        let mut item = get(s, "0a1b2c3d4e").unwrap();
+        assert!(item.meta.candidates.is_empty(), "an item from before triage has no candidates");
+        item.meta.candidates = vec![
+            Candidate {
+                index: 0,
+                line: Some(0),
+                verdict: Verdict::Keep,
+                reason: "jev".into(),
+                score: Some(0.86),
+                lesson: None,
+                kind: Some("pitfall".into()),
+                outcome: None,
+            },
+            Candidate {
+                index: 1,
+                line: Some(1),
+                verdict: Verdict::Known,
+                reason: "known".into(),
+                score: None,
+                lesson: Some("7f3a9c2b41".into()),
+                kind: None,
+                outcome: Some("used:7f3a9c2b41".into()),
+            },
+        ];
+        save(s, &item).unwrap();
+        assert_eq!(get(s, "0a1b2c3d4e").unwrap(), item, "a triaged item round-trips");
+        assert!(!std::fs::read_dir(super::dir(s)).unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with(".tmp")));
+        assert!(save(s, &Item { id: "../x".into(), ..item }).is_err());
     }
 
     #[test]
