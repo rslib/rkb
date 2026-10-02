@@ -5,24 +5,31 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Hit, InboxRow, Injected, Item, Lesson, Request, Status, View } from '../types'
+import type { Hit, InboxRow, Injected, Item, Lesson, Notice, Request, Status, View } from '../types'
 
 // The rkb binary that installed this file; rkb install fills it in.
 const RKB: string = "__RKB__"
 const PANE = 'rkb'
-const COMMAND = 'rkb-pane'
+const COMMAND = 'rkb-status'
 const DOT = ' \u00b7 '
 const KIND: Record<string, string> = { transcript: 'extract', observed: 'observed', note: 'note' }
+const ACCENT = 'cyan'
+const BAR_FULL = '\u2588'
+const BAR_EMPTY = '\u2591'
+const TONE: Record<Notice['tone'], [string, string]> = { ok: ['\u2713', 'green'], fail: ['\u2717', 'red'], busy: ['\u2026', 'yellow'] }
+const APPLIES_COLOR: Record<string, string> = { yes: 'green', likely: 'green', unlikely: 'yellow', no: 'red' }
 const DOT_MARK = '\u25cf'
 const ARROW = '\u203a'
-const RULE = '\u2500'
 const LEVEL: Record<number, { label: string; color?: string }> = {
   3: { label: 'high', color: 'red' },
   2: { label: 'med', color: 'yellow' },
   1: { label: 'low' },
 }
 const TYPE_COLOR: Record<string, string> = { pitfall: 'red', recipe: 'green', fact: 'cyan', decision: 'magenta', preference: 'yellow' }
-const OPEN = { id: PANE, title: 'rkb', focus: true, closeOnEscape: true, columns: 72 } as const
+// No closeOnEscape: Esc hands the keys back and the pane stays, as Claude Code's diff panel does; the dock
+// keeps both as tabs.
+// No columns: the dock opens it at its default share, as wide as Claude Code's diff panel.
+const OPEN = { id: PANE, title: 'rkb', focus: true } as const
 
 function relevanceColor(r: string | null): string | undefined {
   const n = r === null ? NaN : Number(r)
@@ -33,6 +40,8 @@ function relevanceColor(r: string | null): string | undefined {
 const UI_TIMEOUT_MS = 5000
 // A job step parses notes and writes the inbox item, and a prepare reads the transcript.
 const JOB_TIMEOUT_MS = 30000
+// A tool runs a search or a write, which may load a model, so it gets longer than a hook.
+const TOOL_TIMEOUT_MS = 60000
 const NOTES_MAX_TOKENS = 4096
 
 const status = atom({ plugin: 'rkb', key: 'status' } as const, null)
@@ -44,6 +53,7 @@ const lesson = atom({ plugin: 'rkb', key: 'lesson' } as const, null)
 const item = atom({ plugin: 'rkb', key: 'item' } as const, null)
 const inbox = atom({ plugin: 'rkb', key: 'inbox' } as const, [])
 const note = atom({ plugin: 'rkb', key: 'note' } as const, '')
+const notice = atom({ plugin: 'rkb', key: 'notice' } as const, null)
 
 type Json = Record<string, any>
 type Ran = { ok: boolean; data: Json | undefined }
@@ -138,16 +148,28 @@ async function observe($: EngineInterface, session: Session): Promise<void> {
   }
 }
 
+async function say($: EngineInterface, tone: Notice['tone'], text: string): Promise<void> {
+  await update($, notice, () => ({ tone, text }))
+}
+
 async function openLesson($: EngineInterface, id: string): Promise<void> {
   const r = await rkb($, ['show', id])
   if (!r.ok || !r.data) {
-    $.ui.toast(`rkb: cannot show ${id}`)
+    await say($, 'fail', `Cannot show ${id}.`)
     return
   }
   const d = r.data
-  const meta = [id, d.frontmatter?.type, d.frontmatter?.status, d.path].filter(Boolean).join(DOT)
-  const l: Lesson = { id, title: d.title ?? id, body: d.body ?? '', meta }
+  const l: Lesson = {
+    id,
+    title: d.title ?? id,
+    body: String(d.body ?? '').replace(/^# .*\n+/, ''),
+    kind: d.frontmatter?.type ?? '',
+    status: d.frontmatter?.status ?? '',
+    path: d.path ?? '',
+    applies: d.applies?.result ?? '',
+  }
   await update($, lesson, () => l)
+  await update($, notice, () => null)
   await update($, view, () => 'lesson' as View)
   await $.ui.open(OPEN)
 }
@@ -155,12 +177,12 @@ async function openLesson($: EngineInterface, id: string): Promise<void> {
 async function openItem($: EngineInterface, row: InboxRow): Promise<void> {
   const r = await rkb($, ['inbox', 'show', row.id])
   if (!r.ok || !r.data) {
-    $.ui.toast(`rkb: cannot show inbox item ${row.id}`)
+    await say($, 'fail', `Cannot show inbox item ${row.id}.`)
     return
   }
-  const meta = [row.id, KIND[row.kind] ?? row.kind, LEVEL[row.priority]?.label, row.age, r.data.meta?.cwd].filter(Boolean).join(DOT)
-  const i: Item = { id: row.id, title: row.preview, body: r.data.body ?? '', meta }
+  const i: Item = { ...row, title: row.preview, body: r.data.body ?? '', cwd: r.data.meta?.cwd ?? '' }
   await update($, item, () => i)
+  await update($, notice, () => null)
   await update($, view, () => 'item' as View)
 }
 
@@ -170,6 +192,7 @@ async function show($: EngineInterface, v: View): Promise<void> {
     const rows: InboxRow[] = (r.data?.items ?? []).map((i: Json) => ({ id: i.id, kind: i.kind, priority: i.priority, age: i.age, preview: i.preview }))
     await update($, inbox, () => rows)
   }
+  await update($, notice, () => null)
   await update($, view, () => v)
   if (v === 'search') await $.ui.focus({ requestId: PANE, key: 'query' }).catch(() => undefined)
 }
@@ -181,13 +204,98 @@ async function answer($: EngineInterface, session: Session, q: Request): Promise
   } catch {
     return
   }
+  await say($, 'busy', `Running rkb confirm ${q.id}...`)
   const r = await rkb($, ['confirm', q.id, '--choice', choice], { cwd: session.cwd })
   const d = r.data ?? {}
-  $.ui.toast(r.ok ? `rkb: ${d.id ? `${d.id} ` : ''}${d.message ?? d.status ?? 'done'}` : `rkb: ${d.error?.message ?? 'confirm failed'}`)
+  await say($, r.ok ? 'ok' : 'fail', r.ok ? `${q.id}: ${choice}${d.id ? ` (${d.id})` : ''}` : (d.error?.message ?? 'rkb confirm failed'))
   await refresh($, session)
 }
 
-type Live = { session?: Session; isOff: boolean; isObserving: boolean }
+/** Records how a lesson opened in the pane did, as `rkb_used` does for the agent. */
+async function used($: EngineInterface, session: Session | undefined, id: string, result: 'worked' | 'irrelevant'): Promise<void> {
+  const r = await rkb($, ['used', `--${result}`, id, ...(session ? ['--session', session.id] : [])], { cwd: session?.cwd })
+  await say($, r.ok ? 'ok' : 'fail', r.ok ? `Recorded ${id} as ${result}.` : (r.data?.error?.message ?? 'rkb used failed'))
+}
+
+/**
+ * Queues one of the plugin's commands (`/rkb:distill` and so on) as if the person typed it. It runs as a
+ * turn once the session is idle, so the button does not wait for it.
+ */
+async function runCommand($: EngineInterface, name: 'distill' | 'curate' | 'retro'): Promise<void> {
+  await say($, 'busy', `Queued /rkb:${name}; it runs as a turn when the session is idle.`)
+  void $.command.run({ command: `rkb:${name}` }).catch(() => say($, 'fail', `Claude Code did not run /rkb:${name}.`))
+}
+
+/** A 10-cell bar for a relevance from 0 to 1. */
+function bar(relevance: number): string {
+  const fill = Math.max(0, Math.min(10, Math.round(relevance * 10)))
+  return BAR_FULL.repeat(fill) + BAR_EMPTY.repeat(10 - fill)
+}
+
+type Live = { session?: Session; isOff: boolean; isObserving: boolean; tools: Set<string> }
+
+// Claude Code lists a mod's tool as `mcp__<plugin>__<name>`, so `rkb_search` becomes `mcp__rkb__search`.
+const TOOL_PREFIX = 'mcp__rkb__'
+// The plugin's MCP server offers the same tools for sessions without the mod: `mcp__plugin_rkb_rkb__rkb_search`
+// when installed, `mcp__rkb__rkb_search` from a plugin folder.
+const MCP_COPY = /^mcp__.+__rkb_[a-z]+$/
+// The tools settings.json allows without a prompt when they come from `rkb mcp`.
+const ALLOWED = new Set(['search', 'show', 'add', 'note'].map(n => TOOL_PREFIX + n))
+
+/** Registers the agent tools from `rkb tools` under short names into `tools`; registers none when rkb fails. */
+async function registerTools($: EngineInterface, tools: Set<string>): Promise<void> {
+  const r = await rkb($, ['tools'])
+  for (const t of (r.data?.tools ?? []) as { name: string; description: string; inputSchema: Record<string, unknown> }[]) {
+    const name = t.name.replace(/^rkb_/, '')
+    const ok = await $.tool.register({ name, description: t.description, inputSchema: t.inputSchema }).then(
+      () => true,
+      () => false,
+    )
+    if (ok) tools.add(TOOL_PREFIX + name)
+  }
+}
+
+/** Runs `rkb tool rkb_<name>` for a call of `mcp__rkb__<name>`; a failure is a refusal the model reads as an error. */
+async function callTool($: EngineInterface, cwd: string | undefined, tool: string, args: Record<string, unknown>) {
+  const name = `rkb_${tool.slice(TOOL_PREFIX.length)}`
+  try {
+    const r = await $.process.run([RKB, 'tool', name], { cwd, stdin: JSON.stringify(args), timeoutMs: TOOL_TIMEOUT_MS })
+    const text = r.stdout.trim()
+    // Exit 3 is a question for the user, which the agent passes on; 1 and 2 are failures.
+    if (r.exitCode === 1 || r.exitCode === 2) return { deny: text || `rkb exited with ${r.exitCode}` }
+    return { result: text }
+  } catch {
+    return { deny: 'rkb did not run: check that the rkb command is installed (`rkb doctor` in a terminal).' }
+  }
+}
+type Reply = { additionalContext?: string[]; block?: string }
+
+/** Runs `rkb hook <event> --mod` with a classic hook's input; the reply text, or '' when rkb failed. */
+async function hook($: EngineInterface, event: string, input: { cwd: string }): Promise<string> {
+  try {
+    const r = await $.process.run([RKB, 'hook', event, '--mod'], { cwd: input.cwd, stdin: JSON.stringify(input), timeoutMs: UI_TIMEOUT_MS })
+    return r.exitCode === 0 ? r.stdout.trim() : ''
+  } catch {
+    return ''
+  }
+}
+
+/** `result` with rkb's hook reply added: plain text or `additionalContext` as context, `decision: block` as `block`. */
+export function withReply<R extends Reply>(result: R, out: string): R {
+  if (out === '') return result
+  let reply: Json | undefined
+  try {
+    reply = JSON.parse(out)
+  } catch {
+    reply = undefined
+  }
+  if (typeof reply !== 'object' || reply === null) return { ...result, additionalContext: [...(result.additionalContext ?? []), out] }
+  const next: R = { ...result }
+  const context = reply.hookSpecificOutput?.additionalContext
+  if (typeof context === 'string' && context !== '') next.additionalContext = [...(result.additionalContext ?? []), context]
+  if (reply.decision === 'block' && typeof reply.reason === 'string') next.block = reply.reason
+  return next
+}
 
 /** Runs `work` after the current dispatch, so a turn or a compaction never waits for it. */
 function later($: EngineInterface, work: () => Promise<void>): void {
@@ -212,7 +320,7 @@ function turnEnded($: EngineInterface, live: Live, e: { session_id: string; cwd:
 }
 
 export const register: Register = on => {
-  const live: Live = { isOff: false, isObserving: false }
+  const live: Live = { isOff: false, isObserving: false, tools: new Set() }
 
   on('session.start', async ($, e, next) => {
     live.isOff = Boolean(await $.env.get('RKB_OBSERVER'))
@@ -223,19 +331,64 @@ export const register: Register = on => {
       await $.command
         .register({ name: COMMAND, description: 'Search lessons, read the inbox and answer rkb requests in a pane' })
         .catch(() => undefined)
+      await registerTools($, live.tools)
       later($, () => refresh($, s))
     }
     return next(e)
   })
 
-  on('classic.Stop', async ($, e, next) => {
+  on('tool.call', async ($, e, next) => {
+    if (!live.tools.has(e.tool)) return next(e)
+    const { tool, tool_use_id: _id, ...args } = e as { tool: string; tool_use_id: string } & Record<string, unknown>
+    return callTool($, live.session?.cwd, tool, args)
+  })
+
+  on('tool.check', async ($, e, next) => (ALLOWED.has(e.tool) ? { decision: 'allow' as const } : next(e)))
+
+  // With the mod's tools registered, the MCP copies move behind ToolSearch: the model sees their names only.
+  on('tool.describe', async ($, e, next) => {
     const r = await next(e)
+    return live.tools.size > 0 && MCP_COPY.test(e.tool) ? { ...r, isDeferred: true } : r
+  })
+
+  // Every event but PreToolUse goes to `rkb hook --mod`; the plugin's command hooks of this session then do
+  // nothing, because `RKB_MOD` names it. The confirm gate stays a command hook: only its input has
+  // `permission_mode`.
+  on('classic.SessionStart', async ($, e, next) => {
+    await $.env.set('RKB_MOD', e.session_id)
+    const r = await next(e)
+    return withReply(r, await hook($, 'session-start', e))
+  })
+
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    const r = await next(e)
+    return withReply(r, await hook($, 'prompt', e))
+  })
+
+  on('classic.PostToolUse', async ($, e, next) => {
+    const r = await next(e)
+    return e.tool_name === 'Bash' ? withReply(r, await hook($, 'tool-ok', e)) : r
+  })
+
+  on('classic.PostToolUseFailure', async ($, e, next) => {
+    const r = await next(e)
+    return e.tool_name === 'Bash' ? withReply(r, await hook($, 'tool-failed', e)) : r
+  })
+
+  on('classic.Stop', async ($, e, next) => {
+    const r = withReply(await next(e), await hook($, 'stop', e))
     if (!live.isOff) turnEnded($, live, e)
     return r
   })
 
   on('classic.PreCompact', async ($, e, next) => {
+    await hook($, 'pre-compact', e)
     if (!live.isOff) turnEnded($, live, e)
+    return next(e)
+  })
+
+  on('classic.SessionEnd', async ($, e, next) => {
+    await hook($, 'session-end', e)
     return next(e)
   })
 
@@ -261,7 +414,9 @@ export const register: Register = on => {
             <Text color="cyan">{ARROW} rkb</Text>
             <Text dimColor>{i.hook ?? 'hook'}</Text>
             <Text>{i.title ?? i.id}</Text>
-            <Text dimColor>{i.id}</Text>
+            <Box flexShrink={0}>
+                    <Text dimColor>{i.id}</Text>
+                  </Box>
             <Button key={`open-${i.id}`} label="Open" onPress={() => openLesson($, i.id)} />
             <Button
               key={`irrelevant-${i.id}`}
@@ -285,10 +440,62 @@ export const register: Register = on => {
     const width = Math.max(30, e.props.bodyColumns - 2)
     const v = await read($, view)
     const s = await read($, status)
-    const tab = (to: View, label: string, hotkey: string) => (
-      <Button key={`view-${to}`} label={label} hotkey={hotkey} variant={v === to ? 'primary' : undefined} onPress={() => show($, to)} />
+    const said = await read($, notice)
+    const home = await $.env.get('HOME')
+    const tilde = (path: string) => (home && path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path)
+
+    // Two Buttons with one hotkey clash, so only the first drawn takes it.
+    const taken = new Set<string>()
+    const hot = (k: string) => {
+      if (taken.has(k)) return undefined
+      taken.add(k)
+      return k
+    }
+    const button = (key: string, label: string, hotkey: string | undefined, onPress: () => unknown, primary = false) => (
+      <Button key={key} label={label} hotkey={hotkey} plain variant={primary ? 'primary' : 'secondary'} dimColor={!primary} onPress={() => void onPress()} />
     )
-    const back = (to: View) => <Button key="back" label="Back" hotkey="b" onPress={() => update($, view, () => to)} />
+    const badge = (label: string, color?: string) => (
+      <Text inverse bold color={color}>
+        {` ${label.toUpperCase()} `}
+      </Text>
+    )
+    const empty = (line: string, hint: string) => (
+      <Box borderStyle="round" borderDimColor flexDirection="column" paddingX={1}>
+        <Text>{line}</Text>
+        <Text dimColor>{hint}</Text>
+      </Box>
+    )
+
+    const header = (
+      <Box justifyContent="space-between" paddingRight={3}>
+        <Text bold color={ACCENT}>
+          rkb
+        </Text>
+        {s && (
+          <Text dimColor>
+            {s.inbox} inbox{DOT}
+            <Text color={s.high > 0 ? 'red' : undefined}>{s.high} high</Text>
+            {DOT}
+            {s.curate} curate
+          </Text>
+        )}
+      </Box>
+    )
+    const tabs = (
+      <Box gap={3} marginBottom={1}>
+        {button('view-search', 'Search', hot('s'), () => show($, 'search'), v === 'search' || v === 'lesson')}
+        {button('view-inbox', `Inbox ${s?.inbox ?? 0}`, hot('i'), () => show($, 'inbox'), v === 'inbox' || v === 'item')}
+        {button('view-requests', `Requests ${s?.requests.length ?? 0}`, hot('r'), () => show($, 'requests'), v === 'requests')}
+      </Box>
+    )
+    const noticeLine = said && (
+      <Box key="notice" marginBottom={1}>
+        <Text wrap="truncate-end">
+          <Text color={TONE[said.tone][1]}>{TONE[said.tone][0]}</Text> {said.text}
+        </Text>
+      </Box>
+    )
+
     let body
     if (v === 'search') {
       const list = await read($, hits)
@@ -297,7 +504,7 @@ export const register: Register = on => {
         <Box flexDirection="column" gap={1}>
           <Input
             key="query"
-            placeholder="Search lessons, then press Enter"
+            placeholder="Search lessons: an error, a symptom or a tool"
             autoFocus
             onSubmit={async (query: string) => {
               const r = await rkb($, ['search', query], { cwd: live.session?.cwd })
@@ -307,128 +514,180 @@ export const register: Register = on => {
                 relevance: h.relevance ?? null,
                 kind: h.type ?? '',
                 summary: h.summary ?? '',
+                applies: h.applies ?? '',
               }))
               await update($, hits, () => found)
               await update($, note, () => (r.ok ? `${plural(found.length, 'result')} for "${query}"` : 'rkb search failed'))
             }}
           />
           {message !== '' && <Text dimColor>{message}</Text>}
-          {list.length === 0 && message === '' && <Text dimColor>Search by symptom, error text or tool name.</Text>}
-          {list.map(hit => (
-            <Box key={`result-${hit.id}`} flexDirection="column">
-              <Button key={`hit-${hit.id}`} plain label={cut(hit.title, width)} onPress={() => openLesson($, hit.id)} />
-              <Box gap={1}>
-                <Text color={TYPE_COLOR[hit.kind]}>{hit.kind}</Text>
-                {hit.relevance && <Text color={relevanceColor(hit.relevance)}>{hit.relevance}</Text>}
-                <Text dimColor>{hit.id}</Text>
-              </Box>
-              {hit.summary !== '' && (
-                <Text dimColor wrap="truncate-end">
-                  {hit.summary}
-                </Text>
-              )}
-            </Box>
-          ))}
-        </Box>
-      )
-    } else if (v === 'lesson') {
-      const l = await read($, lesson)
-      body = l ? (
-        <Box flexDirection="column" gap={1}>
-          <Box flexDirection="column">
-            <Text bold color="cyan">
-              {l.title}
-            </Text>
-            <Text dimColor wrap="truncate-end">{l.meta}</Text>
-            <Text dimColor>{RULE.repeat(width)}</Text>
-          </Box>
-          <Markdown key="lesson" text={l.body.replace(/^# .*\n+/, '')} />
-          {back('search')}
-        </Box>
-      ) : (
-        <Text dimColor>No lesson open.</Text>
-      )
-    } else if (v === 'item') {
-      const i = await read($, item)
-      body = i ? (
-        <Box flexDirection="column" gap={1}>
-          <Box flexDirection="column">
-            <Text bold color="cyan" wrap="truncate-end">
-              {i.title}
-            </Text>
-            <Text dimColor wrap="truncate-end">{i.meta}</Text>
-            <Text dimColor>{RULE.repeat(width)}</Text>
-          </Box>
-          <Markdown key="item" text={i.body} />
-          {back('inbox')}
-        </Box>
-      ) : (
-        <Text dimColor>No item open.</Text>
-      )
-    } else if (v === 'inbox') {
-      const rows = await read($, inbox)
-      const room = Math.max(10, width - 18)
-      body = (
-        <Box flexDirection="column">
-          {rows.length === 0 && <Text dimColor>The inbox is empty.</Text>}
-          {rows.length > 0 && (
-            <Box gap={2} marginBottom={1}>
-              <Text>
-                <Text color="red">{DOT_MARK}</Text> high
-              </Text>
-              <Text>
-                <Text color="yellow">{DOT_MARK}</Text> med
-              </Text>
-              <Text dimColor>{DOT_MARK} low</Text>
-            </Box>
-          )}
-          {rows.map(row => {
-            const level = LEVEL[row.priority] ?? LEVEL[1]!
+          {list.length === 0 && message === '' && empty('Search your lessons.', 'Paste an error message, or name a tool or a symptom.')}
+          {list.map(hit => {
+            const score = hit.relevance === null ? NaN : Number(hit.relevance)
             return (
-              <Box key={`item-${row.id}`} gap={1}>
-                <Text color={level.color} dimColor={!level.color}>
-                  {DOT_MARK}
+              <Box key={`result-${hit.id}`} borderStyle="round" borderColor={TYPE_COLOR[hit.kind]} borderDimColor flexDirection="column" paddingX={1}>
+                <Box justifyContent="space-between" gap={1}>
+                  <Text wrap="truncate-end">
+                    {badge(hit.kind, TYPE_COLOR[hit.kind])} <Text bold>{hit.title}</Text>
+                  </Text>
+                  <Box flexShrink={0}>
+                    <Text dimColor>{hit.id}</Text>
+                  </Box>
+                </Box>
+                <Text wrap="truncate-end">
+                  {Number.isFinite(score) && (
+                    <Text color={relevanceColor(hit.relevance)} dimColor={!relevanceColor(hit.relevance)}>
+                      {`${bar(score)} ${score.toFixed(2)}`}
+                    </Text>
+                  )}
+                  {Number.isFinite(score) && DOT}
+                  <Text dimColor>applies </Text>
+                  <Text color={APPLIES_COLOR[hit.applies]} dimColor={!APPLIES_COLOR[hit.applies]}>
+                    {hit.applies || 'unknown'}
+                  </Text>
                 </Text>
-                <Box width={8}>
-                  <Text dimColor>{KIND[row.kind] ?? row.kind}</Text>
-                </Box>
-                <Box flexGrow={1}>
-                  <Button key={`open-${row.id}`} plain label={cut(row.preview, room)} onPress={() => openItem($, row)} />
-                </Box>
-                <Text dimColor>{row.age}</Text>
+                {hit.summary !== '' && (
+                  <Text dimColor wrap="truncate-end">
+                    {hit.summary}
+                  </Text>
+                )}
+                {button(`hit-${hit.id}`, 'Open', hot('o'), () => openLesson($, hit.id), true)}
               </Box>
             )
           })}
         </Box>
       )
-    } else {
-      const open = s?.requests ?? []
-      body = (
-        <Box flexDirection="column" gap={1}>
-          {open.length === 0 && <Text dimColor>No open requests. A request that rkb or a background agent leaves open shows here.</Text>}
-          {open.map(q => (
-            <Box key={`request-${q.id}`} flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
-              <Text bold>{q.question}</Text>
-              <Text dimColor>{q.options.join(' / ')}</Text>
-              <Box gap={1}>
-                <Button key={`answer-${q.id}`} label="Answer" variant="primary" onPress={() => (live.session ? answer($, live.session, q) : undefined)} />
-                <Text dimColor>{q.id}</Text>
-              </Box>
-            </Box>
-          ))}
+    } else if (v === 'lesson') {
+      const l = await read($, lesson)
+      body = l ? (
+        <Box borderStyle="round" borderColor={ACCENT} flexDirection="column" paddingX={1}>
+          <Box justifyContent="space-between" gap={1}>
+            <Text wrap="truncate-end">
+              {badge(l.kind || 'lesson', TYPE_COLOR[l.kind])} <Text bold>{l.title}</Text>
+            </Text>
+            <Box flexShrink={0}>
+                    <Text dimColor>{l.id}</Text>
+                  </Box>
+          </Box>
+          <Text dimColor wrap="truncate-end">
+            {[l.status, l.applies ? `applies ${l.applies}` : '', l.path].filter(Boolean).join(DOT)}
+          </Text>
+          <Box marginTop={1}>
+            <Markdown key="lesson" text={l.body} />
+          </Box>
+          <Box gap={3} marginTop={1}>
+            {button('worked', 'Worked', hot('w'), () => used($, live.session, l.id, 'worked'), true)}
+            {button('irrelevant', 'Irrelevant', hot('x'), () => used($, live.session, l.id, 'irrelevant'))}
+            {button('back', 'Back', hot('b'), () => update($, view, () => 'search' as View))}
+          </Box>
+        </Box>
+      ) : (
+        empty('No lesson open.', 'Open one from a search.')
+      )
+    } else if (v === 'item') {
+      const i = await read($, item)
+      const level = LEVEL[i?.priority ?? 1] ?? LEVEL[1]!
+      body = i ? (
+        <Box borderStyle="round" borderColor={level.color ?? ACCENT} flexDirection="column" paddingX={1}>
+          <Box justifyContent="space-between" gap={1}>
+            <Text wrap="truncate-end">
+              {badge(KIND[i.kind] ?? i.kind, level.color)} <Text bold>{i.title}</Text>
+            </Text>
+            <Text dimColor>{i.id}</Text>
+          </Box>
+          <Text dimColor wrap="truncate-end">
+            {[`${level.label} priority`, i.age, tilde(i.cwd)].filter(Boolean).join(DOT)}
+          </Text>
+          <Box marginTop={1}>
+            <Markdown key="item" text={i.body} />
+          </Box>
+          <Box gap={3} marginTop={1}>
+            {button('back', 'Back', hot('b'), () => update($, view, () => 'inbox' as View))}
+          </Box>
+        </Box>
+      ) : (
+        empty('No inbox item open.', 'Open one from the inbox.')
+      )
+    } else if (v === 'inbox') {
+      const rows = await read($, inbox)
+      const room = Math.max(10, width - 20)
+      const actions = (
+        <Box key="actions" gap={3} marginBottom={1}>
+          {button('distill', 'Distill', hot('d'), () => runCommand($, 'distill'), rows.length > 0)}
+          {button('curate', `Curate ${s?.curate ?? 0}`, hot('c'), () => runCommand($, 'curate'), (s?.curate ?? 0) > 0)}
+          {button('retro', 'Retro', hot('t'), () => runCommand($, 'retro'))}
         </Box>
       )
+      const list =
+        rows.length === 0 ? (
+          empty('The inbox is empty.', 'Notes and session extracts wait here until distill turns them into lessons.')
+        ) : (
+          <Box flexDirection="column" gap={1}>
+            {[3, 2, 1].map(p => {
+              const group = rows.filter(row => row.priority === p)
+              const level = LEVEL[p]!
+              if (group.length === 0) return null
+              return (
+                <Box key={`group-${p}`} flexDirection="column">
+                  <Text bold color={level.color} dimColor={!level.color}>
+                    {DOT_MARK} {level.label} <Text dimColor>{group.length}</Text>
+                  </Text>
+                  {group.map(row => (
+                    <Box key={`item-${row.id}`} justifyContent="space-between" gap={1}>
+                      <Box gap={1}>
+                        <Box width={8}>
+                          <Text dimColor>{KIND[row.kind] ?? row.kind}</Text>
+                        </Box>
+                        {button(`open-${row.id}`, cut(row.preview, room), undefined, () => openItem($, row))}
+                      </Box>
+                      <Text dimColor>{row.age}</Text>
+                    </Box>
+                  ))}
+                </Box>
+              )
+            })}
+          </Box>
+        )
+      body = (
+        <Box flexDirection="column">
+          {actions}
+          {list}
+        </Box>
+      )
+    } else {
+      const open = s?.requests ?? []
+      body =
+        open.length === 0 ? (
+          empty('No open requests.', 'A question rkb or a background agent leaves for you shows here.')
+        ) : (
+          <Box flexDirection="column" gap={1}>
+            {open.map(q => (
+              <Box key={`request-${q.id}`} borderStyle="round" borderColor="yellow" flexDirection="column" paddingX={1}>
+                <Box justifyContent="space-between" gap={1}>
+                  <Text bold color="yellow">
+                    needs you
+                  </Text>
+                  <Box flexShrink={0}>
+                    <Text dimColor>{q.id}</Text>
+                  </Box>
+                </Box>
+                <Text>{q.question}</Text>
+                <Text dimColor wrap="truncate-end">
+                  {q.options.join(' / ')}
+                </Text>
+                <Box marginTop={1}>
+                  {button(`answer-${q.id}`, 'Answer', hot('a'), () => (live.session ? answer($, live.session, q) : undefined), true)}
+                </Box>
+              </Box>
+            ))}
+          </Box>
+        )
     }
     return (
       <Box flexDirection="column" paddingX={1}>
-        <Box gap={1}>
-          {tab('search', 'Search', 's')}
-          {tab('inbox', `Inbox ${s?.inbox ?? 0}`, 'i')}
-          {tab('requests', `Requests ${s?.requests.length ?? 0}`, 'r')}
-        </Box>
-        <Box marginBottom={1}>
-          <Text dimColor>{RULE.repeat(width)}</Text>
-        </Box>
+        {header}
+        {tabs}
+        {noticeLine}
         {body}
       </Box>
     )

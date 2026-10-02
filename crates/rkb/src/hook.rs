@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Runs one Claude Code hook event. Never fails: errors go to `hook-errors.log` and nothing is printed.
-pub fn run(event: &str, harness: &str) {
+/// `from_mod` is true when the Claude Code mod calls; a command hook of a session the mod handles does nothing.
+pub fn run(event: &str, harness: &str, from_mod: bool) {
     if rkb_core::observer::active() {
         return;
     }
@@ -25,12 +26,19 @@ pub fn run(event: &str, harness: &str) {
         let _ = lock::append_line(&log, &line.to_string());
     }));
     let reply = std::panic::catch_unwind(|| {
-        if hooks::HARNESSES.contains(&harness) {
-            let _ = hooks::beat(&state, harness);
-            read_payload().and_then(|p| handle(event, &p, &state, harness))
-        } else {
-            Err(format!("unknown harness `{harness}`; use one of {}", hooks::HARNESSES.join(", ")).into())
+        if !hooks::HARNESSES.contains(&harness) {
+            return Err(format!("unknown harness `{harness}`; use one of {}", hooks::HARNESSES.join(", ")).into());
         }
+        let p = read_payload()?;
+        // The confirm gate needs `permission_mode`, which only the command hook's input carries.
+        if !from_mod && event != "pre-tool" && mod_handles(&p) {
+            return Ok(None);
+        }
+        let _ = hooks::beat(&state, harness);
+        if harness == "claude-code" && event != "pre-tool" {
+            let _ = hooks::note_caller(&state, p["session_id"].as_str().unwrap_or(""), if from_mod { "mod" } else { "command" });
+        }
+        handle(event, &p, &state, harness)
     })
     .unwrap_or_else(|_| Ok(None));
     match reply {
@@ -41,6 +49,13 @@ pub fn run(event: &str, harness: &str) {
             let _ = lock::append_line(&state.join("hook-errors.log"), &line.to_string());
         }
     }
+}
+
+/// Whether the Claude Code mod handles this payload's session: it sets `RKB_MOD` to the session id, which
+/// a pi or omp session started from a Claude Code shell inherits with another id.
+fn mod_handles(p: &Value) -> bool {
+    let session = p["session_id"].as_str().unwrap_or("");
+    !session.is_empty() && std::env::var("RKB_MOD").is_ok_and(|m| m == session)
 }
 
 fn read_payload() -> Result<Value> {

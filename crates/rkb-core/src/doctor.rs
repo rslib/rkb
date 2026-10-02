@@ -159,6 +159,18 @@ pub fn hook_checks(home: &Path, state_dir: &Path) -> Vec<Check> {
             }
             _ => {}
         }
+        if h == Harness::Claude {
+            match crate::hooks::callers(state_dir) {
+                (0, _) => {}
+                (n, 0) => out.push(check("hooks: claude mod", Level::Ok, format!("the mod handled {n} recent sessions"), None)),
+                (n, both) => out.push(check(
+                    "hooks: claude mod",
+                    Level::Warn,
+                    format!("{both} of {n} recent sessions ran rkb's hooks twice, through the mod and the command hooks"),
+                    Some("the mod could not switch the command hooks off; report `claude --version`, then run `rkb install claude`".into()),
+                )),
+            }
+        }
         out.push(match crate::hooks::last_beat(state_dir, h.trust_name()) {
             Some(s) => check(name, Level::Ok, format!("last called {}", age(s)), None),
             None => check(
@@ -496,6 +508,27 @@ pub fn break_lock(path: &str, holder: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_check_warns_when_a_session_ran_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, state) = (dir.path().join("home"), dir.path().join("state"));
+        std::fs::create_dir_all(home.join(".claude/plugins")).unwrap();
+        std::fs::write(home.join(".claude/plugins/installed_plugins.json"), r#"{"version":2,"plugins":{"rkb@rkb":[{"version":"x"}]}}"#)
+            .unwrap();
+        let mod_line = |state: &Path| hook_checks(&home, state).into_iter().find(|c| c.name == "hooks: claude mod");
+        assert!(mod_line(&state).is_none(), "no line before the mod ran");
+        crate::hooks::note_caller(&state, "s1", "mod").unwrap();
+        crate::hooks::note_caller(&state, "s1", "mod").unwrap();
+        crate::hooks::note_caller(&state, "p7", "command").unwrap();
+        assert_eq!(std::fs::read_to_string(state.join("sessions/s1.callers")).unwrap(), "mod\n", "recorded once");
+        assert!(crate::hooks::read(&state, "s1").is_empty(), "the session file keeps only signals");
+        assert_eq!(mod_line(&state).map(|c| c.level), Some(Level::Ok));
+        crate::hooks::note_caller(&state, "s1", "command").unwrap();
+        let warn = mod_line(&state).unwrap();
+        assert_eq!(warn.level, Level::Warn);
+        assert!(warn.detail.starts_with("1 of 1 recent sessions ran rkb's hooks twice"), "{}", warn.detail);
+    }
 
     #[test]
     fn hook_check_uses_heartbeat() {

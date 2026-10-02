@@ -48,6 +48,36 @@ pub fn append(state: &Path, session: &str, record: &Value) -> Result<()> {
     lock::append_line(&path, &record.to_string())
 }
 
+/// Records once per session whether the Claude Code mod (`mod`) or a command hook (`command`) called, in
+/// `<session>.callers` beside the session file, so the session file keeps only signals.
+pub fn note_caller(state: &Path, session: &str, by: &str) -> Result<()> {
+    if session.is_empty() {
+        return Ok(());
+    }
+    let path = session_path(state, session).with_extension("callers");
+    if std::fs::read_to_string(&path).is_ok_and(|t| t.lines().any(|l| l == by)) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(sessions_dir(state)).map_err(io(sessions_dir(state)))?;
+    lock::append_line(&path, by)
+}
+
+/// Of the sessions kept, how many the mod handled, and how many of those a command hook also handled.
+pub fn callers(state: &Path) -> (usize, usize) {
+    let (mut by_mod, mut both) = (0, 0);
+    for e in std::fs::read_dir(sessions_dir(state)).into_iter().flatten().flatten() {
+        if e.path().extension().is_none_or(|x| x != "callers") {
+            continue;
+        }
+        let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+        if text.lines().any(|l| l == "mod") {
+            by_mod += 1;
+            both += usize::from(text.lines().any(|l| l == "command"));
+        }
+    }
+    (by_mod, both)
+}
+
 pub fn read(state: &Path, session: &str) -> Vec<Value> {
     std::fs::read_to_string(session_path(state, session)).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
 }

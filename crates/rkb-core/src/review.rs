@@ -131,6 +131,9 @@ pub fn signals(root: &Path, state: &Path) -> Signals {
         out.paths.insert(path.into(), PathSignals::default());
     }
     for e in std::fs::read_dir(state.join("sessions")).into_iter().flatten().flatten() {
+        if e.path().extension().is_none_or(|x| x != "jsonl") {
+            continue;
+        }
         let Some(session) = e.path().file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
         let in_session: Vec<&usage::Record> = records.iter().filter(|u| u.session.as_deref() == Some(session.as_str())).collect();
         for r in in_session.iter().filter(|u| u.event == "injected") {

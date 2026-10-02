@@ -4944,3 +4944,27 @@ fn model_jobs_run_the_observer_for_another_runner() {
     std::fs::write(&path, stored.to_string()).unwrap();
     assert_eq!(run(&["job", "finish", c_id, "--part", "0", "--model", "session"], &answer).0["error"]["code"], "expired");
 }
+
+#[test]
+fn command_hooks_stay_quiet_for_the_session_the_mod_handles() {
+    let env = search_kb();
+    let run = |args: &[&str], session: &str, rkb_mod: &str| {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.env("RKB_MOD", rkb_mod);
+        let payload = serde_json::json!({ "session_id": session, "source": "startup", "cwd": env.kb() });
+        let o = rkb_with(c, args, &payload.to_string());
+        assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+        stdout(&o)
+    };
+    let beat = env.dir.path().join("state/rkb/heartbeat/claude-code");
+    assert_eq!(run(&["hook", "session-start"], "s1", "s1"), "", "the mod handles s1");
+    assert!(!beat.exists(), "no heartbeat for a call the mod handles");
+    assert!(run(&["hook", "session-start", "--mod"], "s1", "s1").contains("rkb search"), "the mod's own call runs");
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_MOD", "s1");
+    let gate = serde_json::json!({ "session_id": "s1", "cwd": env.kb(), "tool_name": "Bash", "tool_input": { "command": "rkb confirm r-4f2a9c --choice continue" } });
+    assert!(stdout(&rkb_with(c, &["hook", "pre-tool"], &gate.to_string())).contains("\"ask\""), "the confirm gate always runs");
+    assert!(run(&["hook", "stop", "--harness", "pi"], "p7", "s1").is_empty(), "stop with no signal prints nothing");
+    assert!(env.dir.path().join("state/rkb/heartbeat/pi").exists(), "a pi session inside a Claude Code shell still runs");
+    assert!(run(&["hook", "session-start"], "s2", "s1").contains("rkb search"), "another session runs");
+}

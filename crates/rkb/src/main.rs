@@ -469,6 +469,9 @@ enum Cmd {
         /// The harness that calls: claude-code, pi or omp. Picks the heartbeat file only.
         #[arg(long, default_value = "claude-code")]
         harness: String,
+        /// Set by the Claude Code mod. Without it, a hook of the session in `RKB_MOD` does nothing.
+        #[arg(long = "mod")]
+        from_mod: bool,
     },
 }
 
@@ -641,8 +644,8 @@ fn main() -> ExitCode {
         println!("{text}");
         return ExitCode::from(exit);
     }
-    if let Some(Cmd::Hook { event, harness }) = &cli.cmd {
-        hook::run(event, harness);
+    if let Some(Cmd::Hook { event, harness, from_mod }) = &cli.cmd {
+        hook::run(event, harness, *from_mod);
         return ExitCode::SUCCESS;
     }
     if cli.toon && cli.format.is_some_and(|f| f != Format::Toon) {

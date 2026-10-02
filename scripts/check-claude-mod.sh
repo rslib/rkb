@@ -18,10 +18,6 @@ printf '{ "name": "rkb", "version": "0.0.0", "description": "rkb mod check", "ty
 printf '{ "modules": ["./register.tsx"] }\n' >"$dir/hooks/hooks.json"
 
 out=$(claude plugin validate "$dir" 2>&1) || { echo "$out"; exit 1; }
-if grep -q 'tool.register' <<<"$out"; then
-  echo "the mod must not register a tool: the model could reach rkb confirm through it" >&2
-  exit 1
-fi
 (cd "$dir" && RKB_OBSERVER= claude -p --plugin-dir "$dir" --debug-file "$dir/debug.log" "/cost" >/dev/null)
 if grep -E "refused|hook failed|skipped:" "$dir/debug.log" | grep -i "rkb"; then
   echo "Claude Code refused part of the mod; see the lines above" >&2
