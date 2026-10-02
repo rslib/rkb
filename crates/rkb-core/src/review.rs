@@ -386,6 +386,7 @@ pub fn curate_count(root: &Path, state: &Path) -> Result<usize> {
     weak.sort();
     weak.dedup();
     let n = candidates + pairs + weak.len();
+    let _ = std::fs::create_dir_all(state);
     let _ = std::fs::write(&path, serde_json::json!({ "date": today, "count": n }).to_string());
     Ok(n)
 }
