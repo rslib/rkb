@@ -40,6 +40,7 @@ impl Env {
             .env("FAKE_CLAUDE_HOME", self.dir.path())
             .env("RKB_TTY", self.dir.path().join("no-tty"))
             .env_remove("CLAUDECODE")
+            .env_remove("RKB_TEST_HOME")
             .env_remove("RKB_FORMAT")
             .env_remove("EMAIL")
             .env_remove("GIT_AUTHOR_NAME")
@@ -2029,6 +2030,15 @@ fn init_clone_sets_up_a_second_machine() {
     let o = rkb_with(c, &["init", "--clone", plain.to_str().unwrap(), "--format", "json"], "");
     assert_eq!(o.status.code(), Some(1));
     assert!(stdout(&o).contains("no kb.toml"), "{}", stdout(&o));
+}
+
+#[test]
+fn rkb_test_home_wins_over_rkb_home() {
+    let env = fixture_kb();
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_HOME", env.dir.path().join("elsewhere")).env("RKB_TEST_HOME", env.kb());
+    let o = rkb_with(c, &["lint"], "");
+    assert!(o.status.success(), "{}", stdout(&o));
 }
 
 fn hook(env: &Env, event: &str, payload: &serde_json::Value) -> String {

@@ -8,15 +8,17 @@ use crate::lesson::{self, Lesson, ParseError};
 pub const SCOPES: [&str; 3] = ["general", "systems", "projects"];
 
 /// The knowledge base root: `$RKB_HOME`, or `~/Personal/kb` when it is not set.
+/// `$RKB_TEST_HOME` wins over `$RKB_HOME` and is meant for tests that run under a user's shell profile.
 pub fn home() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    match std::env::var("RKB_HOME") {
-        Ok(p) if p == "~" => home,
-        Ok(p) => match p.strip_prefix("~/") {
+    let var = |k| std::env::var(k).ok().filter(|p| !p.is_empty());
+    match var("RKB_TEST_HOME").or_else(|| var("RKB_HOME")) {
+        Some(p) if p == "~" => home,
+        Some(p) => match p.strip_prefix("~/") {
             Some(rest) => home.join(rest),
             None => PathBuf::from(p),
         },
-        Err(_) => home.join("Personal/kb"),
+        None => home.join("Personal/kb"),
     }
 }
 
