@@ -430,6 +430,15 @@ enum Cmd {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Run a model step through another runner, such as the Claude Code mod: `prepare` prints a prompt and
+    /// the models to ask, `finish` reads the model's answer and does what rkb would do with it.
+    #[command(
+        after_help = "Example:\n  rkb job prepare observe --session 3f2a --transcript ~/.claude/projects/p/3f2a.jsonl --cwd ~/code/p\n  rkb job finish j-0a1b2c3d --part 0 --model sonnet < answer.txt\n  rkb job finish j-0a1b2c3d --part 0 --failed \"sonnet: overloaded\""
+    )]
+    Job {
+        #[command(subcommand)]
+        action: JobCmd,
+    },
     /// Download the local rerank model, or embed the lessons ahead of searches.
     #[command(after_help = "Example:\n  rkb models fetch\n  rkb models warm")]
     Models {
@@ -473,6 +482,50 @@ enum InboxCmd {
     Done {
         #[arg(required = true, num_args = 1..)]
         ids: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum JobCmd {
+    /// Prepare a job and print its first prompt, or print why there is nothing to do.
+    #[command(after_help = "Example:\n  rkb job prepare observe --session 3f2a --transcript ~/.claude/projects/p/3f2a.jsonl")]
+    Prepare {
+        #[command(subcommand)]
+        kind: PrepareCmd,
+    },
+    /// Give a job the model's answer to one part on stdin. Prints the next prompt, or the outcome after the last.
+    #[command(after_help = "Example:\n  rkb job finish j-0a1b2c3d --part 0 --model sonnet < answer.txt")]
+    Finish {
+        id: String,
+        #[arg(long)]
+        part: usize,
+        /// The chain entry whose model answered.
+        #[arg(long, required_unless_present = "failed")]
+        model: Option<String>,
+        /// Every model failed for this part; ends the job without a change and logs the reason.
+        #[arg(long, conflicts_with = "model")]
+        failed: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PrepareCmd {
+    /// The observer over the new part of one session, with the approved [observer] models.
+    #[command(after_help = "Example:\n  rkb job prepare observe --session 3f2a --transcript ~/.claude/projects/p/3f2a.jsonl")]
+    Observe {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        transcript: std::path::PathBuf,
+        /// claude-code, pi or omp.
+        #[arg(long, default_value = "claude-code")]
+        harness: String,
+        /// The session's working directory; picks the project and system for the lesson titles.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// The session's model, for a chain entry `session`.
+        #[arg(long)]
+        model: Option<String>,
     },
 }
 
@@ -804,6 +857,12 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Tool { .. } | Cmd::Mcp => unreachable!("main runs tools and the MCP server first"),
         Cmd::Observe { session, transcript, harness, cwd, model } => {
             inbox::observe(&env, &session, &transcript, &harness, cwd.as_deref(), model.as_deref())
+        }
+        Cmd::Job { action: JobCmd::Prepare { kind: PrepareCmd::Observe { session, transcript, harness, cwd, model } } } => {
+            inbox::prepare_observe(&env, &session, &transcript, &harness, cwd.as_deref(), model.as_deref())
+        }
+        Cmd::Job { action: JobCmd::Finish { id, part, model, failed } } => {
+            inbox::finish(&env, &id, part, model.as_deref(), failed.as_deref())
         }
         Cmd::Inbox { action: None } => inbox::list(&env),
         Cmd::Inbox { action: Some(InboxCmd::Show { id }) } => inbox::show(&env, &id),

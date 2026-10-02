@@ -17,6 +17,7 @@ pub mod image;
 pub mod import;
 pub mod init;
 pub mod install;
+pub mod job;
 pub mod kb;
 pub mod leak;
 pub mod lesson;

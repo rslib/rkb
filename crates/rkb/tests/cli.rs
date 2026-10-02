@@ -4879,3 +4879,68 @@ fn status_lists_waiting_work_and_session_injections() {
     assert!(v["requests"].as_array().unwrap().is_empty(), "{v}");
     assert_eq!((tree(&env.kb()), tree(&env.dir.path().join("state"))), before, "status changes no file");
 }
+
+#[test]
+fn model_jobs_run_the_observer_for_another_runner() {
+    let env = observer_env(0);
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/pi.jsonl");
+    let run = |args: &[&str], input: &str| -> (serde_json::Value, Option<i32>) {
+        let mut all = args.to_vec();
+        all.extend(["--format", "json"]);
+        let o = rkb_with(with_pi(&env), &all, input);
+        (serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o))), o.status.code())
+    };
+    let t = fixture.to_str().unwrap();
+    let prepare =
+        |s: &str| run(&["job", "prepare", "observe", "--session", s, "--transcript", t, "--harness", "pi", "--model", "openai/sol"], "");
+    let observe = |s: &str| run(&["observe", "--session", s, "--transcript", t, "--harness", "pi", "--model", "openai/sol"], "");
+    let answer = format!("Working...\n{OBSERVED_NOTE}\n");
+
+    let (v, code) = prepare("s1");
+    assert!(v["job"].is_null() && v["skipped"].as_str().unwrap().contains("not approved") && code == Some(0), "{v}");
+    approve_observer(&env);
+
+    let (a, code) = prepare("s1");
+    assert_eq!(code, Some(0), "{a}");
+    let id = a["job"].as_str().unwrap().to_string();
+    assert_eq!(a["models"], serde_json::json!([{ "entry": "bad", "model": "bad" }, { "entry": "session", "model": "openai/sol" }]));
+    assert_eq!((a["part"].as_u64(), a["parts"].as_u64()), (Some(0), Some(1)), "{a}");
+    let prompt = a["prompt"].as_str().unwrap();
+    assert!(prompt.contains("CMake keeps a failed find_package result in the cache") && prompt.contains("[user] The configure step fails"));
+    assert!(prepare("s3").0["skipped"].as_str().unwrap().contains("another observer run is active"), "one run at a time");
+    assert!(observe("s2").0["skipped"].as_str().unwrap().contains("another observer run is active"), "the CLI runner waits too");
+
+    let finish = |part: &str, model: &str, input: &str| run(&["job", "finish", &id, "--part", part, "--model", model], input);
+    assert_eq!(finish("1", "session", &answer).0["error"]["code"], "usage");
+    assert_eq!(finish("0", "opus", &answer).0["error"]["code"], "usage");
+    let (v, code) = finish("0", "session", &answer);
+    assert_eq!(
+        (v["outcome"].as_str(), v["notes"].as_u64(), v["dropped"].as_u64(), code),
+        (Some("added"), Some(1), Some(1), Some(0)),
+        "{v}"
+    );
+    assert_eq!(v["via"], "session (openai/sol)", "{v}");
+    let (show, _) = env.json(&["inbox", "show", v["id"].as_str().unwrap()], "");
+    assert_eq!((show["meta"]["session"].as_str(), show["body"].as_str()), (Some("s1"), Some(OBSERVED_NOTE)));
+    assert_eq!(finish("0", "session", &answer).0["error"]["code"], "not_found");
+
+    let (v, _) = prepare("s1");
+    assert!(v["job"].is_null() && v["skipped"].as_str().unwrap().contains("0 prompts"), "nothing new to observe: {v}");
+    assert!(observe("s1").0["skipped"].as_str().unwrap().contains("0 prompts"), "session end after the mod: {v}");
+    assert!(!env.dir.path().join("args.txt").exists(), "no model ran for s1 in the CLI runner");
+
+    let (v, _) = observe("s2");
+    let (other, _) = env.json(&["inbox", "show", v["id"].as_str().unwrap()], "");
+    assert_eq!(other["body"], show["body"], "both runners keep the same notes");
+
+    let (b, _) = prepare("s3");
+    let failed = run(&["job", "finish", b["job"].as_str().unwrap(), "--part", "0", "--failed", "session: overloaded"], "").0;
+    assert!(failed["error"]["message"].as_str().unwrap().contains("overloaded"), "{failed}");
+    let (c, _) = prepare("s3");
+    let c_id = c["job"].as_str().expect("the failed job is gone and the point stayed");
+    let path = env.dir.path().join(format!("state/rkb/jobs/{c_id}.json"));
+    let mut stored: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    stored["created"] = 1.into();
+    std::fs::write(&path, stored.to_string()).unwrap();
+    assert_eq!(run(&["job", "finish", c_id, "--part", "0", "--model", "session"], &answer).0["error"]["code"], "expired");
+}

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::approval::{self, Approval};
@@ -370,6 +371,121 @@ pub struct Job<'a> {
     pub titles: Vec<String>,
 }
 
+/// One observation in progress: the digest parts, which part goes next and what the parts before gave.
+/// `rkb observe` holds it in memory; a model job saves it between `rkb job prepare` and `rkb job finish`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Run {
+    pub session: String,
+    pub harness: String,
+    pub cwd: Option<String>,
+    /// The chain entries in order, each with the model to ask; `None` is the harness's default model.
+    pub models: Vec<(String, Option<String>)>,
+    pub titles: Vec<String>,
+    pub parts: Vec<String>,
+    /// The transcript offset this run ends at, recorded as the observed point when it completes.
+    pub end: u64,
+    pub next: usize,
+    pub kept: Vec<String>,
+    pub dropped: usize,
+    pub first_dropped: Option<String>,
+    pub via: Vec<String>,
+}
+
+pub enum Prepared {
+    Skipped(String),
+    Ready(Box<Run>),
+}
+
+/// The run for the entries of a session after its last observed point, or why there is none.
+pub fn prepare(state: &Path, cfg: &ObserverConfig, job: &Job) -> Result<Prepared> {
+    let chain = cfg.chain(job.harness);
+    if chain.is_empty() {
+        return Ok(Prepared::Skipped(format!("no observer chain for {}", job.harness)));
+    }
+    let records = crate::hooks::read(state, job.session);
+    let from = records.iter().rev().find(|r| r["kind"] == "observed").and_then(|r| r["offset"].as_u64());
+    let (steps, end) = distill::read_from(job.transcript, job.harness, from)?;
+    let d = distill::digest(&steps);
+    if d.prompts < cfg.min_prompts {
+        return Ok(Prepared::Skipped(format!("{} prompts, fewer than {}", d.prompts, cfg.min_prompts)));
+    }
+    let models = chain.iter().map(|m| (m.clone(), if m == "session" { job.model.map(str::to_string) } else { Some(m.clone()) })).collect();
+    Ok(Prepared::Ready(Box::new(Run {
+        session: job.session.into(),
+        harness: job.harness.into(),
+        cwd: job.cwd.map(str::to_string),
+        models,
+        titles: job.titles.clone(),
+        parts: d.parts,
+        end,
+        next: 0,
+        kept: vec![],
+        dropped: 0,
+        first_dropped: None,
+        via: vec![],
+    })))
+}
+
+impl Run {
+    /// The prompt for the next part: it lists the pending notes and the notes of the parts before.
+    pub fn prompt(&self, state: &Path) -> String {
+        let mut known = pending(state, self.cwd.as_deref());
+        known.extend(self.kept.iter().cloned());
+        prompt(&self.titles, &known, &self.parts[self.next])
+    }
+
+    /// Takes the output of chain entry `entry` for the next part, after `failures` of the entries before it.
+    /// Returns the outcome once the last part is answered: the inbox item is written, the observed point
+    /// moved and the outcome logged.
+    pub fn answer(&mut self, state: &Path, entry: &str, failures: &[String], out: &str) -> Result<Option<Observed>> {
+        let model = self.models.iter().find(|(e, _)| e == entry).and_then(|(_, m)| m.clone());
+        let name = if entry == "session" { format!("session ({})", model.as_deref().unwrap_or("default")) } else { entry.to_string() };
+        let name = if failures.is_empty() { name } else { format!("{name} ({})", failures.join("; ")) };
+        if !self.via.contains(&name) {
+            self.via.push(name);
+        }
+        let n = parse_notes(out);
+        self.dropped += n.dropped;
+        self.first_dropped = self.first_dropped.take().or(n.first_dropped);
+        self.kept.extend(n.notes);
+        self.next += 1;
+        if self.next < self.parts.len() {
+            return Ok(None);
+        }
+        let via = self.via.join(", ");
+        let o = if self.kept.is_empty() {
+            Observed::NoNotes { dropped: self.dropped, via }
+        } else {
+            let meta = Meta {
+                kind: Kind::Observed,
+                time: request::now(),
+                harness: Some(self.harness.clone()),
+                session: Some(self.session.clone()),
+                cwd: self.cwd.clone(),
+                signals: vec![],
+                priority: Some(priority(&self.kept)),
+                source: None,
+            };
+            Observed::Added { item: distill::add(state, meta, &self.kept.join("\n"))?, dropped: self.dropped, via }
+        };
+        crate::hooks::append(state, &self.session, &json!({ "kind": "observed", "offset": self.end }))?;
+        record(state, &self.session, self.parts.len(), &o, self.first_dropped.as_deref());
+        Ok(Some(o))
+    }
+
+    /// Ends the run when every model failed: nothing is added and the observed point stays.
+    pub fn fail(&self, state: &Path, reason: String) -> Observed {
+        fail(state, &self.session, self.parts.len(), reason)
+    }
+
+    /// Logs a run that could not start because another run is active.
+    pub fn busy(&self, state: &Path) -> Observed {
+        let o = Observed::Skipped("another observer run is active".into());
+        record(state, &self.session, self.parts.len(), &o, None);
+        o
+    }
+}
+
 /// Observes the entries of a session after its last observed point with the harness's chain.
 pub fn observe(state: &Path, cfg: &ObserverConfig, job: &Job) -> Result<Observed> {
     let timeout = Duration::from_secs(cfg.timeout_secs);
@@ -382,80 +498,45 @@ pub fn observe(state: &Path, cfg: &ObserverConfig, job: &Job) -> Result<Observed
 
 /// `observe`, with `run_model(model, prompt)` in place of running the harness.
 fn observe_with(state: &Path, cfg: &ObserverConfig, job: &Job, run_model: impl Fn(Option<&str>, &str) -> Result<Ran>) -> Result<Observed> {
-    let chain = cfg.chain(job.harness);
-    if chain.is_empty() {
-        return Ok(Observed::Skipped(format!("no observer chain for {}", job.harness)));
-    }
-    let records = crate::hooks::read(state, job.session);
-    let from = records.iter().rev().find(|r| r["kind"] == "observed").and_then(|r| r["offset"].as_u64());
-    let (steps, end) = distill::read_from(job.transcript, job.harness, from)?;
-    let d = distill::digest(&steps);
-    if d.prompts < cfg.min_prompts {
-        return Ok(Observed::Skipped(format!("{} prompts, fewer than {}", d.prompts, cfg.min_prompts)));
-    }
+    let mut run = match prepare(state, cfg, job)? {
+        Prepared::Skipped(r) => return Ok(Observed::Skipped(r)),
+        Prepared::Ready(r) => *r,
+    };
     std::fs::create_dir_all(state).map_err(io(state))?;
-    let busy = || Observed::Skipped("another observer run is active".into());
-    let _guard = match lock::acquire(&state.join("observer-run.lock"), 6 * 3600, Duration::ZERO) {
+    let _guard = match lock::acquire(&run_lock(state), 6 * 3600, Duration::ZERO) {
         Ok(g) => g,
-        Err(Error::Locked(_)) => {
-            let o = busy();
-            record(state, job.session, d.parts.len(), &o, None);
-            return Ok(o);
-        }
+        Err(Error::Locked(_)) => return Ok(run.busy(state)),
         Err(e) => return Err(e),
     };
+    if crate::job::open(state).iter().any(|j| matches!(j.job, crate::job::Job::Observe(_))) {
+        return Ok(run.busy(state));
+    }
     prune(state);
-    let mut pending = pending(state, job.cwd);
-    let mut kept: Vec<String> = vec![];
-    let mut dropped = 0;
-    let mut first_dropped: Option<String> = None;
-    let mut via: Vec<String> = vec![];
-    for part in &d.parts {
-        let input = prompt(&job.titles, &pending, part);
+    loop {
+        let input = run.prompt(state);
         let mut failures: Vec<String> = vec![];
-        let mut answer = None;
-        for m in chain {
-            let model = if m == "session" { job.model } else { Some(m.as_str()) };
-            match run_model(model, &input)? {
+        let mut done = None;
+        for (entry, model) in run.models.clone() {
+            match run_model(model.as_deref(), &input)? {
                 Ran::Ok(out) => {
-                    answer = Some(out);
-                    let name = if m == "session" { format!("session ({})", model.unwrap_or("default")) } else { m.clone() };
-                    let entry = if failures.is_empty() { name } else { format!("{name} ({})", failures.join("; ")) };
-                    if !via.contains(&entry) {
-                        via.push(entry);
-                    }
+                    done = Some(run.answer(state, &entry, &failures, &out)?);
                     break;
                 }
-                Ran::Failed(r) => failures.push(format!("{m}: {r}")),
-                Ran::Timeout => failures.push(format!("{m}: timeout")),
+                Ran::Failed(r) => failures.push(format!("{entry}: {r}")),
+                Ran::Timeout => failures.push(format!("{entry}: timeout")),
             }
         }
-        let Some(out) = answer else { return Ok(fail(state, job.session, d.parts.len(), failures.join("; "))) };
-        let n = parse_notes(&out);
-        dropped += n.dropped;
-        first_dropped = first_dropped.or(n.first_dropped);
-        pending.extend(n.notes.iter().cloned());
-        kept.extend(n.notes);
+        match done {
+            None => return Ok(run.fail(state, failures.join("; "))),
+            Some(Some(o)) => return Ok(o),
+            Some(None) => {}
+        }
     }
-    let via = via.join(", ");
-    let o = if kept.is_empty() {
-        Observed::NoNotes { dropped, via }
-    } else {
-        let meta = Meta {
-            kind: Kind::Observed,
-            time: request::now(),
-            harness: Some(job.harness.to_string()),
-            session: Some(job.session.to_string()),
-            cwd: job.cwd.map(str::to_string),
-            signals: vec![],
-            priority: Some(priority(&kept)),
-            source: None,
-        };
-        Observed::Added { item: distill::add(state, meta, &kept.join("\n"))?, dropped, via }
-    };
-    crate::hooks::append(state, job.session, &json!({ "kind": "observed", "offset": end }))?;
-    record(state, job.session, d.parts.len(), &o, first_dropped.as_deref());
-    Ok(o)
+}
+
+/// One observer run at a time per machine, whichever runner runs it.
+pub fn run_lock(state: &Path) -> PathBuf {
+    state.join("observer-run.lock")
 }
 
 fn fail(state: &Path, session: &str, parts: usize, reason: String) -> Observed {
