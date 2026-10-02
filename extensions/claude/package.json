@@ -1,0 +1,12 @@
+{
+  "name": "rkb-claude-mod",
+  "private": true,
+  "description": "The rkb mod for Claude Code. rkb embeds hooks/register.tsx and types/index.d.ts and writes them with `rkb install claude`; it is not published.",
+  "type": "module",
+  "scripts": {
+    "check": "../../scripts/check-claude-mod.sh"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  }
+}

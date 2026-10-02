@@ -6,6 +6,9 @@ use crate::error::{Error, Result, io};
 
 /// The rkb skill, built into the binary so an installed copy always matches it.
 pub const SKILL: &str = include_str!("../../../skills/rkb/SKILL.md");
+/// The Claude Code mod and its state contract, with `"__RKB__"` where the rkb binary goes.
+const MOD: &str = include_str!("../../../extensions/claude/hooks/register.tsx");
+const MOD_TYPES: &str = include_str!("../../../extensions/claude/types/index.d.ts");
 /// The `/rkb-retro`, `/rkb-distill` and `/rkb-curate` command prompts: file name and text with frontmatter.
 pub const COMMANDS: [(&str, &str); 3] = [
     ("rkb-retro.md", include_str!("../../../skills/rkb/commands/rkb-retro.md")),
@@ -49,8 +52,6 @@ pub fn claude_program() -> String {
     std::env::var("RKB_CLAUDE").unwrap_or_else(|_| "claude".into())
 }
 
-/// The marketplace files, relative to `plugin_dir`, and the plugin version, which carries a hash of
-/// the content so a changed binary path or prompt makes `claude plugin update` pick it up.
 /// The Claude Code model for the distill command: `claude-code` under `[distill]` in this machine's
 /// `config.toml`, when it is a plain model name. Unit tests never read the user's file.
 pub fn distill_model() -> Option<String> {
@@ -76,6 +77,8 @@ fn with_model(command: &str, model: Option<&str>) -> String {
     }
 }
 
+/// The marketplace files, relative to `plugin_dir`, and the plugin version, which carries a hash of
+/// the content so a changed binary path or prompt makes `claude plugin update` pick it up.
 pub fn plugin_files(bin: &str) -> (Vec<(String, String)>, String) {
     use sha2::{Digest, Sha256};
     let mut hooks = serde_json::Map::new();
@@ -92,7 +95,12 @@ pub fn plugin_files(bin: &str) -> (Vec<(String, String)>, String) {
         ("plugins/rkb/commands/retro.md".to_string(), COMMANDS[0].1.to_string()),
         ("plugins/rkb/commands/distill.md".to_string(), with_model(&distill_command(), distill_model().as_deref())),
         ("plugins/rkb/commands/curate.md".to_string(), COMMANDS[2].1.to_string()),
-        ("plugins/rkb/hooks/hooks.json".to_string(), pretty(serde_json::json!({ "hooks": hooks }))),
+        ("plugins/rkb/hooks/hooks.json".to_string(), pretty(serde_json::json!({ "hooks": hooks, "modules": ["./register.tsx"] }))),
+        (
+            "plugins/rkb/hooks/register.tsx".to_string(),
+            MOD.replace("\"__RKB__\"", &serde_json::to_string(bin).expect("a string serializes")),
+        ),
+        ("plugins/rkb/types/index.d.ts".to_string(), MOD_TYPES.to_string()),
         ("plugins/rkb/.mcp.json".to_string(), pretty(serde_json::json!({ "mcpServers": { "rkb": { "command": bin, "args": ["mcp"] } } }))),
     ];
     let mut h = Sha256::new();
@@ -115,7 +123,9 @@ pub fn plugin_files(bin: &str) -> (Vec<(String, String)>, String) {
     ));
     files.push((
         "plugins/rkb/.claude-plugin/plugin.json".into(),
-        pretty(serde_json::json!({ "name": "rkb", "version": version, "description": about, "author": author })),
+        pretty(
+            serde_json::json!({ "name": "rkb", "version": version, "description": about, "author": author, "types": "./types/index.d.ts" }),
+        ),
     ));
     (files, version)
 }
@@ -885,9 +895,28 @@ mod tests {
         }
         let d = tempfile::tempdir().unwrap();
         write_plugin(d.path(), "rkb").unwrap();
-        let out = std::process::Command::new("claude").args(["plugin", "validate"]).arg(d.path()).output().unwrap();
-        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-        assert!(out.status.success() && !text.contains("warning"), "{text}");
+        for dir in [d.path().to_path_buf(), d.path().join("plugins/rkb")] {
+            let out = std::process::Command::new("claude").args(["plugin", "validate"]).arg(&dir).output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success() && !text.contains("warning"), "{text}");
+        }
+    }
+
+    #[test]
+    fn plugin_carries_the_mod() {
+        let (files, version) = plugin_files("/opt/rkb's bin/rkb");
+        let file = |p: &str| files.iter().find(|(path, _)| path == p).map(|(_, t)| t.clone()).unwrap_or_default();
+        let module = file("plugins/rkb/hooks/register.tsx");
+        assert!(module.contains(r#"const RKB: string = "/opt/rkb's bin/rkb""#) && !module.contains("__RKB__"), "{module}");
+        assert!(file("plugins/rkb/types/index.d.ts").contains("interface PluginState"));
+        let hooks: serde_json::Value = serde_json::from_str(&file("plugins/rkb/hooks/hooks.json")).unwrap();
+        assert_eq!(hooks["modules"], serde_json::json!(["./register.tsx"]));
+        assert_eq!(hooks["hooks"]["Stop"][0]["hooks"][0]["command"], "/opt/rkb's bin/rkb hook stop", "command hooks stay");
+        let manifest: serde_json::Value = serde_json::from_str(&file("plugins/rkb/.claude-plugin/plugin.json")).unwrap();
+        assert_eq!((manifest["types"].as_str(), manifest["version"].as_str()), (Some("./types/index.d.ts"), Some(version.as_str())));
+        let hashed = files.iter().position(|(p, _)| p == "plugins/rkb/hooks/register.tsx").unwrap();
+        let manifest_at = files.iter().position(|(p, _)| p == "plugins/rkb/.claude-plugin/plugin.json").unwrap();
+        assert!(hashed < manifest_at, "the version hash covers the mod");
     }
 
     #[test]
