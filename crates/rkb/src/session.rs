@@ -86,8 +86,14 @@ pub fn auto(env: &Env, kind: &str) -> Result<Output, CliError> {
     let kind = Kind::parse(kind)
         .ok_or_else(|| CliError::new(crate::output::ErrorCode::Usage, format!("unknown run `{kind}`"), "use distill or curate"))?;
     kb::open(&env.root)?;
-    let curate = rkb_core::review::curate_count(&env.root, &env.state)?;
-    let g = auto::claim(&env.state, &rkb_core::paths::config_dir(), kind, curate, rkb_core::request::now())?;
+    let (cfg, now) = (rkb_core::paths::config_dir(), rkb_core::request::now());
+    let mut curate = rkb_core::review::curate_count(&env.root, &env.state)?;
+    // Lesson text goes to Jev only when the run would start; the check drops the cached count.
+    if kind == Kind::Curate && auto::gate(&env.state, &cfg, kind, curate, now).due {
+        let _ = crate::graphing::dupes(env, None, true, false);
+        curate = rkb_core::review::curate_count(&env.root, &env.state)?;
+    }
+    let g = auto::claim(&env.state, &cfg, kind, curate, now)?;
     let human = if g.due { format!("claimed {}: {}", kind.as_str(), g.reason) } else { format!("not now: {}", g.reason) };
     Ok(Output { data: json!({ "claimed": g.due, "reason": g.reason }), human, exit: 0, raw: false })
 }

@@ -7,8 +7,10 @@ use std::time::Duration;
 
 use rkb_core::config::{self, KbConfig};
 use rkb_core::doctor::{Check, Level};
+use rkb_core::dupes::{self, Verdict};
 use rkb_core::kb::Snapshot;
 use rkb_core::leak::LeakScanner;
+use rkb_core::lesson::Lesson;
 use rkb_core::rerank::{self, Opener, Ranked, Reranker, Settings};
 use rkb_core::search::{self, Hit};
 
@@ -279,6 +281,72 @@ pub fn jev_worth(root: &Path, project: Option<&str>, texts: &[&str]) -> Option<(
         })
         .collect();
     Some((JEV.to_string(), answers))
+}
+
+const RELATIONS: [(&str, &str); 4] = [
+    ("same", "One lesson can replace the other; they teach the same thing"),
+    ("extends", "One adds steps or cases to the other on the same topic"),
+    ("conflicts", "They disagree about what to do"),
+    ("different", "They teach different things even if they share words"),
+];
+
+/// Asks Jev how each pair of lessons relates, 10 pairs to a request. `None` when Jev is not in the
+/// chain; a pair either lesson of which the guard keeps from Jev gets the reason instead.
+pub fn jev_dupes(root: &Path, pairs: &[(&Lesson, &Lesson)]) -> Option<Vec<Result<Verdict, String>>> {
+    if !Settings::load(root).chain.iter().any(|b| b == JEV) {
+        return None;
+    }
+    let every = |why: String| Some(pairs.iter().map(|_| Err(why.clone())).collect());
+    let client = match jev_client() {
+        Ok(c) => c,
+        Err(why) => return every(why),
+    };
+    let kb: KbConfig = std::fs::read_to_string(root.join("kb.toml")).ok().and_then(|t| config::parse(&t).ok()).unwrap_or_default();
+    let Some(sink) = kb.sinks.get(JEV) else { return every("kb.toml has no [sinks.jev]".into()) };
+    let Ok(snap) = Snapshot::from_dir(root) else { return every("the labels could not be read".into()) };
+    let env = rkb_core::lint::LintEnv::from_process();
+    let scanner = LeakScanner::new(&kb.leak, env.user.as_deref(), env.home.as_deref());
+    let guard = |l: &Lesson| {
+        let labels = rkb_core::write::effective_at(&snap, &l.path);
+        if !config::sink_allows(&sink.allow, &labels) {
+            return Err(format!("label {}", labels.values().cloned().collect::<Vec<_>>().join(", ")));
+        }
+        if !scanner.scan(&dupes::text(l)).is_empty() {
+            return Err("leak scan".to_string());
+        }
+        Ok(())
+    };
+    let mut out: Vec<Result<Verdict, String>> = pairs.iter().map(|&(a, b)| guard(a).and(guard(b)).map(|_| Verdict::default())).collect();
+    let sent: Vec<usize> = (0..pairs.len()).filter(|&i| out[i].is_ok()).collect();
+    let criteria: serde_json::Map<String, serde_json::Value> =
+        RELATIONS.iter().map(|(k, m)| (k.to_string(), serde_json::json!(m))).collect();
+    for batch in sent.chunks(10) {
+        let mut state = String::from("Pairs of lessons from a knowledge base:");
+        let mut questions = serde_json::Map::new();
+        for (n, &i) in batch.iter().enumerate() {
+            let cut = |l: &Lesson| dupes::text(l).chars().take(2000).collect::<String>();
+            state.push_str(&format!("\n\n[{n}]\nA: {}\nB: {}", cut(pairs[i].0), cut(pairs[i].1)));
+            questions.insert(
+                format!("pair_{n}"),
+                serde_json::json!({ "type": "choice", "instructions": format!("How do lesson A and lesson B of pair [{n}] relate?"), "criteria": criteria }),
+            );
+        }
+        let answer = client.post(&state, questions);
+        for (n, &i) in batch.iter().enumerate() {
+            out[i] = answer.as_ref().map_err(|e| e.clone()).and_then(|v| {
+                let a = &v["answers"][format!("pair_{n}")];
+                let choice = a["choice"].as_str().ok_or("no answer")?;
+                let prob = |k: &str| a["probabilities"][k].as_f64().unwrap_or(if k == choice { 1.0 } else { 0.0 });
+                Ok(Verdict {
+                    hash: dupes::hash(pairs[i].0, pairs[i].1),
+                    verdict: choice.to_string(),
+                    p: prob(choice),
+                    different: prob("different"),
+                })
+            });
+        }
+    }
+    Some(out)
 }
 
 impl Reranker for JevBackend {

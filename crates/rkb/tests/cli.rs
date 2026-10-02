@@ -1635,6 +1635,133 @@ fn dupes_lists_only_the_duplicate_pair() {
     assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
 }
 
+/// The graph fixture with Jev in the chain, whose reply rates every pair `verdict`.
+fn dupes_jev(verdict: &'static str) -> (Env, String, JevLog) {
+    let env = graph_kb();
+    set_chain(&env, "chain = [\"jev\", \"bm25\"]");
+    jev_config(&env, "[jev]\napi_key = \"k\"\n", 0o600);
+    let (url, log) = fake_jev(move |body| {
+        let answers: serde_json::Map<String, serde_json::Value> = body["questions"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| {
+                let other = if verdict == "different" { "same" } else { "different" };
+                let a = serde_json::json!({ "type": "choice", "choice": verdict, "probabilities": { verdict: 0.8, other: 0.1 } });
+                (k.clone(), a)
+            })
+            .collect();
+        (200, serde_json::json!({ "answers": answers }).to_string())
+    });
+    (env, url, log)
+}
+
+fn dupes_run(env: &Env, url: &str, args: &[&str]) -> serde_json::Value {
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_JEV_URL", url);
+    let mut all = args.to_vec();
+    all.extend(["--format", "json"]);
+    let o = rkb_with(c, &all, "");
+    serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)))
+}
+
+#[test]
+fn dupes_check_asks_once_and_again_after_an_edit() {
+    let (env, url, log) = dupes_jev("same");
+    let v = dupes_run(&env, &url, &["dupes", "--check"]);
+    assert_eq!(v["pairs"][0]["jev"]["verdict"], "same", "{v}");
+    assert_eq!(v["pairs"][0]["jev"]["p"], 0.8, "{v}");
+    let body = log.lock().unwrap()[0].1.clone();
+    assert_eq!(body["questions"].as_object().unwrap().len(), 1, "{body}");
+    assert!(body["state"].as_str().unwrap().contains("A: "), "{body}");
+    dupes_run(&env, &url, &["dupes", "--check"]);
+    assert_eq!(log.lock().unwrap().len(), 1, "asked once");
+    let p = env.kb().join("general/build/new-library-not-found-until-cmake-cache-is-cleared.md");
+    std::fs::write(&p, std::fs::read_to_string(&p).unwrap() + "\nAlso delete CMakeCache.txt by hand.\n").unwrap();
+    dupes_run(&env, &url, &["dupes", "--check"]);
+    assert_eq!(log.lock().unwrap().len(), 2, "asked again after an edit");
+}
+
+#[test]
+fn dupes_check_without_jev_changes_nothing() {
+    let env = graph_kb();
+    let v = dupes_run(&env, "http://127.0.0.1:1/", &["dupes", "--check"]);
+    assert!(v["check"].as_str().unwrap().contains("not in the rerank chain"), "{v}");
+    assert!(!env.dir.path().join("state/rkb/dupes.json").exists());
+}
+
+#[test]
+fn dupes_check_keeps_internal_lessons_from_jev() {
+    let (env, url, log) = dupes_jev("same");
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write(
+        "kb.toml",
+        &toml.replace(
+            "[sinks.jev]\nallow = { sensitivity = [\"public\", \"internal\"] }",
+            "[sinks.jev]\nallow = { sensitivity = [\"public\"] }",
+        ),
+    );
+    env.write("general/README.md", "---\nlabels:\n  sensitivity: public\n---\n\n# General\n");
+    env.write("general/build/README.md", "---\nlabels:\n  sensitivity: internal\n---\n\n# Build\n");
+    let v = dupes_run(&env, &url, &["dupes", "--check"]);
+    assert_eq!(v["pairs"][0]["jev"]["unchecked"], "jev: label internal", "{v}");
+    assert!(log.lock().unwrap().is_empty(), "nothing was sent");
+}
+
+#[test]
+fn dupes_hide_pairs_rated_different_unless_all() {
+    let (env, url, _) = dupes_jev("different");
+    let v = dupes_run(&env, &url, &["dupes", "--check"]);
+    assert_eq!((v["pairs"].as_array().unwrap().len(), &v["hidden"]), (0, &serde_json::json!(1)), "{v}");
+    let human = stdout(&env.rkb(&["dupes", "--format", "human"]));
+    assert!(human.contains("1 pairs hidden") && human.contains("--all"), "{human}");
+    let v = dupes_run(&env, &url, &["dupes", "--all"]);
+    assert_eq!(v["pairs"][0]["jev"], serde_json::json!({ "verdict": "different", "p": 0.8 }), "{v}");
+    let human = stdout(&env.rkb(&["dupes", "--all", "--format", "human"]));
+    assert!(human.contains("different 0.80"), "{human}");
+}
+
+#[test]
+fn dupes_hide_pairs_from_the_curate_count() {
+    let (env, url, _) = dupes_jev("different");
+    let count = |env: &Env| {
+        let _ = std::fs::remove_file(env.dir.path().join("state/rkb/curate.json"));
+        let o = rkb_with(
+            env.cmd(env!("CARGO_BIN_EXE_rkb")),
+            &["hook", "session-start"],
+            &serde_json::json!({ "session_id": "s", "source": "startup", "cwd": env.kb() }).to_string(),
+        );
+        assert!(o.status.success());
+        let c: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(env.dir.path().join("state/rkb/curate.json")).unwrap()).unwrap();
+        c["count"].as_u64().unwrap()
+    };
+    let before = count(&env);
+    dupes_run(&env, &url, &["dupes", "--check"]);
+    assert!(!env.dir.path().join("state/rkb/curate.json").exists(), "--check drops the cached count");
+    assert_eq!(count(&env) + 1, before);
+}
+
+#[test]
+fn auto_claim_curate_checks_dupes_only_when_due() {
+    let (env, url, log) = dupes_jev("different");
+    let reason = |env: &Env| {
+        let v = dupes_run(env, &url, &["auto", "claim", "curate"]);
+        (v["claimed"].as_bool().unwrap(), v["reason"].as_str().unwrap().to_string())
+    };
+    let _ = std::fs::remove_file(env.dir.path().join("state/rkb/curate.json"));
+    let (claimed, why) = reason(&env);
+    assert!(!claimed && why.starts_with("off"), "{why}");
+    assert!(log.lock().unwrap().is_empty(), "auto is off: no request");
+    let cache = env.dir.path().join("state/rkb/curate.json");
+    let before = serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&cache).unwrap()).unwrap()["count"].as_u64().unwrap();
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[jev]\napi_key = \"k\"\n\n[distill]\nauto = true\n");
+    std::fs::set_permissions(env.dir.path().join("config/rkb/config.toml"), std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let (claimed, why) = reason(&env);
+    assert_eq!(log.lock().unwrap().len(), 1, "due: asked");
+    assert!(claimed && why.starts_with(&format!("{} ", before - 1)), "the hidden pair is not counted ({before} before): {why}");
+}
+
 #[test]
 fn add_names_a_similar_lesson_in_another_folder() {
     let env = search_kb();

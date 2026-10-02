@@ -8,6 +8,7 @@ pub mod conditions;
 pub mod config;
 pub mod distill;
 pub mod doctor;
+pub mod dupes;
 pub mod error;
 pub mod eval;
 pub mod facts;

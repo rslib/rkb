@@ -115,11 +115,17 @@ enum Cmd {
         limit: usize,
     },
     /// List pairs of lessons that may say the same thing, most similar first. Changes nothing.
-    #[command(after_help = "Example:\n  rkb dupes\n  rkb dupes --min 0.3")]
+    #[command(after_help = "Example:\n  rkb dupes\n  rkb dupes --check\n  rkb dupes --min 0.3")]
     Dupes {
         /// Similarity from 0 to 1. Default: `dupes.min_similarity` in kb.toml, or 0.4.
         #[arg(long)]
         min: Option<f64>,
+        /// Ask Jev how each unchecked pair relates (same, extends, conflicts, different); pairs rated different are then hidden.
+        #[arg(long)]
+        check: bool,
+        /// Show the pairs Jev rated different too.
+        #[arg(long)]
+        all: bool,
     },
     /// List the lessons connected to one lesson: links, supersedes, similar words, shared tags.
     #[command(after_help = "Example:\n  rkb related 7f3a9c2b41")]
@@ -792,9 +798,9 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
                 searching::eval(&env, queries, self_check, min_recall, rerank.as_deref().unwrap_or(rkb_core::rerank::BM25), recall_sweep)
             }
         }
-        Cmd::Dupes { min } => {
+        Cmd::Dupes { min, check, all } => {
             kb::open(&root)?;
-            graphing::dupes(&env, min)
+            graphing::dupes(&env, min, check, all)
         }
         Cmd::Related { id, limit } => {
             kb::open(&root)?;

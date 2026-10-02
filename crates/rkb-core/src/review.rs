@@ -379,7 +379,9 @@ pub fn curate_count(root: &Path, state: &Path) -> Result<usize> {
         return Ok(n as usize);
     }
     let candidates = review(root, state, None)?.len();
-    let pairs = crate::graph::Graph::load(root)?.dupes(crate::graph::min_similarity(root)).len();
+    let keep = crate::triage::Thresholds::load(&crate::paths::config_dir()).keep;
+    let pairs =
+        crate::dupes::shown(&crate::graph::Graph::load(root)?, crate::graph::min_similarity(root), &crate::dupes::load(state), keep).len();
     let snap = Snapshot::from_dir(root)?;
     let mut weak: Vec<String> = crate::lint::lint(&snap, &crate::lint::LintEnv::default(), None)
         .into_iter()

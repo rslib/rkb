@@ -1,8 +1,13 @@
+use std::collections::BTreeMap;
+
+use rkb_core::dupes;
 use rkb_core::graph::{self, Edge, Graph};
+use rkb_core::triage::Thresholds;
 use serde_json::{Value, json};
 
 use crate::list::{cut, marks, width};
 use crate::output::{CliError, Output, paint};
+use crate::rerankers;
 use crate::writes::Env;
 
 fn lesson_json(g: &Graph, i: usize) -> Value {
@@ -55,12 +60,51 @@ fn find(g: &Graph, id: &str) -> Result<usize, CliError> {
     g.find(id).ok_or_else(|| rkb_core::Error::NotFound(id.to_string()).into())
 }
 
-pub fn dupes(env: &Env, min: Option<f64>) -> Result<Output, CliError> {
+pub fn dupes(env: &Env, min: Option<f64>, check: bool, all: bool) -> Result<Output, CliError> {
     let g = load(env)?;
     let min = min.unwrap_or_else(|| graph::min_similarity(&env.root));
-    let pairs = g.dupes(min);
+    let mut cache = dupes::load(&env.state);
+    let mut why: BTreeMap<(usize, usize), String> = BTreeMap::new();
+    let mut note = None;
+    if check {
+        let todo: Vec<(usize, usize)> = g
+            .dupes(min)
+            .into_iter()
+            .map(|p| (p.0, p.1))
+            .filter(|&(a, b)| dupes::get(&cache, &g.lessons[a], &g.lessons[b]).is_none())
+            .collect();
+        let lessons: Vec<_> = todo.iter().map(|&(a, b)| (&g.lessons[a], &g.lessons[b])).collect();
+        note = Some(match rerankers::jev_dupes(&env.root, &lessons) {
+            None => "jev is not in the rerank chain, so nothing was checked".to_string(),
+            Some(answers) => {
+                let mut asked = 0;
+                for (&(a, b), r) in todo.iter().zip(answers) {
+                    match r {
+                        Ok(v) => {
+                            asked += 1;
+                            cache.insert(dupes::key(&g.lessons[a], &g.lessons[b]), v);
+                        }
+                        Err(e) => {
+                            why.insert((a, b), format!("jev: {e}"));
+                        }
+                    }
+                }
+                dupes::save(&env.state, &cache).map_err(|source| rkb_core::Error::Io { path: env.state.join("dupes.json"), source })?;
+                let _ = std::fs::remove_file(env.state.join("curate.json"));
+                format!("checked {asked} pairs, {} unchecked", why.len())
+            }
+        });
+    }
+    let keep = Thresholds::load(&rkb_core::paths::config_dir()).keep;
+    let total = g.dupes(min).len();
+    let pairs = if all { g.dupes(min) } else { dupes::shown(&g, min, &cache, keep) };
+    let hidden = total - pairs.len();
+    let verdict = |a: usize, b: usize| dupes::get(&cache, &g.lessons[a], &g.lessons[b]);
     let (c, m, w) = (env.colored, marks(), width());
     let mut human = format!("{} {} {} pairs at or above {min:.2}\n", paint(c, "1", "dupes"), m.sep, pairs.len());
+    if let Some(n) = &note {
+        human.push_str(&format!("{n}\n"));
+    }
     for &(a, b, s) in &pairs {
         for (i, lead) in [(a, format!("{s:.2}")), (b, "    ".to_string())] {
             let l = &g.lessons[i];
@@ -70,6 +114,11 @@ pub fn dupes(env: &Env, min: Option<f64>) -> Result<Output, CliError> {
                 cut(&graph::title(l), w.saturating_sub(9), m),
                 paint(c, "2", &format!("{} {} {}", l.frontmatter.id, m.sep, l.path))
             ));
+        }
+        match (verdict(a, b), why.get(&(a, b))) {
+            (Some(v), _) => human.push_str(&format!("\n       {}", paint(c, "33", &format!("{} {:.2}", v.verdict, v.p)))),
+            (_, Some(e)) => human.push_str(&format!("\n       {}", paint(c, "33", &format!("unchecked ({e})")))),
+            _ => {}
         }
         human.push('\n');
     }
@@ -82,11 +131,26 @@ pub fn dupes(env: &Env, min: Option<f64>) -> Result<Output, CliError> {
             "To merge, with the user's agreement: `rkb edit` the lesson to keep, then `rkb supersede <other> --by <kept>`".to_string(),
         ]
     };
+    if hidden > 0 {
+        human.push_str(&format!("\n{hidden} pairs hidden: Jev rated them different. `rkb dupes --all` shows them.\n"));
+    }
     let rows: Vec<Value> = pairs
         .iter()
-        .map(|&(a, b, s)| json!({ "similarity": (s * 100.0).round() / 100.0, "a": lesson_json(&g, a), "b": lesson_json(&g, b) }))
+        .map(|&(a, b, s)| {
+            let mut row = json!({ "similarity": (s * 100.0).round() / 100.0, "a": lesson_json(&g, a), "b": lesson_json(&g, b) });
+            if let Some(v) = verdict(a, b) {
+                row["jev"] = json!({ "verdict": v.verdict, "p": (v.p * 100.0).round() / 100.0 });
+            } else if let Some(e) = why.get(&(a, b)) {
+                row["jev"] = json!({ "unchecked": e });
+            }
+            row
+        })
         .collect();
-    Ok(Output { data: json!({ "min_similarity": min, "pairs": rows, "help": help }), human, exit: 0, raw: false })
+    let mut data = json!({ "min_similarity": min, "pairs": rows, "hidden": hidden, "help": help });
+    if let Some(n) = note {
+        data["check"] = json!(n);
+    }
+    Ok(Output { data, human, exit: 0, raw: false })
 }
 
 pub fn related(env: &Env, id: &str, limit: usize) -> Result<Output, CliError> {
