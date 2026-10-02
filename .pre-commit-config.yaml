@@ -24,8 +24,8 @@ repos:
         always_run: true
       - id: extension-check
         name: extension type check
-        # Runs once `npm install` has run in extensions/rkb; the Rust tests drive the extension itself.
-        entry: sh -c '[ ! -d extensions/rkb/node_modules ] || npm --prefix extensions/rkb run --silent check'
+        # Runs once `npm install` has run in extensions/pi; the Rust tests drive the extension itself.
+        entry: sh -c '[ ! -d extensions/pi/node_modules ] || npm --prefix extensions/pi run --silent check'
         language: system
         pass_filenames: false
         always_run: true

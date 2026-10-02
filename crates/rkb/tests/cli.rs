@@ -2419,9 +2419,9 @@ fn extension_drives_rkb_hook() {
     std::fs::write(env.kb().join("kb.toml"), format!("{toml}\n[hooks]\nstop_nudge = true\n")).unwrap();
     std::fs::create_dir_all(env.dir.path().join(".claude")).unwrap();
     let (req, _) = env.json(&["install", "claude"], "");
-    let package = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../extensions/rkb");
+    let package = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../extensions/pi");
     if !package.join("node_modules/typebox").exists() {
-        eprintln!("skipped: run `npm install` in extensions/rkb to test the extension");
+        eprintln!("skipped: run `npm install` in extensions/pi to test the extension");
         return;
     }
     let script = package.join("test/run.mjs");

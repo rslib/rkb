@@ -1,4 +1,4 @@
-// Drives extensions/rkb.ts against a fake pi/omp API with the real `rkb` binary on PATH.
+// Drives extensions/pi/src/rkb.ts against a fake pi/omp API with the real `rkb` binary on PATH.
 // Usage: node run.mjs <generated extension .ts> <pi|omp>
 // Env: XDG_STATE_HOME and RKB_HOME set up by the Rust test; RKB_KB is the knowledge base folder;
 // RKB_REQUEST and RKB_QUESTION name a stored request.
