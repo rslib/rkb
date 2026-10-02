@@ -85,6 +85,17 @@ function cut(text: string, width: number): string {
   return line.length <= width ? line : `${line.slice(0, Math.max(0, width - 3))}...`
 }
 
+/** Claude Code's `Markdown` takes at most 10000 characters and no control characters but tab and newline. */
+const FIT_MAX = 9500
+
+function fit(text: string, more: string): string {
+  const t = text.replace(/\r\n/g, '\n').replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '')
+  if (t.length <= FIT_MAX) return t
+  const at = t.lastIndexOf('\n', FIT_MAX)
+  const head = t.slice(0, at > 0 ? at : FIT_MAX)
+  return `${head}\n\n... ${t.length - head.length} more characters. ${more}`
+}
+
 function plural(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? '' : 's'}`
 }
@@ -278,7 +289,7 @@ function bar(relevance: number): string {
 }
 
 // `start` is the session context rkb prints at session start, delivered with the next prompt.
-type Live = { session?: Session; isOff: boolean; isObserving: boolean; tools: Set<string>; start?: Promise<string> }
+type Live = { session?: Session; isOff: boolean; isObserving: boolean; isQuiet: boolean; tools: Set<string>; start?: Promise<string> }
 type AutoKind = 'distill' | 'curate'
 
 const AUTO_TASK: Record<AutoKind, string> = {
@@ -379,16 +390,18 @@ function later($: EngineInterface, work: () => Promise<void>): void {
   })
 }
 
-function turnEnded($: EngineInterface, live: Live, e: { session_id: string; cwd: string; transcript_path: string }): void {
+function turnEnded($: EngineInterface, live: Live, e: { session_id: string; cwd: string; transcript_path: string; background_tasks?: { status: string; description: string }[] }): void {
   const s: Session = { id: e.session_id, cwd: e.cwd, transcript: e.transcript_path }
   live.session = s
+  const isAuto = !live.isQuiet && !e.background_tasks?.some(t => t.status === 'running' && t.description.startsWith('rkb '))
+  live.isQuiet = false
   later($, async () => {
     await refresh($, s)
     if (live.isObserving) return
     live.isObserving = true
     try {
       await observe($, s)
-      if (!(await autoRun($, s, 'distill'))) await autoRun($, s, 'curate')
+      if (isAuto && !(await autoRun($, s, 'distill'))) await autoRun($, s, 'curate')
     } finally {
       live.isObserving = false
     }
@@ -396,7 +409,7 @@ function turnEnded($: EngineInterface, live: Live, e: { session_id: string; cwd:
 }
 
 export const register: Register = on => {
-  const live: Live = { isOff: false, isObserving: false, tools: new Set() }
+  const live: Live = { isOff: false, isObserving: false, isQuiet: false, tools: new Set() }
 
   on('session.start', async ($, e, next) => {
     live.isOff = Boolean(await $.env.get('RKB_OBSERVER'))
@@ -407,7 +420,7 @@ export const register: Register = on => {
       // Nothing here holds the first prompt: the command, the tools and the status come in the background.
       later($, async () => {
         await Promise.all([
-          $.command.register({ name: COMMAND, description: 'Search lessons, read the inbox and answer rkb requests in a pane' }).catch(() => undefined),
+          $.command.register({ name: COMMAND, description: 'Search lessons, read the inbox and answer rkb requests in a pane', immediate: true }).catch(() => undefined),
           registerTools($, live.tools),
           refresh($, s),
         ])
@@ -481,8 +494,9 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: COMMAND }, async $ => {
-    await $.ui.open(OPEN)
-    return {}
+    live.isQuiet = true
+    const opened = await $.ui.open(OPEN)
+    return opened.isPlaced ? {} : { text: `rkb: the pane did not open: ${opened.reason}` }
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -656,7 +670,7 @@ export const register: Register = on => {
             {[l.status, l.applies ? `applies ${l.applies}` : '', l.path].filter(Boolean).join(DOT)}
           </Text>
           <Box marginTop={1}>
-            <Markdown key="lesson" text={l.body} />
+            <Markdown key="lesson" text={fit(l.body, `Run \`rkb show ${l.id}\` to read all.`)} />
           </Box>
           <Box gap={3} marginTop={1}>
             {button('worked', 'Worked', hot('w'), () => used($, live.session, l.id, 'worked'), true)}
@@ -682,7 +696,7 @@ export const register: Register = on => {
             {[`${level.label} priority`, i.age, tilde(i.cwd)].filter(Boolean).join(DOT)}
           </Text>
           <Box marginTop={1}>
-            <Markdown key="item" text={i.body} />
+            <Markdown key="item" text={fit(i.body, `Run \`rkb inbox show ${i.id}\` to read all.`)} />
           </Box>
           <Box gap={3} marginTop={1}>
             {button('back', 'Back', hot('b'), () => update($, view, () => 'inbox' as View))}

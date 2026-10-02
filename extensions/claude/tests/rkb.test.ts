@@ -447,6 +447,26 @@ for (const surface of ['terminal', 'desktop'] as const) {
   })
 }
 
+test('a long inbox item with control characters still renders', async ($, on) => {
+  const clock = mock.clock(on)
+  world(on)
+  const calls: Call[] = []
+  const row = { id: 'bbbbbbbbbb', kind: 'observed', priority: 3, age: '2 h', preview: 'a long extract' }
+  const body = `start\r\n\u001b[31mred\n${'line of text\n'.repeat(1600)}`
+  fakeRkb(on, { status: statusOf(), 'job prepare': { job: null }, inbox: (c: Call) => (c.args[1] === 'show' ? { body, meta: {} } : { items: [row] }) }, calls)
+  await stop($, clock)
+  const ui = await $.ui.mount({
+    plugin: 'rkb',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'rkb',
+    props: { title: 'rkb', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} },
+  })
+  await ui.press({ key: 'view-inbox' })
+  await ui.press({ key: 'open-bbbbbbbbbb' })
+  expect((await ui.find({ key: 'item' }))?.text).toContain('more characters. Run `rkb inbox show bbbbbbbbbb`')
+})
+
 test('a due automatic distill starts its agent', async ($, on) => {
   const clock = mock.clock(on)
   const seen = world(on)
@@ -484,4 +504,21 @@ test('no automatic run without a claim', async ($, on) => {
   fakeRkb(on, { status: statusOf(), 'job prepare': { job: null }, inbox: { total: {} }, auto: { claimed: false, reason: 'off' } }, [])
   await stop($, clock)
   expect(spawns).toBe(0)
+})
+
+test('/rkb-status says why the pane did not open', async ($, on) => {
+  world(on)
+  on('ui.open', () => ({ value: { isPlaced: false as const, reason: 'terminal too narrow' } }))
+  expect(await $.command.run({ command: 'rkb-status', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 100 } })).toMatchObject({ text: 'rkb: the pane did not open: terminal too narrow' })
+})
+
+test('a stop after /rkb-status claims no automatic run', async ($, on) => {
+  const clock = mock.clock(on)
+  world(on)
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  const calls: Call[] = []
+  fakeRkb(on, { status: statusOf(), 'job prepare': { job: null }, inbox: { total: { keep: 0 } }, auto: { claimed: false, reason: 'x' } }, calls)
+  await $.command.run({ command: 'rkb-status', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 100 } })
+  await stop($, clock)
+  expect(calls.some(c => c.args[0] === 'auto')).toBe(false)
 })
