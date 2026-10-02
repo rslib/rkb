@@ -247,7 +247,7 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
         return Ok(None);
     };
     let (_, text) = kb::find(&root, &hit.id)?;
-    hooks::append(state, session, &json!({ "kind": "injected", "id": hit.id }))?;
+    hooks::append(state, session, &json!({ "kind": "injected", "id": hit.id, "hook": "tool-failed", "time": rkb_core::request::now() }))?;
     record_use(&root, state, &hit.id, "injected", session, Some(format!("tool-failed, {}", ranked.describe())))?;
     let context = hooks::render(&[injected(&hit, missing_note(&place, &hit.path, &text))]);
     Ok(Some(reply("PostToolUseFailure", "additionalContext", json!(context))))
@@ -352,7 +352,7 @@ fn recall(p: &Value, state: &Path, session: &str, text: &str) -> Result<Option<S
     }
     let mut blocks = vec![];
     for h in &strong {
-        hooks::append(state, session, &json!({ "kind": "injected", "id": h.id }))?;
+        hooks::append(state, session, &json!({ "kind": "injected", "id": h.id, "hook": "recall", "time": rkb_core::request::now() }))?;
         record_use(&root, state, &h.id, "injected", session, Some(format!("recall, {}", ranked.describe())))?;
         let text = kb::find(&root, &h.id).map(|(_, t)| t).unwrap_or_default();
         blocks.push(injected(h, missing_note(&place, &h.path, &text)));

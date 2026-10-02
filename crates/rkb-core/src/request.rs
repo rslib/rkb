@@ -238,6 +238,20 @@ pub fn pending(dir: &Path) -> usize {
     std::fs::read_dir(dir).map_or(0, |e| e.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "json")).count())
 }
 
+/// The stored requests that have not expired, oldest first.
+pub fn open(dir: &Path) -> Vec<Request> {
+    remove_expired(dir);
+    let mut out: Vec<Request> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok())
+        .collect();
+    out.sort_by_key(|r| r.created);
+    out
+}
+
 pub fn remove(dir: &Path, id: &str) {
     let _ = std::fs::remove_file(file(dir, id));
 }

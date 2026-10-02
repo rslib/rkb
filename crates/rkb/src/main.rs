@@ -188,6 +188,14 @@ enum Cmd {
     /// Print the current project, system and lesson counts in at most 5 lines, for a session hook.
     #[command(after_help = "Example:\n  rkb context")]
     Context,
+    /// Print what waits for the user (inbox, curate candidates, open requests) and the lessons a session
+    /// injected, in one call, for a harness UI. Changes no lesson, inbox item or request.
+    #[command(after_help = "Example:\n  rkb status\n  rkb status --session 3f2a --format json")]
+    Status {
+        /// The harness session whose injected lessons to list.
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Check git, the hook, PATH, lint, locks, requests and matching, with a fix for each problem.
     #[command(after_help = "Example:\n  rkb doctor\n  rkb doctor --break-lock")]
     Doctor {
@@ -711,6 +719,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             let s = rkb_core::state::build(&root, env.place.clone().unwrap_or_default(), &env.state)?;
             Ok(session::context(&s))
         }
+        Cmd::Status { session } => session::waiting(&env, session.as_deref()),
         Cmd::Doctor { break_lock } => session::doctor(&env, &env.place.clone().unwrap_or_default(), break_lock),
         Cmd::List { folder } => {
             kb::open(&root)?;

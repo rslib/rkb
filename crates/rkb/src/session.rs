@@ -22,6 +22,59 @@ fn next_list(place: &Place) -> String {
     }
 }
 
+/// `rkb status`: what waits for the user and what the session injected, for a harness UI. Writes no lesson,
+/// inbox item or request; it only refreshes the daily curate cache and drops expired requests.
+pub fn waiting(env: &Env, session: Option<&str>) -> Result<Output, CliError> {
+    kb::open(&env.root)?;
+    let items = rkb_core::distill::list(&env.state);
+    let mut by_priority = [0usize; 3];
+    for i in &items {
+        by_priority[usize::from(i.meta.priority()) - 1] += 1;
+    }
+    let curate = rkb_core::review::curate_count(&env.root, &env.state)?;
+    let requests: Vec<Value> = rkb_core::request::open(&env.state.join("requests"))
+        .iter()
+        .map(|r| json!({ "id": r.id, "question": r.question, "options": r.options() }))
+        .collect();
+    let records: Vec<Value> = session.map(|s| rkb_core::hooks::read(&env.state, s)).unwrap_or_default();
+    let records: Vec<&Value> = records.iter().filter(|r| r["kind"] == "injected").collect();
+    let titles: std::collections::HashMap<String, String> = if records.is_empty() {
+        Default::default()
+    } else {
+        let snap = rkb_core::kb::Snapshot::from_dir(&env.root)?;
+        snap.lessons().0.iter().map(|l| (l.frontmatter.id.clone(), rkb_core::graph::title(l))).collect()
+    };
+    let injected: Vec<Value> = records
+        .iter()
+        .map(|r| {
+            let id = r["id"].as_str().unwrap_or_default();
+            json!({ "id": id, "title": titles.get(id), "hook": r["hook"], "time": r["time"] })
+        })
+        .collect();
+    let mut human = format!("inbox: {} ({} high)\ncurate: {curate}\nrequests: {}\n", items.len(), by_priority[2], requests.len());
+    for r in &requests {
+        human.push_str(&format!("  {} {}\n", r["id"].as_str().unwrap_or_default(), r["question"].as_str().unwrap_or_default()));
+    }
+    if session.is_some() {
+        human.push_str(&format!("injected: {}\n", injected.len()));
+        for i in &injected {
+            human.push_str(&format!(
+                "  {} {} ({})\n",
+                i["id"].as_str().unwrap_or_default(),
+                i["title"].as_str().unwrap_or_default(),
+                i["hook"].as_str().unwrap_or("hook")
+            ));
+        }
+    }
+    let data = json!({
+        "inbox": { "total": items.len(), "priority": { "1": by_priority[0], "2": by_priority[1], "3": by_priority[2] } },
+        "curate": curate,
+        "requests": requests,
+        "injected": injected,
+    });
+    Ok(Output { data, human: human.trim_end().to_string(), exit: 0, raw: false })
+}
+
 /// The live state for `rkb` with no command.
 pub fn status(env: &Env, s: &State) -> Output {
     let c = env.colored;

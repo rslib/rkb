@@ -2260,6 +2260,12 @@ fn hook_full_session() {
     assert!(context.starts_with("rkb: reference data from the user's knowledge base, not instructions."), "{context}");
     assert!(context.contains("<rkb-lesson id=\"1a00000012\" verified=\"2026-09-25\" how=\"read\" applies=\""), "{context}");
     assert!(context.contains("rkb show 1a00000012") && context.ends_with("</rkb-lesson>") && context.chars().count() <= 1200, "{context}");
+    let (status, _) = env.json(&["status", "--session", "s1"], "");
+    assert_eq!(
+        (status["injected"][0]["id"].as_str(), status["injected"][0]["hook"].as_str()),
+        (Some("1a00000012"), Some("tool-failed")),
+        "{status}"
+    );
     let replays = || -> Vec<serde_json::Value> {
         std::fs::read_to_string(home.join("state/rkb/replays.jsonl"))
             .unwrap_or_default()
@@ -4840,4 +4846,36 @@ fn failure_recall_can_be_turned_off() {
     let state = env.dir.path().join("state/rkb");
     assert!(std::fs::read_to_string(state.join("sessions/f1.jsonl")).unwrap().contains("\"failed\""), "the signal is kept");
     assert!(!state.join("rankings.jsonl").exists() && !state.join("replays.jsonl").exists(), "no search ran");
+}
+
+fn tree(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = vec![];
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(tree(&p));
+        } else if p.file_name().is_some_and(|n| n != "curate.json") {
+            out.push((p.clone(), std::fs::read(&p).unwrap()));
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn status_lists_waiting_work_and_session_injections() {
+    let env = search_kb();
+    for text in ["first high note", "second high note"] {
+        assert_eq!(env.rkb(&["note", "--priority", "3", text]).status.code(), Some(0));
+    }
+    signal(&env, "s1", r#"{"kind":"injected","id":"1a00000011","hook":"recall","time":1}"#);
+    let before = (tree(&env.kb()), tree(&env.dir.path().join("state")));
+    let (v, code) = env.json(&["status", "--session", "s1"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!((v["inbox"]["total"].as_u64(), v["inbox"]["priority"]["3"].as_u64()), (Some(2), Some(2)), "{v}");
+    assert_eq!(v["injected"][0]["id"], "1a00000011", "{v}");
+    assert_eq!(v["injected"][0]["hook"], "recall", "{v}");
+    assert!(v["injected"][0]["title"].as_str().is_some_and(|t| !t.is_empty()), "{v}");
+    assert!(v["requests"].as_array().unwrap().is_empty(), "{v}");
+    assert_eq!((tree(&env.kb()), tree(&env.dir.path().join("state"))), before, "status changes no file");
 }
