@@ -81,8 +81,21 @@ impl Item {
         format!("---\n{fm}---\n\n{}\n", self.body.trim_end())
     }
 
+    /// One line that says what the item is about: an extract's first prompt the user typed, an observed
+    /// item's first note as `<type>: <text>`, else the first line. Cut markers and harness markup are skipped.
     pub fn preview(&self) -> String {
-        self.body.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).unwrap_or("").to_string()
+        static NOTE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let note =
+            NOTE.get_or_init(|| regex::Regex::new(r"^- \d{4}-\d{2}-\d{2} \[\w+\] \((\w+); *\w+\) +(.+)$").expect("valid note pattern"));
+        let lines: Vec<&str> = self
+            .body
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !(l.starts_with('[') && l.ends_with(" cut]")))
+            .collect();
+        let typed = lines.iter().filter_map(|l| l.strip_prefix("[user] ")).find(|t| !t.starts_with('<'));
+        let first = typed.or_else(|| lines.iter().find(|l| !l.starts_with("[user] <")).copied()).unwrap_or("");
+        note.captures(first).map_or_else(|| first.to_string(), |c| format!("{}: {}", &c[1], &c[2]))
     }
 }
 
@@ -659,6 +672,21 @@ mod tests {
 
     fn note(time: u64) -> Meta {
         Meta { kind: Kind::Note, time, harness: None, session: None, cwd: None, signals: vec![], priority: None, source: None }
+    }
+
+    #[test]
+    fn preview_skips_cut_markers_and_markup() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = dir.path();
+        let extract = add(
+            s,
+            note(300),
+            "[913 earlier lines cut]\n  agent text\n[user] <command-name>/effort</command-name>\n[user] fix the python tests",
+        )
+        .unwrap();
+        assert_eq!(extract.preview(), "fix the python tests");
+        let observed = add(s, note(400), "- 2026-10-02 [high] (preference; general) Research the web before ranking.").unwrap();
+        assert_eq!(observed.preview(), "preference: Research the web before ranking.");
     }
 
     #[test]
