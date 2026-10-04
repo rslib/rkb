@@ -22,6 +22,17 @@ pub fn batch(config_dir: &Path) -> usize {
         .map_or(DEFAULT_BATCH, |n| n.clamp(1, 20) as usize)
 }
 
+/// Candidates one distill run handles, unless `[distill] run_max` in `config.toml` says otherwise.
+pub const DEFAULT_RUN_MAX: usize = 100;
+
+/// The distill run limit: `run_max` under `[distill]` in this machine's `config.toml`, from 1 to 500.
+pub fn run_max(config_dir: &Path) -> usize {
+    crate::config::machine(config_dir)
+        .ok()
+        .and_then(|(_, t)| t.get("distill")?.get("run_max")?.as_integer())
+        .map_or(DEFAULT_RUN_MAX, |n| n.clamp(1, 500) as usize)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -949,5 +960,15 @@ mod tests {
         assert_eq!(batch(d.path()), 8);
         std::fs::write(d.path().join("config.toml"), "[distill]\nbatch = 99\n").unwrap();
         assert_eq!(batch(d.path()), 20);
+    }
+
+    #[test]
+    fn run_max_from_config() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(run_max(d.path()), DEFAULT_RUN_MAX);
+        std::fs::write(d.path().join("config.toml"), "[distill]\nrun_max = 20\n").unwrap();
+        assert_eq!(run_max(d.path()), 20);
+        std::fs::write(d.path().join("config.toml"), "[distill]\nrun_max = 900\n").unwrap();
+        assert_eq!(run_max(d.path()), 500);
     }
 }

@@ -458,13 +458,16 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
     if let Some(step) = burst(ctx, &kb, action, approved)? {
         return saved(ctx, step);
     }
+    if let Some(step) = stuck(ctx, action, approved, &p)? {
+        return saved(ctx, step);
+    }
     finish(ctx, snap, p)
 }
 
-/// Commits a looping agent may make in an hour before rkb asks the user.
-pub const DEFAULT_BURST: i64 = 30;
+/// Lesson-write commits an agent may make in an hour before rkb asks the user.
+pub const DEFAULT_BURST: i64 = 200;
 
-/// Asks before a write when the knowledge base had more than `writes.burst` commits in the last hour,
+/// Asks before a write when the knowledge base had more than `writes.burst` lesson-write commits in the last hour,
 /// so an agent stuck in a loop cannot flood it. Agents write freely otherwise.
 fn burst(ctx: &Ctx, kb: &KbConfig, action: &Action, approved: &[Decision]) -> Result<Option<Outcome>> {
     if approved.contains(&Decision::Continue) {
@@ -476,7 +479,7 @@ fn burst(ctx: &Ctx, kb: &KbConfig, action: &Action, approved: &[Decision]) -> Re
         return Ok(None);
     }
     let question = format!(
-        "The knowledge base had {count} commits in the last hour, more than writes.burst ({limit}). An agent may be looping. Write this change anyway?"
+        "The knowledge base had {count} lesson writes in the last hour, more than writes.burst ({limit}). An agent may be looping. Write this change anyway?"
     );
     ask(action, approved, question, vec![Choice { text: "continue".into(), decision: Some(Decision::Continue) }]).map(Some)
 }
@@ -485,9 +488,31 @@ fn burst_limit(kb: &KbConfig) -> i64 {
     kb.writes.as_ref().and_then(|t| t.get("burst")).and_then(|v| v.as_integer()).unwrap_or(DEFAULT_BURST)
 }
 
+const WRITE_TYPES: [&str; 10] = ["add", "edit", "flag", "supersede", "archive", "unarchive", "move", "rename", "verify", "label"];
+
+/// Commits in `range` whose subject starts with a write type, so site and chore commits do not count.
 fn commit_count(root: &Path, range: &[&str]) -> i64 {
-    let args: Vec<&str> = ["rev-list", "--count"].into_iter().chain(range.iter().copied()).collect();
-    git::run(root, &args).ok().and_then(|o| String::from_utf8_lossy(&o).trim().parse().ok()).unwrap_or(0)
+    let args: Vec<&str> = ["log", "--format=%s"].into_iter().chain(range.iter().copied()).collect();
+    let out = git::run(root, &args).unwrap_or_default();
+    let is_write = |s: &&str| s.split(['(', ':']).next().is_some_and(|t| WRITE_TYPES.contains(&t));
+    String::from_utf8_lossy(&out).lines().filter(is_write).count() as i64
+}
+
+/// Asks before a session writes a lesson a third time in an hour.
+fn stuck(ctx: &Ctx, action: &Action, approved: &[Decision], p: &Prepared) -> Result<Option<Outcome>> {
+    let Some(session) = crate::usage::env_session() else { return Ok(None) };
+    if p.id.is_empty() || approved.contains(&Decision::Continue) {
+        return Ok(None);
+    }
+    let earlier = crate::hooks::session_writes(ctx.state, &session, &p.id);
+    if earlier < 2 {
+        return Ok(None);
+    }
+    let question = format!(
+        "This session already wrote lesson {} {} time(s) in the last hour. An agent may be stuck. Write this change anyway?",
+        p.id, earlier
+    );
+    ask(action, approved, question, vec![Choice { text: "continue".into(), decision: Some(Decision::Continue) }]).map(Some)
 }
 
 /// Minutes a `continue` on the burst question covers that session's writes (`writes.burst_grace_minutes`).
@@ -1358,8 +1383,8 @@ pub(crate) fn finish(ctx: &Ctx, mut snap: Snapshot, p: Prepared) -> Result<Outco
     git::commit_paths(ctx.root, &message, &paths)?;
     let commit = String::from_utf8_lossy(&git::run(ctx.root, &["rev-parse", "--short", "HEAD"])?).trim().to_string();
     let diff = String::from_utf8_lossy(&git::run(ctx.root, &["show", "--format=", &commit])?).into_owned();
-    if p.kind == "add" {
-        crate::hooks::log_written(ctx.state, &p.id);
+    if !p.id.is_empty() {
+        crate::hooks::log_written(ctx.state, &p.id, p.kind);
     }
     Ok(Outcome::Written(Written { kind: p.kind, id: p.id, path: p.path, title: p.title, commit, diff, notes: p.notes }))
 }
@@ -1394,17 +1419,18 @@ mod tests {
             |args: &[&str]| assert!(std::process::Command::new("git").args(args).current_dir(repo.path()).status().unwrap().success());
         git(&["init", "-q"]);
         let commit = |n: &str| git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", n]);
-        commit("a");
+        commit("add: a");
         let head = String::from_utf8(git::run(repo.path(), &["rev-parse", "HEAD"]).unwrap()).unwrap().trim().to_string();
         let now = request::now();
         let g = |until: u64| Grace { until, head: head.clone() };
         save_graces(state.path(), &[("s".to_string(), g(now + 600)), ("old".to_string(), g(now - 1))].into_iter().collect()).unwrap();
         assert_eq!(graces(state.path()).keys().collect::<Vec<_>>(), ["s"], "expired windows are dropped");
         assert!(!in_grace(state.path(), repo.path(), 2, "other"), "another session has no window");
-        commit("b");
-        commit("c");
+        commit("edit: b");
+        commit("edit: c");
         assert!(in_grace(state.path(), repo.path(), 2, "s"), "2 commits since the continue");
-        commit("d");
+        commit("edit: d");
+        commit("chore: site");
         assert!(!in_grace(state.path(), repo.path(), 2, "s"), "3 commits: a loop inside the window");
         assert!(graces(state.path()).is_empty(), "and the window is closed");
     }

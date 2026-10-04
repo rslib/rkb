@@ -20,10 +20,16 @@ pub const COMMANDS: [(&str, &str); 3] = [
 pub const AGENT_STEPS: [(&str, &str); 2] =
     [("distill", include_str!("../../../skills/rkb/agents/distill.md")), ("curate", include_str!("../../../skills/rkb/agents/curate.md"))];
 
-/// The steps of agent `name`, with this machine's distill batch size.
+/// The steps of agent `name`, with this machine's distill batch size and run limit.
 pub fn agent_steps(name: &str) -> String {
-    let batch = if cfg!(test) { crate::distill::DEFAULT_BATCH } else { crate::distill::batch(&crate::paths::config_dir()) };
-    AGENT_STEPS.iter().find(|(n, _)| *n == name).map_or("", |(_, t)| t).trim_end().replace("__BATCH__", &batch.to_string())
+    let (batch, run_max) = if cfg!(test) {
+        (crate::distill::DEFAULT_BATCH, crate::distill::DEFAULT_RUN_MAX)
+    } else {
+        let dir = crate::paths::config_dir();
+        (crate::distill::batch(&dir), crate::distill::run_max(&dir))
+    };
+    let text = AGENT_STEPS.iter().find(|(n, _)| *n == name).map_or("", |(_, t)| t).trim_end();
+    text.replace("__BATCH__", &batch.to_string()).replace("__RUNMAX__", &run_max.to_string())
 }
 
 /// The line in every command file rkb writes; uninstall removes only files that have it.
@@ -1204,6 +1210,22 @@ mod tests {
         assert!(hooks(&settings, None).unwrap());
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(v, serde_json::json!({ "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "my-own stop hook" }] }] } }));
+    }
+
+    #[test]
+    fn distill_steps_repeat_until_done() {
+        let steps = agent_steps("distill");
+        assert!(steps.contains("Repeat from step 1 while `keep` or `known` candidates remain and fewer than 100 candidates"), "{steps}");
+        assert!(!steps.contains("__RUNMAX__") && !distill_command().contains("__RUNMAX__"));
+        assert!(distill_command().contains("fewer than 100 candidates") && Harness::Pi.extension().contains("fewer than 100 candidates"));
+    }
+
+    #[test]
+    fn run_limit_from_config() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("config.toml"), "[distill]\nrun_max = 20\n").unwrap();
+        let text = AGENT_STEPS[0].1.replace("__RUNMAX__", &crate::distill::run_max(d.path()).to_string());
+        assert!(text.contains("fewer than 20 candidates"), "{text}");
     }
 
     #[test]

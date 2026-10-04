@@ -645,6 +645,7 @@ fn write_burst_asks_before_flooding() {
     let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap() + "\n[writes]\nburst = 2\n";
     env.write("kb.toml", &toml);
     add_ok(&env, "cmake", &lesson_with("First lesson of the burst"));
+    add_ok(&env, "cmake", &lesson_with("Zeroth lesson of the burst"));
     let before = commit_count(&env);
     let add_as = |session: &str, title: &str| -> serde_json::Value {
         let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
@@ -680,6 +681,66 @@ fn write_burst_asks_before_flooding() {
     let (v, _) = env.json(&["doctor"], "");
     let line = v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "burst grace").cloned().unwrap();
     assert!(line["detail"].as_str().unwrap().starts_with("session s1 until "), "{line}");
+}
+
+#[test]
+fn burst_ignores_other_commits() {
+    let env = kb_with_topics();
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap() + "\n[writes]\nburst = 2\n";
+    env.write("kb.toml", &toml);
+    for i in 0..5 {
+        env.write(&format!("site{i}.txt"), "x\n");
+        env.git(&["add", "--", &format!("site{i}.txt")]);
+        assert!(env.git(&["commit", "-q", "-m", &format!("chore: site {i}")]).status.success());
+    }
+    let v = add_ok(&env, "cmake", &lesson_with("After many other commits"));
+    assert_eq!(v["status"], "written", "{v}");
+}
+
+#[test]
+fn burst_default_is_200() {
+    assert_eq!(rkb_core::write::DEFAULT_BURST, 200);
+}
+
+fn stuck_cmd(env: &Env, args: &[&str], input: &str) -> serde_json::Value {
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_SESSION", "s1");
+    serde_json::from_slice(&rkb_with(c, &[args, &["--format", "json"]].concat(), input).stdout).unwrap()
+}
+
+#[test]
+fn stuck_third_edit_and_ping_pong_ask() {
+    let env = kb_with_topics();
+    env.trust_claude();
+    let v = stuck_cmd(&env, &["add", "--topic", "cmake"], &lesson_with("Stuck lesson"));
+    assert_eq!(v["status"], "written", "{v}");
+    let id = v["id"].as_str().unwrap().to_string();
+    let (a, _) = current(&env, &id);
+    let b = a.replace("Set HDF5_ROOT.", "Set HDF5_ROOT to the prefix.");
+    assert_ne!(a, b);
+    let edit = |text: &str| {
+        let (_, hash) = current(&env, &id);
+        stuck_cmd(&env, &["edit", &id, "--base", &hash], text)
+    };
+    assert_eq!(edit(&b)["status"], "written", "second write of the lesson");
+    let v = edit(&a);
+    assert_eq!(v["status"], "needs_user", "third write of the lesson: {v}");
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("CLAUDECODE", "1");
+    let o = rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", "continue", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["status"], "written", "continue lets it through: {v}");
+    let (v, _) = env.json(&["edit", &id, "--base", &current(&env, &id).1], &b);
+    assert_eq!(v["status"], "written", "no session, not checked: {v}");
+}
+
+#[test]
+fn stuck_ignores_bulk_adds() {
+    let env = kb_with_topics();
+    for i in 0..12 {
+        let v = stuck_cmd(&env, &["add", "--topic", "cmake"], &lesson_with(&format!("Bulk lesson number {i}")));
+        assert_eq!(v["status"], "written", "{v}");
+    }
 }
 
 #[test]

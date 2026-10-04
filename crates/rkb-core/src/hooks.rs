@@ -381,21 +381,30 @@ pub fn log_replay(state: &Path, r: &Replay) -> Result<()> {
 
 pub const WRITTEN: &str = "written.jsonl";
 
-/// Records that `id` was written in this harness session, kept on this machine for `rkb eval --replay`. Best effort.
-pub fn log_written(state: &Path, id: &str) {
+/// Records that `id` was written in this harness session, kept on this machine for `rkb eval --replay` and the stuck guard. Best effort.
+pub fn log_written(state: &Path, id: &str, kind: &str) {
     let Some(session) = crate::usage::env_session() else { return };
-    let rec = serde_json::json!({ "time": crate::request::now(), "id": id, "session": session });
+    let rec = serde_json::json!({ "time": crate::request::now(), "id": id, "session": session, "kind": kind });
     let _ = lock::append_line(&state.join(WRITTEN), &rec.to_string());
 }
 
-/// Session id to the lessons written in it, from `written.jsonl`. Malformed lines are skipped.
+fn records(state: &Path) -> Vec<Value> {
+    std::fs::read_to_string(state.join(WRITTEN)).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect()
+}
+
+/// Session id to the lessons added in it, from `written.jsonl`. Malformed lines are skipped.
 pub fn written(state: &Path) -> Vec<(String, String)> {
-    std::fs::read_to_string(state.join(WRITTEN))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    records(state)
+        .into_iter()
+        .filter(|v| v["kind"].as_str().is_none_or(|k| k == "add"))
         .filter_map(|v| Some((v["session"].as_str()?.to_string(), v["id"].as_str()?.to_string())))
         .collect()
+}
+
+/// How many times `session` wrote lesson `id` in the last hour.
+pub fn session_writes(state: &Path, session: &str, id: &str) -> usize {
+    let cutoff = crate::request::now().saturating_sub(3600);
+    records(state).into_iter().filter(|v| v["session"] == session && v["id"] == id && v["time"].as_u64().unwrap_or(0) >= cutoff).count()
 }
 
 /// The logged failures of the last `days` days, oldest first. Malformed lines are skipped.
