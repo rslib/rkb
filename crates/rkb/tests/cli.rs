@@ -3528,6 +3528,9 @@ build)
   if [ -z "$FAKE_RS_WEB_NO_INDEX" ]; then
     cp site.json dist/index.json
   fi
+  if [ -f site.json ]; then
+    python3 -c 'import json; v=json.load(open("site.json")); print(json.dumps({"lessons": [{k:x for k,x in r.items() if k != "queries"} for r in v["lessons"]]}))' > dist/public.json
+  fi
   if [ -n "$FAKE_RS_WEB_EXTRA" ]; then
     mkdir -p "dist/$(dirname "$FAKE_RS_WEB_EXTRA")"
     printf '%s' "$FAKE_RS_WEB_TEXT" > "dist/$FAKE_RS_WEB_EXTRA"
@@ -3739,6 +3742,25 @@ fn site_protects_internal_lessons_with_a_password() {
     let m = v["error"]["message"].as_str().unwrap();
     assert!(m.contains("about/index.html: shows protected lesson `1a00000004` in plain text"), "{m}");
     assert!(!m.contains("Shallow clones"), "the finding names the lesson by id only: {m}");
+    let public_query = "public searchable phrase";
+    let p = env.kb().join("general/git/rebase-with-local-edits-using-autostash.md");
+    let text = std::fs::read_to_string(&p).unwrap().replacen("\n---\n", &format!("\nqueries:\n  - {public_query}\n---\n"), 1);
+    std::fs::write(p, text).unwrap();
+    let p = env.kb().join("general/git/shallow-clones-break-git-describe.md");
+    let text = std::fs::read_to_string(&p).unwrap().replacen("\n---\n", &format!("\nqueries:\n  - {public_query}\n---\n"), 1);
+    std::fs::write(p, text).unwrap();
+    let (v, code) = site(&env, &["site", "build", "--out", out_s], &[pw[0], pw[1]]);
+    assert_eq!(code, Some(0), "a query shared with a public lesson is not a leak: {v}");
+    let public_index: serde_json::Value = serde_json::from_slice(&std::fs::read(out.join("public.json")).unwrap()).unwrap();
+    assert!(
+        public_index["lessons"].as_array().unwrap().iter().any(|lesson| lesson["id"] == "1a00000003"),
+        "the public lesson is still published: {public_index}"
+    );
+    assert!(!public_index.to_string().contains("public searchable phrase"), "queries stay encrypted in the site index");
+    let protected_path = env.dir.path().join("cache/rkb/site/stage/protected/general/git/shallow-clones-break-git-describe.md");
+    assert!(std::fs::read_to_string(protected_path).unwrap().contains(public_query), "the query remains in the protected lesson copy");
+    let public_lesson = env.dir.path().join("cache/rkb/site/stage/lessons/general/git/rebase-with-local-edits-using-autostash.md");
+    assert!(std::fs::read_to_string(public_lesson).unwrap().contains(public_query), "the query is published in its public lesson");
     let (v, code) = site(
         &env,
         &["site", "build", "--out", out_s],

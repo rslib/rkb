@@ -364,9 +364,11 @@ fn without_ciphertext(text: &str) -> String {
 fn check(env: &Env, dist: &Path, s: &site::Site) -> Vec<String> {
     let kb = kb_config(env);
     let scanner = LeakScanner::new(&kb.leak, env.lint.user.as_deref(), env.lint.home.as_deref());
-    // Text that public lessons show anyway cannot give a protected lesson away.
-    let public: String =
-        s.files.iter().filter(|(p, _)| p.starts_with("lessons/")).map(|(_, d)| String::from_utf8_lossy(d).into_owned()).collect();
+    let public: String = s.files.iter().filter(|(path, _)| path.starts_with("lessons/")).fold(String::new(), |mut text, (_, data)| {
+        text.push_str(&String::from_utf8_lossy(data));
+        text.push('\n');
+        text
+    });
     let secrets: Vec<(&str, Vec<&str>)> = s
         .secrets
         .iter()
@@ -374,7 +376,7 @@ fn check(env: &Env, dist: &Path, s: &site::Site) -> Vec<String> {
             let mut words: Vec<&str> = vec![x.title.as_str(), x.path.as_str()];
             words.extend(x.tags.iter().map(String::as_str).filter(|t| t.chars().count() >= 4));
             words.extend(x.queries.iter().map(String::as_str).filter(|q| q.chars().count() >= 4));
-            (x.id.as_str(), words.into_iter().filter(|w| !public.contains(w)).collect())
+            (x.id.as_str(), words.into_iter().filter(|word| !public.contains(word)).collect())
         })
         .collect();
     let hidden: Vec<(&str, Vec<u8>)> = s
