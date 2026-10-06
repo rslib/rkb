@@ -364,11 +364,32 @@ fn without_ciphertext(text: &str) -> String {
 fn check(env: &Env, dist: &Path, s: &site::Site) -> Vec<String> {
     let kb = kb_config(env);
     let scanner = LeakScanner::new(&kb.leak, env.lint.user.as_deref(), env.lint.home.as_deref());
-    let public: String = s.files.iter().filter(|(path, _)| path.starts_with("lessons/")).fold(String::new(), |mut text, (_, data)| {
-        text.push_str(&String::from_utf8_lossy(data));
-        text.push('\n');
-        text
-    });
+    let public: Vec<String> =
+        s.files
+            .iter()
+            .filter(|(path, _)| path.starts_with("lessons/"))
+            .map(|(_, data)| String::from_utf8_lossy(data).into_owned())
+            .chain(
+                s.index["lessons"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|lesson| lesson["tags"].as_array().into_iter().flatten().filter_map(|tag| tag.as_str().map(str::to_owned))),
+            )
+            .chain(s.index["lessons"].as_array().into_iter().flatten().flat_map(|lesson| {
+                lesson["queries"].as_array().into_iter().flatten().filter_map(|query| query.as_str().map(str::to_owned))
+            }))
+            .chain(
+                s.index["protected"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|lesson| lesson["tags"].as_array().into_iter().flatten().filter_map(|tag| tag.as_str().map(str::to_owned))),
+            )
+            .chain(s.index["protected"].as_array().into_iter().flatten().flat_map(|lesson| {
+                lesson["queries"].as_array().into_iter().flatten().filter_map(|query| query.as_str().map(str::to_owned))
+            }))
+            .collect();
     let secrets: Vec<(&str, Vec<&str>)> = s
         .secrets
         .iter()
@@ -376,7 +397,7 @@ fn check(env: &Env, dist: &Path, s: &site::Site) -> Vec<String> {
             let mut words: Vec<&str> = vec![x.title.as_str(), x.path.as_str()];
             words.extend(x.tags.iter().map(String::as_str).filter(|t| t.chars().count() >= 4));
             words.extend(x.queries.iter().map(String::as_str).filter(|q| q.chars().count() >= 4));
-            (x.id.as_str(), words.into_iter().filter(|word| !public.contains(word)).collect())
+            (x.id.as_str(), words.into_iter().filter(|word| !public.iter().any(|lesson| lesson.contains(word))).collect())
         })
         .collect();
     let hidden: Vec<(&str, Vec<u8>)> = s

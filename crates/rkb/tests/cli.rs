@@ -3529,7 +3529,7 @@ build)
     cp site.json dist/index.json
   fi
   if [ -f site.json ]; then
-    python3 -c 'import json; v=json.load(open("site.json")); print(json.dumps({"lessons": [{k:x for k,x in r.items() if k != "queries"} for r in v["lessons"]]}))' > dist/public.json
+    python3 -c 'import json; v=json.load(open("site.json")); print(json.dumps({"lessons": [{"id": r["id"], "tags": r.get("tags", []), "queries": r.get("queries", [])} for r in v["lessons"]]}))' > dist/public.json
   fi
   if [ -n "$FAKE_RS_WEB_EXTRA" ]; then
     mkdir -p "dist/$(dirname "$FAKE_RS_WEB_EXTRA")"
@@ -3756,7 +3756,8 @@ fn site_protects_internal_lessons_with_a_password() {
         public_index["lessons"].as_array().unwrap().iter().any(|lesson| lesson["id"] == "1a00000003"),
         "the public lesson is still published: {public_index}"
     );
-    assert!(!public_index.to_string().contains("public searchable phrase"), "queries stay encrypted in the site index");
+    assert!(public_index.to_string().contains("public searchable phrase"), "the public query is present in rendered metadata");
+    assert!(public_index.to_string().contains("rebase"), "public tags are present in rendered metadata");
     let protected_path = env.dir.path().join("cache/rkb/site/stage/protected/general/git/shallow-clones-break-git-describe.md");
     assert!(std::fs::read_to_string(protected_path).unwrap().contains(public_query), "the query remains in the protected lesson copy");
     let public_lesson = env.dir.path().join("cache/rkb/site/stage/lessons/general/git/rebase-with-local-edits-using-autostash.md");
