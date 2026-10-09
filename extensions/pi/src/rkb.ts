@@ -19,7 +19,6 @@ const DECLINED = "The user declined this rkb confirm.";
 // omp stops a session_shutdown handler after 2 s.
 const SHUTDOWN_TIMEOUT_MS = 1800;
 const RETRO: string = "__RETRO__";
-const DISTILL: string = "__DISTILL__";
 const CURATE: string = "__CURATE__";
 const TOOLS_JSON: string = "__TOOLS__";
 // A tool runs a search or a write, which may load a model, so it gets longer than a hook.
@@ -230,7 +229,7 @@ interface Doc {
 }
 type Tone = "ok" | "fail" | "busy";
 type View = "search" | "inbox" | "item" | "lesson" | "requests";
-type Outcome = { do: "close" } | { do: "send"; name: "retro" | "distill" | "curate" } | { do: "answer"; id: string };
+type Outcome = { do: "close" } | { do: "send"; name: "retro" | "curate" } | { do: "answer"; id: string };
 interface Pane {
   view: View;
   typing: boolean;
@@ -389,7 +388,6 @@ function paneComponent(T: Tui, tui: any, theme: any, done: (o: Outcome) => void,
       const row = p.rows[p.rowAt];
       if (row && k(data, "enter", "o")) go(act.item(row));
       else if (k(data, "g")) go(act.triage());
-      else if (k(data, "d")) return done({ do: "send", name: "distill" });
       else if (k(data, "c")) return done({ do: "send", name: "curate" });
       else if (k(data, "t")) return done({ do: "send", name: "retro" });
     } else if (p.view === "item") {
@@ -467,8 +465,8 @@ function paneComponent(T: Tui, tui: any, theme: any, done: (o: Outcome) => void,
       out.push(...windowed(lines, sel, room()));
       hint = p.typing ? "Enter search | Tab results | Esc close" : "s or / type a search | Up/Down select | Enter open | i inbox | r requests | Esc close";
     } else if (p.view === "inbox") {
-      out.push(fg("dim", `g Triage${SEP}d Distill${SEP}c Curate ${s?.curate ?? 0}${SEP}t Retro`));
-      if (p.rows.length === 0) out.push("", "The inbox is empty.", fg("dim", "Notes and session extracts wait here until distill turns them into lessons."));
+      out.push(fg("dim", `g Triage${SEP}c Curate ${s?.curate ?? 0}${SEP}t Retro`));
+      if (p.rows.length === 0) out.push("", "The inbox is empty.", fg("dim", "Notes and session extracts wait here until a promotion turns them into lessons."));
       const lines: string[] = [];
       let sel = 0;
       for (const prio of [3, 2, 1]) {
@@ -737,7 +735,7 @@ export default function rkb(pi: ExtensionAPI) {
     const lib = T;
     for (;;) {
       const out = (await custom((tui: any, theme: any, _keys: any, done: (o: Outcome) => void) => paneComponent(lib, tui, theme, done, p, actions(ctx, p), () => status))) as Outcome | undefined;
-      if (out?.do === "send") pi.sendUserMessage(prompt({ retro: RETRO, distill: DISTILL, curate: CURATE }[out.name], ""));
+      if (out?.do === "send") pi.sendUserMessage(prompt({ retro: RETRO, curate: CURATE }[out.name], ""));
       const q = out?.do === "answer" ? status?.requests.find((r) => r.id === out.id) : undefined;
       if (!q) return;
       await answer(ctx, q);
@@ -854,7 +852,6 @@ export default function rkb(pi: ExtensionAPI) {
 
   for (const [name, text, description] of [
     ["rkb-retro", RETRO, "Record the durable lessons of this session in rkb now"],
-    ["rkb-distill", DISTILL, "Turn a few rkb inbox items into lessons"],
     ["rkb-curate", CURATE, "Merge near-duplicate lessons, sharpen weak ones and archive ones that do not help"],
   ]) {
     pi.registerCommand(name, {

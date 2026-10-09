@@ -2,7 +2,6 @@
 //! This crate never writes to the terminal; the `rkb` binary presents its results.
 
 pub mod approval;
-pub mod auto;
 pub mod body;
 pub mod conditions;
 pub mod config;
@@ -29,6 +28,7 @@ pub mod lock;
 pub mod matching;
 pub mod observer;
 pub mod paths;
+pub mod promote;
 pub mod request;
 pub mod rerank;
 pub mod review;

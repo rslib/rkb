@@ -9,8 +9,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result, io};
 
-/// Items older than this are deleted without being distilled.
-pub const EXPIRY_DAYS: u64 = 30;
 /// Inbox items one distill run takes, unless `[distill] batch` in `config.toml` says otherwise.
 pub const DEFAULT_BATCH: usize = 5;
 
@@ -65,6 +63,11 @@ pub struct Meta {
     /// The signals that caused a transcript extract, such as `fixed cmake`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signals: Vec<String>,
+    /// One hash for each failed command in the extract, for the repeat count across sessions. These
+    /// are the same hashes the failure hook records, so the two counts agree and no error text is
+    /// stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<String>,
     /// 1 to 3, highest first in the inbox; an item without one counts as 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
@@ -245,10 +248,79 @@ pub fn remove(state: &Path, id: &str) -> bool {
     valid_id(id) && std::fs::remove_file(file(state, id)).is_ok()
 }
 
-/// Deletes items older than `EXPIRY_DAYS` at `now` and returns how many.
-pub fn expire(state: &Path, now: u64) -> usize {
-    let limit = now.saturating_sub(EXPIRY_DAYS * 24 * 3600);
-    list(state).into_iter().filter(|i| i.meta.time < limit && remove(state, &i.id)).count()
+/// Removes every inbox item that carries any of `sigs`, except `keep`. Returns how many it removed.
+pub fn remove_signatures(state: &Path, sigs: &[String], keep: &str) -> usize {
+    let mut n = 0;
+    for item in list(state) {
+        if item.id != keep && item.meta.signatures.iter().any(|s| sigs.contains(s)) && remove(state, &item.id) {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn signatures_file(state: &Path) -> PathBuf {
+    state.join("signatures.jsonl")
+}
+
+/// Whether a promotion already wrote a lesson for this signature. A done row has no `session`, so the
+/// repeat count of `rkb review --signals` never sees it.
+pub fn is_done(state: &Path, sig: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(signatures_file(state)) else { return false };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|v| v["done"] == true && v["sig"].as_str() == Some(sig))
+}
+
+/// Records that a lesson now covers `sig`, so it is not promoted again.
+pub fn mark_done(state: &Path, sig: &str) {
+    let line = serde_json::json!({ "time": crate::request::now(), "sig": sig, "done": true }).to_string();
+    let _ = crate::lock::append_line(&signatures_file(state), &line);
+}
+
+fn session_pairs(state: &Path) -> std::collections::BTreeSet<(String, String)> {
+    let Ok(text) = std::fs::read_to_string(signatures_file(state)) else { return Default::default() };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| Some((v["sig"].as_str()?.to_string(), v["session"].as_str()?.to_string())))
+        .collect()
+}
+
+/// The number of distinct sessions in which this signature appeared.
+pub fn sessions(state: &Path, sig: &str) -> usize {
+    session_pairs(state)
+        .iter()
+        .filter(|(s, _)| s == sig)
+        .map(|(_, session)| session.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+/// Whether the signature appeared in two or more sessions.
+pub fn eligible(state: &Path, sig: &str) -> bool {
+    sessions(state, sig) >= 2
+}
+
+/// Keeps the inbox under `[inbox] max_items` (default 500), oldest first, and returns how many it
+/// dropped. Age alone never drops an item.
+pub fn enforce_cap(state: &Path, config_dir: &Path) -> usize {
+    let cap = max_items(config_dir);
+    let mut items = list(state);
+    if items.len() <= cap {
+        return 0;
+    }
+    items.sort_by(|a, b| a.meta.time.cmp(&b.meta.time).then(a.id.cmp(&b.id)));
+    items[..items.len() - cap].iter().filter(|i| remove(state, &i.id)).count()
+}
+
+pub const DEFAULT_MAX_ITEMS: usize = 500;
+
+/// The `[inbox] max_items` cap from the per-machine config, at least 1.
+pub fn max_items(config_dir: &Path) -> usize {
+    crate::config::machine(config_dir)
+        .ok()
+        .and_then(|(_, t)| t.get("inbox")?.get("max_items")?.as_integer())
+        .map_or(DEFAULT_MAX_ITEMS, |n| n.max(1) as usize)
 }
 
 /// Lines of one extract at most; the most recent part is kept.
@@ -596,8 +668,15 @@ pub fn read_from(transcript: &Path, harness: &str, from: Option<u64>) -> Result<
     Ok((steps, from + whole as u64))
 }
 
-pub fn capture(state: &Path, harness: &str, session: &str, transcript: &Path, cwd: Option<&str>) -> Result<Option<Item>> {
-    expire(state, crate::request::now());
+pub fn capture(
+    state: &Path,
+    config_dir: &Path,
+    harness: &str,
+    session: &str,
+    transcript: &Path,
+    cwd: Option<&str>,
+) -> Result<Option<Item>> {
+    enforce_cap(state, config_dir);
     let records = crate::hooks::read(state, session);
     let last = records.iter().rposition(|r| r["kind"] == "extracted");
     let since = &records[last.map_or(0, |i| i + 1)..];
@@ -614,24 +693,63 @@ pub fn capture(state: &Path, harness: &str, session: &str, transcript: &Path, cw
     }
     let (steps, end) = read_from(transcript, harness, last.and_then(|i| records[i]["offset"].as_u64()))?;
     let body = extract(&steps);
-    let item = if body.is_empty() {
-        None
-    } else {
-        let meta = Meta {
-            kind: Kind::Transcript,
-            time: crate::request::now(),
-            harness: Some(harness.to_string()),
-            session: Some(session.to_string()),
-            cwd: cwd.map(str::to_string),
-            signals: signals.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect(),
-            priority: Some(crate::hooks::score(since, &records).clamp(1, 3) as u8),
-            source: None,
-            candidates: vec![],
-        };
-        Some(add(state, meta, &body)?)
+    // One signature for each failed command, the same hash the failure hook records, so a session
+    // with one of two failures still matches and the repeat count is shared with `rkb review`.
+    let found = failure_signatures(&steps);
+    let item = match keep_signatures(&body, &found, state) {
+        None => None,
+        Some(sigs) => {
+            let meta = Meta {
+                kind: Kind::Transcript,
+                time: crate::request::now(),
+                harness: Some(harness.to_string()),
+                session: Some(session.to_string()),
+                cwd: cwd.map(str::to_string),
+                signals: signals.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect(),
+                signatures: sigs.clone(),
+                priority: Some(crate::hooks::score(since, &records).clamp(1, 3) as u8),
+                source: None,
+                candidates: vec![],
+            };
+            let item = add(state, meta, &body)?;
+            for sig in &sigs {
+                crate::hooks::seen_before(state, sig, session);
+            }
+            Some(item)
+        }
     };
     crate::hooks::append(state, session, &serde_json::json!({ "kind": "extracted", "offset": end }))?;
     Ok(item)
+}
+
+/// The signatures a new item keeps: the ones `found` holds, minus those a promotion already answered.
+/// `None` drops the item, which happens only when the body is empty or every failure was answered.
+/// An extract with no failure at all is kept with no signature, and one answered failure never hides a
+/// second, unanswered one in the same extract.
+fn keep_signatures(body: &str, found: &[String], state: &Path) -> Option<Vec<String>> {
+    if body.is_empty() {
+        return None;
+    }
+    let pending: Vec<String> = found.iter().filter(|s| !is_done(state, s)).cloned().collect();
+    if found.is_empty() || !pending.is_empty() { Some(pending) } else { None }
+}
+
+/// One hash for each failed command in `steps`, from the program and its error output. The hash is
+/// `hooks::signature` over the program name alone, exactly as the failure hook computes it, so the two
+/// rows coincide and never store the error text. `cmake --build build` and `cmake --build out` with the
+/// same error give one hash.
+fn failure_signatures(steps: &[Step]) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for s in steps {
+        if let Step::Command { command, ok: false, output } = s {
+            let program = crate::hooks::program(command).unwrap_or_default();
+            let sig = crate::hooks::signature(&program, output);
+            if !out.contains(&sig) {
+                out.push(sig);
+            }
+        }
+    }
+    out
 }
 
 /// Every Claude Code auto memory folder: `~/.claude/projects/*/memory/`.
@@ -715,6 +833,7 @@ pub fn import_notes(state: &Path, notes: &[(String, String)]) -> Result<(usize, 
             session: None,
             cwd: None,
             signals: vec![],
+            signatures: vec![],
             priority: Some(2),
             source: Some(source.clone()),
             candidates: vec![],
@@ -749,6 +868,50 @@ mod tests {
         assert!(text.contains("error: x undefined (×3)") && text.matches("x undefined").count() == 1, "{text}");
     }
 
+    #[test]
+    fn one_signature_for_each_failed_command_and_they_match_across_sessions() {
+        let failed = |cmd: &str, text: &str| Step::Command { command: cmd.into(), ok: false, output: text.into() };
+        let a = vec![Step::Prompt("build it".into()), failed("cmake --build .", "Exit code 1\nerror: could not find hdf5")];
+        let b = vec![
+            Step::Prompt("a different question entirely".into()),
+            Step::Text("I will try another flag".into()),
+            failed("cmake --build .", "Exit code 1\nerror: could not find hdf5"),
+        ];
+        assert_eq!(failure_signatures(&a), failure_signatures(&b), "the agent text is not signed");
+        // Two failures give two signatures, so a session with only one of them still matches.
+        let two = vec![failed("cmake --build .", "error: could not find hdf5"), failed("ninja", "error: no rule to make target")];
+        let sigs = failure_signatures(&two);
+        assert_eq!(sigs.len(), 2);
+        assert!(failure_signatures(&a).iter().all(|s| sigs.contains(s)));
+        // Only the hash is kept, never the error text.
+        assert!(sigs.iter().all(|s| s.len() == 24 && s.bytes().all(|b| b.is_ascii_hexdigit())), "{sigs:?}");
+    }
+
+    #[test]
+    fn remove_signatures_keeps_the_named_item_and_drops_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = dir.path();
+        let sig = crate::hooks::signature("", "error: could not find hdf5");
+        let meta = || Meta {
+            kind: Kind::Transcript,
+            time: 1,
+            harness: None,
+            session: None,
+            cwd: None,
+            signals: vec![],
+            signatures: vec![sig.clone()],
+            priority: None,
+            source: None,
+            candidates: vec![],
+        };
+        let a = add(s, meta(), "one").unwrap();
+        let b = add(s, meta(), "two").unwrap();
+        let c = add(s, Meta { signatures: vec![], ..meta() }, "three").unwrap();
+        assert_eq!(remove_signatures(s, std::slice::from_ref(&sig), &a.id), 1);
+        let ids: Vec<String> = list(s).into_iter().map(|i| i.id).collect();
+        assert!(ids.contains(&a.id) && ids.contains(&c.id) && !ids.contains(&b.id), "{ids:?}");
+    }
+
     fn note(time: u64) -> Meta {
         Meta {
             kind: Kind::Note,
@@ -757,6 +920,7 @@ mod tests {
             session: None,
             cwd: None,
             signals: vec![],
+            signatures: vec![],
             priority: None,
             source: None,
             candidates: vec![],
@@ -835,8 +999,74 @@ mod tests {
         let day = 24 * 3600;
         add(s, note(1_000 * day), "old").unwrap();
         let fresh = add(s, note(1_029 * day), "fresh").unwrap();
-        assert_eq!(expire(s, 1_031 * day), 2, "the old item and the item at 200 s");
+        let cfg = dir.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("config.toml"), "[inbox]\nmax_items = 1\n").unwrap();
+        assert_eq!(enforce_cap(s, &cfg), 2, "the two oldest items are dropped over the cap");
         assert_eq!(list(s).into_iter().map(|i| i.id).collect::<Vec<_>>(), [fresh.id]);
+    }
+
+    #[test]
+    fn a_direct_note_carries_no_failure_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = dir.path().join("state");
+        std::fs::create_dir_all(&s).unwrap();
+        let item = add(&s, note(100), "undefined reference to vtable for Widget").unwrap();
+        assert!(item.meta.signatures.is_empty(), "a direct note carries no failure signature");
+    }
+
+    #[test]
+    fn the_hook_and_capture_agree_on_one_failure() {
+        let output = "Exit code 1\nCMake Error: could not find HDF5";
+        // Exactly what the failure hook does in `crates/rkb/src/hook.rs`.
+        let hook = crate::hooks::signature(&crate::hooks::program("cmake --build build").unwrap(), output);
+        let steps = vec![Step::Command { command: "cmake --build build".into(), ok: false, output: output.into() }];
+        assert_eq!(failure_signatures(&steps), vec![hook.clone()], "the two hashes must coincide");
+        // A different full command with the same program and error is the same failure.
+        let other = vec![Step::Command { command: "cmake --build out".into(), ok: false, output: output.into() }];
+        assert_eq!(failure_signatures(&steps), failure_signatures(&other));
+    }
+
+    #[test]
+    fn an_answered_failure_does_not_drop_a_second_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = dir.path();
+        let a = crate::hooks::signature("cmake", "error: could not find hdf5");
+        let b = crate::hooks::signature("ninja", "error: no rule to make target");
+        let found = vec![a.clone(), b.clone()];
+        assert_eq!(keep_signatures("body", &found, s), Some(found.clone()), "nothing answered yet");
+        mark_done(s, &a);
+        assert_eq!(keep_signatures("body", &found, s), Some(vec![b.clone()]), "the answered one goes, the other stays");
+        mark_done(s, &b);
+        assert_eq!(keep_signatures("body", &found, s), None, "every failure answered: the item is dropped");
+        assert_eq!(keep_signatures("body", &[], s), Some(vec![]), "an extract with no failure is kept");
+        assert_eq!(keep_signatures("", &found, s), None, "an empty body is dropped");
+    }
+
+    #[test]
+    fn a_done_signature_is_not_promoted_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = dir.path();
+        let sig = crate::hooks::signature("", "error: could not find hdf5");
+        assert!(!is_done(s, &sig));
+        mark_done(s, &sig);
+        assert!(is_done(s, &sig));
+        // A done row holds no session, so the repeat count ignores it.
+        assert_eq!(sessions(s, &sig), 0);
+    }
+
+    #[test]
+    fn repeat_counts_distinct_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = dir.path();
+        let sig = "error: undefined reference to vtable";
+        assert_eq!(sessions(s, sig), 0);
+        assert!(!crate::hooks::seen_before(s, sig, "s1"));
+        assert!(!crate::hooks::seen_before(s, sig, "s1"), "the same session does not count twice");
+        assert!(crate::hooks::seen_before(s, sig, "s2"));
+        assert_eq!(sessions(s, sig), 2);
+        assert!(eligible(s, sig));
+        assert!(!eligible(s, "error: other"));
     }
 
     fn fixture(name: &str) -> String {
@@ -937,17 +1167,17 @@ mod tests {
                 .unwrap(),
         );
         std::fs::write(&t, first).unwrap();
-        assert_eq!(capture(s, "claude-code", "x", &t, None).unwrap(), None, "no signal, no item");
+        assert_eq!(capture(s, dir.path(), "claude-code", "x", &t, None).unwrap(), None, "no signal, no item");
 
         crate::hooks::append(s, "x", &serde_json::json!({ "kind": "fixed", "program": "cmake" })).unwrap();
-        let item = capture(s, "claude-code", "x", &t, Some("/work/demo")).unwrap().unwrap();
+        let item = capture(s, dir.path(), "claude-code", "x", &t, Some("/work/demo")).unwrap().unwrap();
         assert_eq!(item.meta.signals, ["fixed cmake"]);
         assert!(item.body.contains("Could NOT find ZLIB") && !item.body.contains("Configured."));
-        assert_eq!(capture(s, "claude-code", "x", &t, None).unwrap(), None, "nothing new");
+        assert_eq!(capture(s, dir.path(), "claude-code", "x", &t, None).unwrap(), None, "nothing new");
 
         std::fs::write(&t, format!("{first}{rest}")).unwrap();
         crate::hooks::append(s, "x", &serde_json::json!({ "kind": "correction" })).unwrap();
-        let later = capture(s, "claude-code", "x", &t, None).unwrap().unwrap();
+        let later = capture(s, dir.path(), "claude-code", "x", &t, None).unwrap().unwrap();
         assert_eq!(later.body, "[agent] Configured. ZLIB_ROOT tells find_package where to look.");
         assert_eq!(list(s).len(), 2);
     }

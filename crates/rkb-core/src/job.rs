@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, io};
-use crate::observer;
 use crate::request;
 
 /// A job that is not finished within an hour is dropped, and finishing it fails.
@@ -18,7 +17,6 @@ pub const EXPIRY_S: u64 = 3600;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Job {
-    Observe(observer::Run),
     Triage(crate::triage::Ask),
 }
 
@@ -96,20 +94,12 @@ pub fn open(state: &Path) -> Vec<Stored> {
 mod tests {
     use super::*;
 
-    fn run() -> observer::Run {
-        observer::Run {
-            session: "s1".into(),
+    fn ask() -> crate::triage::Ask {
+        crate::triage::Ask {
             harness: "claude-code".into(),
-            cwd: None,
-            models: vec![("sonnet".into(), Some("sonnet".into()))],
-            titles: vec![],
-            parts: vec!["part".into()],
-            end: 10,
-            next: 0,
-            kept: vec![],
-            dropped: 0,
-            first_dropped: None,
-            via: vec![],
+            models: vec![("haiku".into(), Some("haiku".into()))],
+            entries: vec![],
+            prompt: "p".into(),
         }
     }
 
@@ -117,7 +107,7 @@ mod tests {
     fn save_load_expire() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path();
-        let job = Stored { id: new_id(), created: request::now(), job: Job::Observe(run()) };
+        let job = Stored { id: new_id(), created: request::now(), job: Job::Triage(ask()) };
         save(state, &job).unwrap();
         assert_eq!(load(state, &job.id), Ok(job.clone()));
         assert_eq!(open(state).len(), 1);

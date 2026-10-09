@@ -42,7 +42,6 @@ const UI_TIMEOUT_MS = 5000
 const JOB_TIMEOUT_MS = 30000
 // A tool runs a search or a write, which may load a model, so it gets longer than a hook.
 const TOOL_TIMEOUT_MS = 60000
-const NOTES_MAX_TOKENS = 4096
 
 const status = atom({ plugin: 'rkb', key: 'status' } as const, null)
 const band = atom({ plugin: 'rkb', key: 'band' } as const, [])
@@ -128,47 +127,6 @@ async function refresh($: EngineInterface, session: Session): Promise<void> {
     await update($, seen, ids => [...ids, ...fresh.map(i => i.id)])
     await update($, band, shown => [...shown, ...fresh])
   }
-}
-
-/**
- * Runs one model job of any kind: rkb prepares each part, the session's own client answers it, and rkb
- * handles the answer. Returns the last thing rkb printed.
- */
-async function runJob($: EngineInterface, session: Session, prepare: string[]): Promise<Json | undefined> {
-  const model = await $.session.model()
-  let step = (await rkb($, [...prepare, '--model', model], { cwd: session.cwd, timeoutMs: JOB_TIMEOUT_MS })).data
-  while (step?.job && step.prompt) {
-    const finish = ['job', 'finish', step.job, '--part', String(step.part)]
-    const failures: string[] = []
-    let next: Json | undefined
-    let answered = false
-    for (const m of step.models as { entry: string; model: string | null }[]) {
-      const r = await $.model.complete({ model: m.model ?? model, prompt: step.prompt, maxTokens: NOTES_MAX_TOKENS })
-      if (r.isAnswered) {
-        next = (await rkb($, [...finish, '--model', m.entry], { cwd: session.cwd, stdin: r.text, timeoutMs: JOB_TIMEOUT_MS })).data
-        answered = true
-        break
-      }
-      failures.push(`${m.entry}: ${r.reason}`)
-    }
-    if (!answered) {
-      await rkb($, [...finish, '--failed', failures.join('; ')], { cwd: session.cwd })
-      return undefined
-    }
-    step = next
-  }
-  return step
-}
-
-/** One observer run, then triage of the inbox and the small model for what triage left unsure. */
-async function observe($: EngineInterface, session: Session): Promise<void> {
-  if (session.transcript) {
-    const prepare = ['job', 'prepare', 'observe', '--session', session.id, '--transcript', session.transcript, '--harness', 'claude-code', '--cwd', session.cwd]
-    const done = await runJob($, session, prepare)
-    if (done?.outcome === 'added') $.ui.toast(`rkb: ${plural(done.notes, 'note')} for the inbox`)
-  }
-  await rkb($, ['inbox', 'triage'], { cwd: session.cwd, timeoutMs: JOB_TIMEOUT_MS })
-  await runJob($, session, ['job', 'prepare', 'triage', '--harness', 'claude-code'])
 }
 
 async function say($: EngineInterface, tone: Notice['tone'], text: string): Promise<void> {
@@ -289,35 +247,11 @@ function bar(relevance: number): string {
 }
 
 // `start` is the session context rkb prints at session start, delivered with the next prompt.
-type Live = { session?: Session; isOff: boolean; isObserving: boolean; isQuiet: boolean; tools: Set<string>; start?: Promise<string> }
-type AutoKind = 'distill' | 'curate'
-
-const AUTO_TASK: Record<AutoKind, string> = {
-  distill: 'Distill the triaged rkb inbox into lessons, as your steps say.',
-  curate: 'Curate the rkb knowledge base, as your steps say.',
-}
-
-/**
- * Starts the agent for an automatic run when rkb says one is due and this session wins the claim. rkb
- * holds the gates (`[distill] auto`, the gap since the last run) and records the start in the claim.
- */
-async function autoRun($: EngineInterface, session: Session, kind: AutoKind): Promise<boolean> {
-  const claim = await rkb($, ['auto', 'claim', kind], { cwd: session.cwd })
-  if (claim.data?.claimed !== true) return false
-  const started = await $.agent
-    .spawn({ subagentType: `rkb:${kind}`, description: `rkb ${kind}`, prompt: AUTO_TASK[kind] })
-    .then(r => !r.deny)
-    .catch(() => false)
-  if (started) $.ui.toast(`rkb: ${kind} started in the background`)
-  return started
-}
+type Live = { session?: Session; isOff: boolean; isQuiet: boolean; tools: Set<string>; start?: Promise<string> }
 
 // Claude Code lists a mod's tool as `mcp__<plugin>__<name>`, so `rkb_search` becomes `mcp__rkb__search`.
 const TOOL_PREFIX = 'mcp__rkb__'
-// The plugin's MCP server offers the same tools for sessions without the mod: `mcp__plugin_rkb_rkb__rkb_search`
-// when installed, `mcp__rkb__rkb_search` from a plugin folder.
-const MCP_COPY = /^mcp__.+__rkb_[a-z]+$/
-// The tools settings.json allows without a prompt when they come from `rkb mcp`.
+// The tools settings.json allows without a prompt, next to the mod's registration.
 const ALLOWED = new Set(['search', 'show', 'add', 'note'].map(n => TOOL_PREFIX + n))
 
 /** Registers the agent tools from `rkb tools` under short names into `tools`; registers none when rkb fails. */
@@ -393,23 +327,14 @@ function later($: EngineInterface, work: () => Promise<void>): void {
 function turnEnded($: EngineInterface, live: Live, e: { session_id: string; cwd: string; transcript_path: string; background_tasks?: { status: string; description: string }[] }): void {
   const s: Session = { id: e.session_id, cwd: e.cwd, transcript: e.transcript_path }
   live.session = s
-  const isAuto = !live.isQuiet && !e.background_tasks?.some(t => t.status === 'running' && t.description.startsWith('rkb '))
   live.isQuiet = false
   later($, async () => {
     await refresh($, s)
-    if (live.isObserving) return
-    live.isObserving = true
-    try {
-      await observe($, s)
-      if (isAuto && !(await autoRun($, s, 'distill'))) await autoRun($, s, 'curate')
-    } finally {
-      live.isObserving = false
-    }
   })
 }
 
 export const register: Register = on => {
-  const live: Live = { isOff: false, isObserving: false, isQuiet: false, tools: new Set() }
+  const live: Live = { isOff: false, isQuiet: false, tools: new Set() }
 
   on('session.start', async ($, e, next) => {
     live.isOff = Boolean(await $.env.get('RKB_OBSERVER'))
@@ -436,12 +361,6 @@ export const register: Register = on => {
   })
 
   on('tool.check', async ($, e, next) => (ALLOWED.has(e.tool) ? { decision: 'allow' as const } : next(e)))
-
-  // With the mod's tools registered, the MCP copies move behind ToolSearch: the model sees their names only.
-  on('tool.describe', async ($, e, next) => {
-    const r = await next(e)
-    return live.tools.size > 0 && MCP_COPY.test(e.tool) ? { ...r, isDeferred: true } : r
-  })
 
   // Every event but PreToolUse goes to `rkb hook --mod`; the plugin's command hooks of this session then do
   // nothing, because `RKB_MOD` names it. The confirm gate stays a command hook: only its input has

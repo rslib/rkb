@@ -235,12 +235,14 @@ pub fn typed_text(prompt: &str) -> String {
 pub const RANKINGS: &str = "rankings.jsonl";
 
 /// Logs one hook ranking: which backend ranked, which were skipped and why, and how long it took.
-pub fn log_ranking(state: &Path, hook: &str, ranked: &crate::rerank::Ranked, ms: u64) {
+pub fn log_ranking(state: &Path, hook: &str, ranked: &crate::rerank::Ranked, hits: &[crate::search::Hit], ms: u64) {
     let line = serde_json::json!({
         "time": crate::request::now(),
         "hook": hook,
         "backend": ranked.backend,
         "skipped": ranked.skipped.iter().map(|(b, r)| format!("{b}: {r}")).collect::<Vec<_>>(),
+        // The top 5 ids in rank order, so found-but-not-injected can be told from never-found.
+        "ids": hits.iter().take(5).map(|h| h.id.clone()).collect::<Vec<_>>(),
         "ms": ms,
     });
     let _ = lock::append_line(&state.join(RANKINGS), &line.to_string());
@@ -428,7 +430,7 @@ pub(crate) fn prune_log(state: &Path, name: &str) {
     if !text.lines().next().is_some_and(old) {
         return;
     }
-    // ponytail: a line appended between the read and the rename is lost; one replay line is cheap to lose.
+    // a line appended between the read and the rename is lost; one replay line is cheap to lose.
     let kept: String = text.lines().filter(|l| !old(l)).map(|l| format!("{l}\n")).collect();
     let tmp = state.join(format!(".{name}.tmp"));
     if std::fs::write(&tmp, kept).is_ok() {
@@ -864,5 +866,31 @@ mod tests {
         assert_eq!(typed_text(pasted), "why is this not in config.toml?");
         assert_eq!(typed_text("<bash-input> rkb approve observer</bash-input>"), "");
         assert_eq!(typed_text("remember: cmake needs ZLIB_ROOT"), "remember: cmake needs ZLIB_ROOT");
+    }
+
+    #[test]
+    fn the_ranking_line_names_the_top_five_ids_and_no_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let hit = |id: &str| crate::search::Hit {
+            id: id.into(),
+            kind: crate::lesson::LessonType::Fact,
+            title: "t".into(),
+            path: "general/a.md".into(),
+            status: crate::lesson::Status::Active,
+            applies: crate::conditions::Verdict::Yes,
+            summary: "s".into(),
+            score: 1.0,
+            line: None,
+            relevance: None,
+            verified: "2026-09-25".into(),
+            verified_how: "ran".into(),
+        };
+        let hits: Vec<_> = ["a", "b", "c", "d", "e", "f"].iter().map(|i| hit(i)).collect();
+        let ranked = crate::rerank::Ranked { backend: "bm25".into(), scores: None, order: None, skipped: vec![] };
+        log_ranking(state, "recall", &ranked, &hits, 12);
+        let text = std::fs::read_to_string(state.join(RANKINGS)).unwrap();
+        assert!(text.contains("\"ids\":[\"a\",\"b\",\"c\",\"d\",\"e\"]"), "{text}");
+        assert!(!text.contains("\"query\""), "{text}");
     }
 }

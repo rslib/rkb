@@ -463,7 +463,7 @@ pub fn triage_check(state_dir: &Path) -> Option<Check> {
     Some(check("triage", Level::Ok, detail, None))
 }
 
-pub fn observer_check(config_dir: &Path, state_dir: &Path) -> Check {
+pub fn observer_check(config_dir: &Path, _state_dir: &Path) -> Check {
     use crate::observer;
     let cfg = match observer::load(config_dir) {
         Ok(c) => c,
@@ -476,22 +476,7 @@ pub fn observer_check(config_dir: &Path, state_dir: &Path) -> Check {
     if !observer::approved(config_dir, &cfg) {
         return check("observer", Level::Warn, format!("{chains}; not approved here"), Some("run `rkb approve observer`".into()));
     }
-    let runs: Vec<serde_json::Value> = observer::log(state_dir).into_iter().filter(|r| r["outcome"] != "skipped").collect();
-    let last3 = &runs[runs.len().saturating_sub(3)..];
-    if last3.len() == 3 && last3.iter().all(|r| r["outcome"] == "failed") {
-        let reason = last3[2]["detail"].as_str().unwrap_or("").to_string();
-        return check("observer", Level::Warn, format!("the last 3 runs failed: {reason}"), Some("check `[observer] cmd` by hand".into()));
-    }
-    let last = runs.last().and_then(|r| r["time"].as_i64()).and_then(|t| jiff::Timestamp::from_second(t).ok());
-    let detail = match (last, runs.last()) {
-        (Some(t), Some(r)) => format!(
-            "{chains}; last run {}: {}",
-            t.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M"),
-            r["detail"].as_str().unwrap_or("")
-        ),
-        _ => format!("{chains}; no run yet"),
-    };
-    check("observer", Level::Ok, detail, None)
+    check("observer", Level::Ok, format!("{chains}; approved here"), None)
 }
 
 fn trust_check(config_dir: &Path) -> Check {
@@ -651,29 +636,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(observer_check(&config, &state).detail, "claude-code = sonnet, haiku; triage claude-code = haiku; no run yet");
-        std::fs::create_dir_all(&state).unwrap();
-        let line =
-            |o: &str, d: &str| format!("{{\"time\":1790000000,\"session\":\"s\",\"parts\":1,\"outcome\":\"{o}\",\"detail\":\"{d}\"}}\n");
-        let log = [
-            line("added", "2 notes"),
-            line("failed", "timeout"),
-            line("failed", "timeout"),
-            line("skipped", "busy"),
-            line("failed", "timeout"),
-        ]
-        .concat();
-        std::fs::write(state.join("observer.jsonl"), log).unwrap();
-        let c = observer_check(&config, &state);
-        assert_eq!(c.level, Level::Warn);
-        assert!(c.detail.contains("timeout"));
-        std::fs::write(
-            state.join("observer.jsonl"),
-            line("failed", "exit 1") + &line("added", "1 notes, 0 lines dropped, via haiku (sonnet: exit 1)"),
-        )
-        .unwrap();
-        let c = observer_check(&config, &state);
-        assert!(c.detail.contains("last run 2026-") && c.detail.ends_with("via haiku (sonnet: exit 1)"), "{}", c.detail);
+        assert_eq!(observer_check(&config, &state).detail, "claude-code = sonnet, haiku; triage claude-code = haiku; approved here");
     }
 
     #[test]

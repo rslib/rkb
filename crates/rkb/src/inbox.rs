@@ -59,6 +59,7 @@ pub fn note(env: &Env, words: Vec<String>, priority: Option<u8>) -> Result<Outpu
         session: rkb_core::usage::env_session(),
         cwd: None,
         signals: vec![],
+        signatures: vec![],
         priority: priority.map(|p| p.clamp(1, 3)),
         source: None,
         candidates: vec![],
@@ -89,7 +90,7 @@ pub fn import_claude(env: &Env, memory: Option<&str>, files: &[std::path::PathBu
 
 pub fn list(env: &Env) -> Result<Output, CliError> {
     let now = request::now();
-    let expired = distill::expire(&env.state, now);
+    let expired = distill::enforce_cap(&env.state, &rkb_core::paths::config_dir());
     let items = distill::list(&env.state);
     let (c, m, w) = (env.colored, marks(), width());
     let mut human = format!("{} {} {} items\n", paint(c, "1", "inbox"), m.sep, items.len());
@@ -107,7 +108,7 @@ pub fn list(env: &Env) -> Result<Output, CliError> {
         ));
     }
     if expired > 0 {
-        human.push_str(&format!("\n{expired} items older than {} days expired\n", distill::EXPIRY_DAYS));
+        human.push_str(&format!("\n{expired} oldest items dropped over the inbox cap\n"));
     }
     let help = if items.is_empty() {
         "The inbox is empty"
@@ -147,7 +148,7 @@ fn novelty(env: &Env, item: &Item, text: &str) -> Option<(String, f32)> {
 /// unsure ones through `harness`'s CLI and its approved triage models.
 pub fn triage(env: &Env, ask: Option<&str>) -> Result<Output, CliError> {
     use rkb_core::triage::{self, Counts, Stages, Thresholds};
-    distill::expire(&env.state, request::now());
+    distill::enforce_cap(&env.state, &rkb_core::paths::config_dir());
     let has_kb = rkb_core::kb::open(&env.root).is_ok();
     let novel = |item: &Item, text: &str| novelty(env, item, text);
     let score = |item: &Item, texts: &[&str]| {
@@ -243,131 +244,6 @@ pub fn done(env: &Env, ids: &[String], outcomes: &[String]) -> Result<Output, Cl
 
 /// The observer settings for `harness` when its chain is set and approved, and the lesson titles of the
 /// session's place.
-fn observer_setup(env: &Env, harness: &str, cwd: Option<&str>) -> Result<(rkb_core::config::ObserverConfig, Vec<String>), CliError> {
-    use rkb_core::observer;
-    let config = rkb_core::paths::config_dir();
-    let cfg = observer::load(&config).map_err(|e| CliError::new(ErrorCode::Usage, e, "fix [observer] in config.toml"))?;
-    if cfg.chain(harness).is_empty() {
-        return Err(CliError::new(
-            ErrorCode::Usage,
-            format!("no observer model chain for {harness}"),
-            format!("add `{harness} = [\"<model>\", \"session\"]` under [observer] in ~/.config/rkb/config.toml"),
-        ));
-    }
-    if !observer::approved(&config, &cfg) {
-        return Err(CliError::new(ErrorCode::Usage, "the observer is not approved here", "run `rkb approve observer`"));
-    }
-    rkb_core::kb::open(&env.root)?;
-    let here = cwd.map(std::path::PathBuf::from).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let place = rkb_core::state::locate(&env.root, &here, &rkb_core::matching::Hints::default(), &env.state)?;
-    let name = |m: &Option<rkb_core::matching::Matched>| m.as_ref().map(|m| m.name.clone());
-    let titles = observer::titles(&env.root, name(&place.project).as_deref(), name(&place.system).as_deref())?;
-    Ok((cfg, titles))
-}
-
-fn observed(o: rkb_core::observer::Observed) -> Result<Output, CliError> {
-    use rkb_core::observer::Observed;
-    let (human, data) = match o {
-        Observed::Added { item, dropped, via } => {
-            let n = item.body.lines().count();
-            (
-                format!("observed {n} notes into inbox item {} via {via}; {dropped} other lines dropped", item.id),
-                json!({ "outcome": "added", "id": item.id, "notes": n, "dropped": dropped, "via": via }),
-            )
-        }
-        Observed::NoNotes { dropped, via } => (
-            format!("no durable notes via {via}; {dropped} other lines dropped"),
-            json!({ "outcome": "none", "id": null, "notes": 0, "dropped": dropped, "via": via }),
-        ),
-        Observed::Skipped(r) => (format!("skipped: {r}"), json!({ "outcome": "skipped", "id": null, "skipped": r })),
-        Observed::Failed(r) => {
-            return Err(CliError::new(
-                ErrorCode::Refused,
-                format!("every observer model failed: {r}"),
-                "check the [observer] models; see `rkb doctor`",
-            ));
-        }
-    };
-    Ok(Output { data, human, exit: 0, raw: false })
-}
-
-/// `rkb observe`: runs the harness's approved model chain over the new part of one session.
-pub fn observe(
-    env: &Env,
-    session: &str,
-    transcript: &std::path::Path,
-    harness: &str,
-    cwd: Option<&str>,
-    model: Option<&str>,
-) -> Result<Output, CliError> {
-    let (cfg, titles) = observer_setup(env, harness, cwd)?;
-    let job = rkb_core::observer::Job { session, transcript, harness, cwd, model, titles };
-    observed(rkb_core::observer::observe(&env.state, &cfg, &job)?)
-}
-
-fn next_prompt(env: &Env, id: &str, run: &rkb_core::observer::Run) -> Output {
-    let models: Vec<Value> = run.models.iter().map(|(entry, model)| json!({ "entry": entry, "model": model })).collect();
-    let human = format!(
-        "job {id}: part {} of {}; ask the models in order: {}",
-        run.next + 1,
-        run.parts.len(),
-        run.models.iter().map(|m| m.0.as_str()).collect::<Vec<_>>().join(", ")
-    );
-    let data = json!({
-        "job": id,
-        "kind": "observe",
-        "models": models,
-        "part": run.next,
-        "parts": run.parts.len(),
-        "prompt": run.prompt(&env.state),
-        "help": [format!("Send the first answer to `rkb job finish {id} --part {} --model <entry>` on stdin", run.next)],
-    });
-    Output { data, human, exit: 0, raw: false }
-}
-
-fn no_job(reason: &str) -> Output {
-    Output { data: json!({ "job": null, "skipped": reason }), human: format!("no job: {reason}"), exit: 0, raw: false }
-}
-
-/// `rkb job prepare observe`: the first prompt of an observer run for another runner, or why there is none.
-pub fn prepare_observe(
-    env: &Env,
-    session: &str,
-    transcript: &std::path::Path,
-    harness: &str,
-    cwd: Option<&str>,
-    model: Option<&str>,
-) -> Result<Output, CliError> {
-    use rkb_core::{job, observer};
-    let (cfg, titles) = match observer_setup(env, harness, cwd) {
-        Ok(s) => s,
-        Err(e) if e.code == ErrorCode::Usage => return Ok(no_job(&e.message)),
-        Err(e) => return Err(e),
-    };
-    let spec = observer::Job { session, transcript, harness, cwd, model, titles };
-    let run = match observer::prepare(&env.state, &cfg, &spec)? {
-        observer::Prepared::Skipped(r) => return Ok(no_job(&r)),
-        observer::Prepared::Ready(r) => *r,
-    };
-    std::fs::create_dir_all(&env.state)
-        .map_err(|e| CliError::new(ErrorCode::Io, format!("cannot create {}: {e}", env.state.display()), "check the state folder"))?;
-    let busy = |run: &observer::Run| {
-        run.busy(&env.state);
-        Ok(no_job("another observer run is active"))
-    };
-    let _guard = match rkb_core::lock::acquire(&observer::run_lock(&env.state), 6 * 3600, std::time::Duration::ZERO) {
-        Ok(g) => g,
-        Err(rkb_core::error::Error::Locked(_)) => return busy(&run),
-        Err(e) => return Err(e.into()),
-    };
-    if job::open(&env.state).iter().any(|j| matches!(j.job, job::Job::Observe(_))) {
-        return busy(&run);
-    }
-    let stored = job::Stored { id: job::new_id(), created: request::now(), job: job::Job::Observe(run.clone()) };
-    job::save(&env.state, &stored)?;
-    Ok(next_prompt(env, &stored.id, &run))
-}
-
 fn read_answer() -> Result<String, CliError> {
     let mut out = String::new();
     std::io::stdin()
@@ -384,6 +260,10 @@ fn triaged(c: rkb_core::triage::Counts, via: &str) -> Output {
         exit: 0,
         raw: false,
     }
+}
+
+fn no_job(reason: &str) -> Output {
+    Output { data: json!({ "job": null, "skipped": reason }), human: format!("no job: {reason}"), exit: 0, raw: false }
 }
 
 fn finish_triage(
@@ -462,7 +342,7 @@ fn ask_with_cli(env: &Env, harness: &str) -> Result<Option<Output>, CliError> {
     for (entry, model) in &ask.models {
         let (program, args) = observer::command(harness, model.as_deref());
         match observer::run(&program, &args, &ask.prompt, timeout, &env.state.join("observer"))? {
-            observer::Ran::Ok(out) => return Ok(Some(triaged(triage::finish_ask(&env.state, &ask, entry, &out)?, entry))),
+            observer::Ran::Ok { text, .. } => return Ok(Some(triaged(triage::finish_ask(&env.state, &ask, entry, &text)?, entry))),
             observer::Ran::Failed(r) => failures.push(format!("{entry}: {r}")),
             observer::Ran::Timeout => failures.push(format!("{entry}: timeout")),
         }
@@ -481,38 +361,7 @@ pub fn finish(env: &Env, id: &str, part: usize, model: Option<&str>, failed: Opt
         Missing::Expired => CliError::new(ErrorCode::Expired, format!("job {id} is older than one hour"), "prepare the job again"),
         Missing::NotFound => CliError::new(ErrorCode::NotFound, format!("no job {id}"), "prepare the job again"),
     })?;
-    let mut run = match stored.job {
-        job::Job::Observe(run) => run,
-        job::Job::Triage(ask) => return finish_triage(env, id, part, model, failed, &ask),
-    };
-    if part != run.next {
-        return Err(CliError::new(
-            ErrorCode::Usage,
-            format!("job {id} waits for part {}, not {part}", run.next),
-            format!("pass --part {}", run.next),
-        ));
-    }
-    if let Some(reason) = failed {
-        job::remove(&env.state, id);
-        return observed(run.fail(&env.state, reason.to_string()));
-    }
-    let entries: Vec<&str> = run.models.iter().map(|m| m.0.as_str()).collect();
-    let entry = model.filter(|m| entries.contains(m)).ok_or_else(|| {
-        CliError::new(ErrorCode::Usage, "--model must name the chain entry that answered", format!("pass one of: {}", entries.join(", ")))
-    })?;
-    let mut out = String::new();
-    std::io::stdin()
-        .take(1 << 20)
-        .read_to_string(&mut out)
-        .map_err(|e| CliError::new(ErrorCode::Usage, format!("cannot read stdin: {e}"), "pipe the model's answer on stdin"))?;
-    match run.answer(&env.state, entry, &[], &out)? {
-        Some(o) => {
-            job::remove(&env.state, id);
-            observed(o)
-        }
-        None => {
-            job::save(&env.state, &job::Stored { job: job::Job::Observe(run.clone()), ..stored })?;
-            Ok(next_prompt(env, id, &run))
-        }
+    match stored.job {
+        job::Job::Triage(ask) => finish_triage(env, id, part, model, failed, &ask),
     }
 }

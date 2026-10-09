@@ -71,7 +71,7 @@ fn read_payload() -> Result<Value> {
 fn handle(event: &str, p: &Value, state: &Path, harness: &str) -> Result<Option<String>> {
     let session = p["session_id"].as_str().unwrap_or("");
     match event {
-        "session-start" => session_start(p, state, harness),
+        "session-start" => session_start(p, state),
         "pre-tool" => pre_tool(p, state),
         "tool-ok" => tool_ok(p, state, session),
         "tool-failed" => tool_failed(p, state, session),
@@ -80,7 +80,7 @@ fn handle(event: &str, p: &Value, state: &Path, harness: &str) -> Result<Option<
         "pre-compact" => capture(p, state, session, harness),
         "session-end" => {
             let captured = capture(p, state, session, harness);
-            start_observer(p, session, harness)?;
+            start_promotion(p, state, harness)?;
             captured
         }
         _ => Err(format!("unknown hook event `{event}`").into()),
@@ -109,26 +109,14 @@ fn reply(event: &str, key: &str, value: Value) -> String {
     json!({ "hookSpecificOutput": out }).to_string()
 }
 
-fn session_start(p: &Value, state: &Path, harness: &str) -> Result<Option<String>> {
+/// The session context, with no work nudge: the inbox and curate counts stay in `rkb status`.
+fn session_start(p: &Value, state: &Path) -> Result<Option<String>> {
     hooks::cleanup(state);
     let root = kb::home();
     kb::open(&root)?;
     let place = state::locate(&root, &cwd(p), &Hints::default(), state)?;
     let s = state::build(&root, place, state)?;
-    let mut text = crate::session::context(&s).human;
-    // With automatic runs on, the Claude Code mod starts distill and curate, so the agent is not asked to.
-    if harness == "claude-code" && rkb_core::auto::enabled(&paths::config_dir()) {
-        return Ok(Some(text));
-    }
-    let distill = if harness == "claude-code" { "/rkb:distill" } else { "/rkb-distill" };
-    if let Some(line) = rkb_core::distill::nudge(state, request::now(), distill, rkb_core::distill::batch(&paths::config_dir())) {
-        text.push_str(&format!("\n{line}"));
-    }
-    let curate = if harness == "claude-code" { "/rkb:curate" } else { "/rkb-curate" };
-    if let Some(line) = rkb_core::review::curate_nudge(&root, state, curate) {
-        text.push_str(&format!("\n{line}"));
-    }
-    Ok(Some(text))
+    Ok(Some(crate::session::context(&s).human))
 }
 
 fn pre_tool(p: &Value, state: &Path) -> Result<Option<String>> {
@@ -274,26 +262,24 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
 
 fn capture(p: &Value, state: &Path, session: &str, harness: &str) -> Result<Option<String>> {
     let transcript = p["transcript_path"].as_str().ok_or("the payload has no transcript_path")?;
-    rkb_core::distill::capture(state, harness, session, Path::new(transcript), p["cwd"].as_str())?;
+    rkb_core::distill::capture(state, &paths::config_dir(), harness, session, Path::new(transcript), p["cwd"].as_str())?;
     Ok(None)
 }
 
-/// Starts `rkb observe` for the session in the background when the observer has an approved chain
-/// for this harness, and returns at once.
-fn start_observer(p: &Value, session: &str, harness: &str) -> Result<()> {
+/// Starts `rkb promote` in the background when an approved chain exists and an item repeats in two
+/// or more sessions, and returns at once.
+fn start_promotion(p: &Value, state: &Path, harness: &str) -> Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    let Some(transcript) = p["transcript_path"].as_str() else { return Ok(()) };
-    if rkb_core::observer::ready(&paths::config_dir(), harness).is_none() {
+    let config = paths::config_dir();
+    if rkb_core::observer::ready(&config, harness).is_none() || rkb_core::promote::ready_items(state).is_empty() {
         return Ok(());
     }
+    let max = rkb_core::promote::max_per_pass(&config);
     let mut c = Command::new(std::env::current_exe()?);
-    c.args(["observe", "--session", session, "--transcript", transcript, "--harness", harness]);
+    c.args(["promote", "--max", &max.to_string(), "--harness", harness]);
     if let Some(cwd) = p["cwd"].as_str() {
-        c.args(["--cwd", cwd]);
-    }
-    if let Some(model) = p["model"].as_str().filter(|m| !m.is_empty()) {
-        c.args(["--model", model]);
+        c.current_dir(cwd);
     }
     c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0).spawn()?;
     Ok(())
@@ -316,11 +302,11 @@ fn ranked_search(
     let timeout = cfg.get("hook_timeout_ms").and_then(toml::Value::as_integer).map_or(DEFAULT_HOOK_TIMEOUT_MS, |v| v.max(0) as u64);
     let start = std::time::Instant::now();
     let ranked = crate::rerankers::run(root, &settings, None, query, &found.hits, std::time::Duration::from_millis(timeout))?;
-    if settings.chain.iter().any(|b| b != rerank::BM25) && !found.hits.is_empty() {
-        hooks::log_ranking(state, hook, &ranked, start.elapsed().as_millis() as u64);
-    }
     if let Some(scores) = &ranked.scores {
         search::apply_relevance(&mut found.hits, scores, ranked.order.as_deref());
+    }
+    if settings.chain.iter().any(|b| b != rerank::BM25) && !found.hits.is_empty() {
+        hooks::log_ranking(state, hook, &ranked, &found.hits, start.elapsed().as_millis() as u64);
     }
     Ok((found.hits, ranked, place))
 }

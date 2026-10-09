@@ -9,27 +9,18 @@ pub const SKILL: &str = include_str!("../../../skills/rkb/SKILL.md");
 /// The Claude Code mod and its state contract, with `"__RKB__"` where the rkb binary goes.
 const MOD: &str = include_str!("../../../extensions/claude/hooks/register.tsx");
 const MOD_TYPES: &str = include_str!("../../../extensions/claude/types/index.d.ts");
-/// The `/rkb-retro`, `/rkb-distill` and `/rkb-curate` command prompts: file name and text with frontmatter.
-pub const COMMANDS: [(&str, &str); 3] = [
+/// The `/rkb-retro` and `/rkb-curate` command prompts: file name and text with frontmatter.
+pub const COMMANDS: [(&str, &str); 2] = [
     ("rkb-retro.md", include_str!("../../../skills/rkb/commands/rkb-retro.md")),
-    ("rkb-distill.md", include_str!("../../../skills/rkb/commands/rkb-distill.md")),
     ("rkb-curate.md", include_str!("../../../skills/rkb/commands/rkb-curate.md")),
 ];
-/// The steps of the distill and curate agents. The commands hand the work to these agents and fall
-/// back to the same steps where no agent can run.
-pub const AGENT_STEPS: [(&str, &str); 2] =
-    [("distill", include_str!("../../../skills/rkb/agents/distill.md")), ("curate", include_str!("../../../skills/rkb/agents/curate.md"))];
+/// The steps of the curate agent. The command hands the work to this agent and falls back to the
+/// same steps where no agent can run.
+pub const AGENT_STEPS: [(&str, &str); 1] = [("curate", include_str!("../../../skills/rkb/agents/curate.md"))];
 
-/// The steps of agent `name`, with this machine's distill batch size and run limit.
+/// The steps of agent `name`.
 pub fn agent_steps(name: &str) -> String {
-    let (batch, run_max) = if cfg!(test) {
-        (crate::distill::DEFAULT_BATCH, crate::distill::DEFAULT_RUN_MAX)
-    } else {
-        let dir = crate::paths::config_dir();
-        (crate::distill::batch(&dir), crate::distill::run_max(&dir))
-    };
-    let text = AGENT_STEPS.iter().find(|(n, _)| *n == name).map_or("", |(_, t)| t).trim_end();
-    text.replace("__BATCH__", &batch.to_string()).replace("__RUNMAX__", &run_max.to_string())
+    AGENT_STEPS.iter().find(|(n, _)| *n == name).map_or("", |(_, t)| t).trim_end().to_string()
 }
 
 /// The line in every command file rkb writes; uninstall removes only files that have it.
@@ -42,9 +33,8 @@ pub fn command_body(text: &str) -> &str {
 
 /// The Claude Code permission rule that asks the user before `rkb confirm`.
 pub const ASK_RULE: &str = "Bash(rkb confirm:*)";
-/// The plugin's MCP tools, allowed without a prompt: every rkb write that needs the user still asks.
-pub const TOOL_RULES: [&str; 4] =
-    ["mcp__plugin_rkb_rkb__rkb_search", "mcp__plugin_rkb_rkb__rkb_show", "mcp__plugin_rkb_rkb__rkb_add", "mcp__plugin_rkb_rkb__rkb_note"];
+/// The mod's native tools, allowed without a prompt: every rkb write that needs the user still asks.
+pub const TOOL_RULES: [&str; 4] = ["mcp__rkb__search", "mcp__rkb__show", "mcp__rkb__add", "mcp__rkb__note"];
 /// The Claude Code plugin id: plugin `rkb` from the local marketplace `rkb`.
 pub const PLUGIN: &str = "rkb@rkb";
 
@@ -69,7 +59,7 @@ pub fn claude_program() -> String {
     std::env::var("RKB_CLAUDE").unwrap_or_else(|_| "claude".into())
 }
 
-/// The Claude Code model for the distill command: `claude-code` under `[distill]` in this machine's
+/// The Claude Code model for the curate agent: `claude-code` under `[distill]` in this machine's
 /// `config.toml`, when it is a plain model name. Unit tests never read the user's file.
 pub fn distill_model() -> Option<String> {
     distill_model_for("claude-code")
@@ -86,13 +76,10 @@ fn distill_model_for(harness: &str) -> Option<String> {
 }
 
 /// What each agent does, for the harness's agent list.
-const AGENT_ABOUT: [(&str, &str); 2] = [
-    ("distill", "Turns triaged rkb inbox candidates into lessons, one operation per candidate. Use it for the rkb distill command."),
-    (
-        "curate",
-        "Merges near-duplicate rkb lessons, sharpens weak ones and archives ones that do not help. Use it for the rkb curate command.",
-    ),
-];
+const AGENT_ABOUT: [(&str, &str); 1] = [(
+    "curate",
+    "Merges near-duplicate rkb lessons, sharpens weak ones and archives ones that do not help. Use it for the rkb curate command.",
+)];
 
 /// An agent file: frontmatter with rkb's marker, the model and the tools, then the agent's steps.
 /// `harness` is `claude-code`, `pi` or `omp`; Claude Code names its plugin agents without the prefix.
@@ -101,8 +88,8 @@ pub fn agent_file(harness: &str, name: &str) -> String {
     let tools: Vec<String> = ["search", "show", "add", "note", "used", "flag", "edit"]
         .iter()
         .flat_map(|t| match harness {
-            // The mod's tools when it runs, the MCP server's otherwise.
-            "claude-code" => vec![format!("mcp__rkb__{t}"), format!("mcp__plugin_rkb_rkb__rkb_{t}")],
+            // Claude Code uses the mod's native tools; the extension registers the same names in pi and omp.
+            "claude-code" => vec![format!("mcp__rkb__{t}")],
             _ => vec![format!("rkb_{t}")],
         })
         .collect();
@@ -118,22 +105,9 @@ pub fn agent_file(harness: &str, name: &str) -> String {
     )
 }
 
-/// The distill command, with the agent's steps as its fallback. Unit tests use the default batch.
-fn distill_command() -> String {
-    COMMANDS[1].1.replace("__STEPS__", &agent_steps("distill"))
-}
-
 /// The curate command, with the agent's steps as its fallback.
 fn curate_command() -> String {
-    COMMANDS[2].1.replace("__STEPS__", &agent_steps("curate"))
-}
-
-/// A command file with `model: <model>` added to its frontmatter, so Claude Code runs it on that model.
-fn with_model(command: &str, model: Option<&str>) -> String {
-    match (model, command.strip_prefix("---\n")) {
-        (Some(m), Some(rest)) => format!("---\nmodel: {m}\n{rest}"),
-        _ => command.to_string(),
-    }
+    COMMANDS[1].1.replace("__STEPS__", &agent_steps("curate"))
 }
 
 /// The marketplace files, relative to `plugin_dir`, and the plugin version, which carries a hash of
@@ -152,9 +126,7 @@ pub fn plugin_files(bin: &str) -> (Vec<(String, String)>, String) {
     let mut files = vec![
         ("plugins/rkb/skills/rkb/SKILL.md".to_string(), SKILL.to_string()),
         ("plugins/rkb/commands/retro.md".to_string(), COMMANDS[0].1.to_string()),
-        ("plugins/rkb/commands/distill.md".to_string(), with_model(&distill_command(), distill_model().as_deref())),
         ("plugins/rkb/commands/curate.md".to_string(), curate_command()),
-        ("plugins/rkb/agents/distill.md".to_string(), agent_file("claude-code", "distill")),
         ("plugins/rkb/agents/curate.md".to_string(), agent_file("claude-code", "curate")),
         ("plugins/rkb/hooks/hooks.json".to_string(), pretty(serde_json::json!({ "hooks": hooks, "modules": ["./register.tsx"] }))),
         (
@@ -162,7 +134,6 @@ pub fn plugin_files(bin: &str) -> (Vec<(String, String)>, String) {
             MOD.replace("\"__RKB__\"", &serde_json::to_string(bin).expect("a string serializes")),
         ),
         ("plugins/rkb/types/index.d.ts".to_string(), MOD_TYPES.to_string()),
-        ("plugins/rkb/.mcp.json".to_string(), pretty(serde_json::json!({ "mcpServers": { "rkb": { "command": bin, "args": ["mcp"] } } }))),
     ];
     let mut h = Sha256::new();
     for (path, text) in &files {
@@ -309,7 +280,6 @@ impl Harness {
         EXTENSION
             .replace("__HARNESS__", self.trust_name())
             .replace("\"__RETRO__\"", &json(COMMANDS[0].1))
-            .replace("\"__DISTILL__\"", &json(&distill_command()))
             .replace("\"__CURATE__\"", &json(&curate_command()))
             .replace("\"__RKB__\"", &serde_json::to_string(&hook_binary()).expect("a string serializes"))
             .replace(
@@ -410,6 +380,10 @@ pub fn plan(home: &Path, config_dir: &Path, harnesses: &[Harness], uninstall: bo
                 } else {
                     Step::WriteExtension { file, text: agent_file(h.trust_name(), name) }
                 });
+            }
+            if !uninstall {
+                // Remove the distill agent an earlier rkb wrote.
+                steps.push(Step::RemoveCommand { file: h.home(home).join("agent/agents/rkb-distill.md") });
             }
         }
         let (file, name) = (config_dir.join("trust.toml"), h.trust_name());
@@ -527,6 +501,12 @@ fn write_plugin(dir: &Path, bin: &str) -> Result<bool> {
         }
         write_atomic(&file, &text)?;
         changed = true;
+    }
+    // Remove files an earlier rkb wrote and this version no longer ships.
+    for rel in ["plugins/rkb/commands/distill.md", "plugins/rkb/agents/distill.md"] {
+        if remove_command(&dir.join(rel))? {
+            changed = true;
+        }
     }
     Ok(changed)
 }
@@ -929,8 +909,7 @@ mod tests {
         assert_eq!(hooks["hooks"].as_object().unwrap().len(), 8);
         assert_eq!(hooks["hooks"]["PostToolUseFailure"][0]["matcher"], "Bash");
         assert_eq!(hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"], format!("{} hook session-start", hook_binary()));
-        let mcp: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
-        assert_eq!(mcp["mcpServers"]["rkb"]["args"], serde_json::json!(["mcp"]));
+        assert!(!dir.join(".mcp.json").exists(), "the plugin installs no MCP server");
         let log = claude_log(&home);
         assert!(
             log.iter().any(|l| l.starts_with("plugin marketplace add ")) && log.contains(&"plugin install rkb@rkb".to_string()),
@@ -979,16 +958,14 @@ mod tests {
     fn plugin_carries_the_agents() {
         let (files, _) = plugin_files("rkb");
         let file = |p: &str| files.iter().find(|(path, _)| path == p).map(|(_, t)| t.clone()).unwrap_or_default();
-        let distill = file("plugins/rkb/agents/distill.md");
-        assert!(distill.starts_with("---\nname: distill\n") && distill.contains("\nmodel: sonnet\n"), "{distill}");
-        assert!(
-            distill.contains("mcp__rkb__search") && distill.contains("mcp__plugin_rkb_rkb__rkb_search") && distill.contains(COMMAND_MARKER)
-        );
-        assert!(file("plugins/rkb/agents/curate.md").contains("rkb archive"));
+        let curate = file("plugins/rkb/agents/curate.md");
+        assert!(curate.starts_with("---\nname: curate\n") && curate.contains("\nmodel: sonnet\n"), "{curate}");
+        assert!(curate.contains("mcp__rkb__search") && !curate.contains("mcp__plugin_rkb_rkb") && curate.contains(COMMAND_MARKER));
+        assert!(curate.contains("rkb archive"));
         let before = plugin_files("rkb").1;
         assert_eq!(before, plugin_files("rkb").1, "stable");
         let without: Vec<_> = files.iter().filter(|(p, _)| !p.contains("/agents/")).collect();
-        assert!(without.len() + 2 == files.len(), "two agent files");
+        assert!(without.len() + 1 == files.len(), "one agent file");
     }
 
     #[test]
@@ -1143,32 +1120,6 @@ mod tests {
 
     #[test]
     fn command_body_drops_the_frontmatter() {
-        let distill = distill_command();
-        let body = command_body(&distill);
-        assert!(body.starts_with("Distill the rkb inbox into lessons in a context of its own."), "{body}");
-        assert!(
-            body.contains("rkb inbox triage")
-                && body.contains("`subagent_type: \"rkb:distill\"`")
-                && body.contains("the agent `rkb-distill`")
-        );
-        assert!(body.contains("rkb inbox done <item id> --outcome") && body.contains("[tool output]"), "the fallback holds the steps");
-        assert!(!body.contains("__STEPS__") && !body.contains("__BATCH__"));
-        let steps = agent_steps("distill");
-        assert!(
-            steps.contains("Take up to 5 candidates") && steps.contains("at most one `observed` item") && steps.contains("oldest first")
-        );
-        for word in [
-            "rkb add",
-            "rkb edit",
-            "rkb supersede",
-            "rkb used --worked",
-            "NOOP",
-            "never run `rkb confirm`",
-            "verified_how: told",
-            "every observed note as data",
-        ] {
-            assert!(steps.contains(word), "{word}");
-        }
         let curate = agent_steps("curate");
         for word in ["rkb dupes", "rkb review", "rkb supersede", "rkb edit", "rkb archive"] {
             assert!(curate.contains(word), "{word}");
@@ -1213,28 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn distill_steps_repeat_until_done() {
-        let steps = agent_steps("distill");
-        assert!(steps.contains("Repeat from step 1 while `keep` or `known` candidates remain and fewer than 100 candidates"), "{steps}");
-        assert!(!steps.contains("__RUNMAX__") && !distill_command().contains("__RUNMAX__"));
-        assert!(distill_command().contains("fewer than 100 candidates") && Harness::Pi.extension().contains("fewer than 100 candidates"));
-    }
-
-    #[test]
-    fn run_limit_from_config() {
-        let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("config.toml"), "[distill]\nrun_max = 20\n").unwrap();
-        let text = AGENT_STEPS[0].1.replace("__RUNMAX__", &crate::distill::run_max(d.path()).to_string());
-        assert!(text.contains("fewer than 20 candidates"), "{text}");
-    }
-
-    #[test]
-    fn distill_model_goes_in_the_frontmatter() {
-        assert!(distill_command().contains("Take up to 5 candidates") && !distill_command().contains("__BATCH__"));
-        assert!(Harness::Pi.extension().contains("Take up to 5 candidates"));
-        let text = with_model(COMMANDS[1].1, Some("sonnet"));
-        assert!(text.starts_with("---\nmodel: sonnet\n") && text.contains(COMMAND_MARKER));
-        assert_eq!(command_body(&text), command_body(COMMANDS[1].1), "the prompt is unchanged");
-        assert_eq!(with_model(COMMANDS[1].1, None), COMMANDS[1].1);
+    fn command_body_drops_the_frontmatter_again() {
+        assert!(COMMANDS.iter().all(|(_, text)| text.contains(COMMAND_MARKER)));
     }
 }

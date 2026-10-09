@@ -7,6 +7,7 @@ mod inbox;
 mod list;
 mod mcp;
 mod output;
+mod promote;
 mod rerankers;
 mod searching;
 mod session;
@@ -197,16 +198,6 @@ enum Cmd {
     /// Print the current project, system and lesson counts in at most 5 lines, for a session hook.
     #[command(after_help = "Example:\n  rkb context")]
     Context,
-    /// Claim an automatic distill or curate run when one is due; the Claude Code mod starts it.
-    #[command(hide = true, after_help = "Example:\n  rkb auto claim distill")]
-    Auto {
-        /// claim.
-        #[arg(value_parser = ["claim"])]
-        action: String,
-        /// distill or curate.
-        #[arg(value_parser = ["distill", "curate"])]
-        kind: String,
-    },
     /// Print what waits for the user (inbox, curate candidates, open requests) and the lessons a session
     /// injected, in one call, for a harness UI. Changes no lesson, inbox item or request.
     #[command(after_help = "Example:\n  rkb status\n  rkb status --session 3f2a --format json")]
@@ -432,25 +423,16 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<InboxCmd>,
     },
-    /// Have the harness's agent, with the approved [observer] models, read a session and save its
-    /// durable notes to the inbox. The session-end hook starts it in the background.
-    #[command(
-        after_help = "Example:\n  rkb observe --session 3f2a --transcript ~/.claude/projects/p/3f2a.jsonl --harness claude-code --cwd ~/code/p"
-    )]
-    Observe {
+    /// Promote inbox items whose signature repeats in two or more sessions, with one approved-model
+    /// call each, and write the lesson through the normal path.
+    #[command(after_help = "Example:\n  rkb promote\n  rkb promote --max 1")]
+    Promote {
+        /// At most this many items; default `[promote] max_per_pass` (3).
         #[arg(long)]
-        session: String,
-        #[arg(long)]
-        transcript: std::path::PathBuf,
+        max: Option<usize>,
         /// claude-code, pi or omp.
         #[arg(long, default_value = "claude-code")]
         harness: String,
-        /// The session's working directory; picks the project and system for the lesson titles.
-        #[arg(long)]
-        cwd: Option<String>,
-        /// The session's model, for a chain entry `session`. Default: the harness's default model.
-        #[arg(long)]
-        model: Option<String>,
     },
     /// Run a model step through another runner, such as the Claude Code mod: `prepare` prints a prompt and
     /// the models to ask, `finish` reads the model's answer and does what rkb would do with it.
@@ -554,23 +536,6 @@ enum PrepareCmd {
         /// claude-code, pi or omp.
         #[arg(long, default_value = "claude-code")]
         harness: String,
-        /// The session's model, for a chain entry `session`.
-        #[arg(long)]
-        model: Option<String>,
-    },
-    /// The observer over the new part of one session, with the approved [observer] models.
-    #[command(after_help = "Example:\n  rkb job prepare observe --session 3f2a --transcript ~/.claude/projects/p/3f2a.jsonl")]
-    Observe {
-        #[arg(long)]
-        session: String,
-        #[arg(long)]
-        transcript: std::path::PathBuf,
-        /// claude-code, pi or omp.
-        #[arg(long, default_value = "claude-code")]
-        harness: String,
-        /// The session's working directory; picks the project and system for the lesson titles.
-        #[arg(long)]
-        cwd: Option<String>,
         /// The session's model, for a chain entry `session`.
         #[arg(long)]
         model: Option<String>,
@@ -829,7 +794,6 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             Ok(session::context(&s))
         }
         Cmd::Status { session } => session::waiting(&env, session.as_deref()),
-        Cmd::Auto { kind, .. } => session::auto(&env, &kind),
         Cmd::Doctor { break_lock } => session::doctor(&env, &env.place.clone().unwrap_or_default(), break_lock),
         Cmd::List { folder } => {
             kb::open(&root)?;
@@ -842,7 +806,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Review { folder, signals } => {
             kb::open(&root)?;
             if signals {
-                return Ok(session::signals(&rkb_core::review::signals(&root, &env.state), colored));
+                return Ok(session::signals(&rkb_core::review::signals(&root, &env.state), rkb_core::promote::cost(&env.state), colored));
             }
             let c = rkb_core::review::review(&root, &env.state, folder.as_deref())?;
             Ok(session::review(&c, colored))
@@ -912,12 +876,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Note { words, priority } => inbox::note(&env, words, priority),
         Cmd::Tools => Ok(agent::list()),
         Cmd::Tool { .. } | Cmd::Mcp => unreachable!("main runs tools and the MCP server first"),
-        Cmd::Observe { session, transcript, harness, cwd, model } => {
-            inbox::observe(&env, &session, &transcript, &harness, cwd.as_deref(), model.as_deref())
-        }
-        Cmd::Job { action: JobCmd::Prepare { kind: PrepareCmd::Observe { session, transcript, harness, cwd, model } } } => {
-            inbox::prepare_observe(&env, &session, &transcript, &harness, cwd.as_deref(), model.as_deref())
-        }
+        Cmd::Promote { max, harness } => promote::run(&env, max, &harness),
         Cmd::Job { action: JobCmd::Prepare { kind: PrepareCmd::Triage { harness, model } } } => {
             inbox::prepare_triage(&env, &harness, model.as_deref())
         }

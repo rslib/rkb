@@ -1787,40 +1787,14 @@ fn dupes_hide_pairs_from_the_curate_count() {
     let (env, url, _) = dupes_jev("different");
     let count = |env: &Env| {
         let _ = std::fs::remove_file(env.dir.path().join("state/rkb/curate.json"));
-        let o = rkb_with(
-            env.cmd(env!("CARGO_BIN_EXE_rkb")),
-            &["hook", "session-start"],
-            &serde_json::json!({ "session_id": "s", "source": "startup", "cwd": env.kb() }).to_string(),
-        );
-        assert!(o.status.success());
-        let c: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(env.dir.path().join("state/rkb/curate.json")).unwrap()).unwrap();
-        c["count"].as_u64().unwrap()
+        let (v, _) = env.json(&["status"], "");
+        assert!(env.dir.path().join("state/rkb/curate.json").exists(), "status refreshes the daily curate cache");
+        v["curate"].as_u64().unwrap()
     };
     let before = count(&env);
     dupes_run(&env, &url, &["dupes", "--check"]);
     assert!(!env.dir.path().join("state/rkb/curate.json").exists(), "--check drops the cached count");
     assert_eq!(count(&env) + 1, before);
-}
-
-#[test]
-fn auto_claim_curate_checks_dupes_only_when_due() {
-    let (env, url, log) = dupes_jev("different");
-    let reason = |env: &Env| {
-        let v = dupes_run(env, &url, &["auto", "claim", "curate"]);
-        (v["claimed"].as_bool().unwrap(), v["reason"].as_str().unwrap().to_string())
-    };
-    let _ = std::fs::remove_file(env.dir.path().join("state/rkb/curate.json"));
-    let (claimed, why) = reason(&env);
-    assert!(!claimed && why.starts_with("off"), "{why}");
-    assert!(log.lock().unwrap().is_empty(), "auto is off: no request");
-    let cache = env.dir.path().join("state/rkb/curate.json");
-    let before = serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&cache).unwrap()).unwrap()["count"].as_u64().unwrap();
-    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[jev]\napi_key = \"k\"\n\n[distill]\nauto = true\n");
-    std::fs::set_permissions(env.dir.path().join("config/rkb/config.toml"), std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
-    let (claimed, why) = reason(&env);
-    assert_eq!(log.lock().unwrap().len(), 1, "due: asked");
-    assert!(claimed && why.starts_with(&format!("{} ", before - 1)), "the hidden pair is not counted ({before} before): {why}");
 }
 
 #[test]
@@ -1964,8 +1938,11 @@ fn note_and_inbox() {
     let old = env.dir.path().join("state/rkb/inbox/0123456789.md");
     std::fs::write(&old, "---\nkind: note\ntime: 1000\n---\n\nold\n").unwrap();
     let (v, _) = env.json(&["inbox"], "");
+    assert_eq!((v["expired"].as_u64(), v["items"].as_array().unwrap().len()), (Some(0), 2), "an old item is kept under the cap: {v}");
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[inbox]\nmax_items = 1\n");
+    let (v, _) = env.json(&["inbox"], "");
     assert_eq!((v["expired"].as_u64(), v["items"].as_array().unwrap().len()), (Some(1), 1), "{v}");
-    assert!(!old.exists());
+    assert!(!old.exists(), "the oldest item is dropped over the cap");
 }
 
 #[test]
@@ -2277,24 +2254,27 @@ fn session_end_saves_an_extract_only_after_a_signal() {
 }
 
 #[test]
-fn session_start_names_a_full_inbox() {
+fn session_start_names_no_inbox_or_curate_count() {
     let env = search_kb();
     let start =
         |env: &Env| hook(env, "session-start", &serde_json::json!({ "session_id": "s", "cwd": env.dir.path(), "source": "startup" }));
-    for i in 0..2 {
-        env.json(&["note", &format!("finding {i}")], "");
-    }
-    assert!(!start(&env).contains("/rkb-distill"), "two fresh items say nothing");
-    for i in 2..5 {
+    for i in 0..5 {
         env.json(&["note", &format!("finding {i}")], "");
     }
     let text = start(&env);
-    assert!(text.contains("5 items wait") && text.contains("/rkb:distill"), "Claude Code names its plugin command: {text}");
+    assert!(text.contains("rkb: ") && text.contains("rkb search \"<words>\" --toon"), "the context lines: {text}");
+    assert!(
+        !text.contains("inbox") && !text.contains("/rkb:distill") && !text.contains("/rkb:curate"),
+        "a full inbox adds no work nudge: {text}"
+    );
     let o = env.rkb_in(
         &["hook", "session-start", "--harness", "pi"],
         &serde_json::json!({ "session_id": "p", "cwd": env.dir.path() }).to_string(),
     );
-    assert!(String::from_utf8_lossy(&o.stdout).contains("run /rkb-distill"), "{}", stdout(&o));
+    let pi = String::from_utf8_lossy(&o.stdout);
+    assert!(!pi.contains("inbox") && !pi.contains("/rkb-distill") && !pi.contains("/rkb-curate"), "pi too: {pi}");
+    let (v, _) = env.json(&["status"], "");
+    assert_eq!(v["inbox"]["total"], 5, "the count stays in rkb status: {v}");
 }
 
 #[test]
@@ -2398,17 +2378,16 @@ fn hook_never_fails() {
 }
 
 #[test]
-fn hook_session_start_asks_to_curate() {
+fn status_reports_the_curate_count_not_the_session_start() {
     let env = search_kb();
     let start = || hook(&env, "session-start", &serde_json::json!({ "session_id": "s", "source": "startup", "cwd": env.kb() }));
-    let out = start();
-    assert!(
-        out.contains("rkb curate: 10 ") && out.contains("run /rkb:curate, without waiting for the user"),
-        "10 vague Evidence sections: {out}"
-    );
+    assert!(!start().contains("curate"), "session start names no curate count");
+    let (v, _) = env.json(&["status"], "");
+    assert_eq!(v["curate"], 10, "10 vague Evidence sections, reported by status: {v}");
     let cache = env.dir.path().join("state/rkb/curate.json");
     std::fs::write(&cache, std::fs::read_to_string(&cache).unwrap().replace("\"count\":10", "\"count\":4")).unwrap();
-    assert!(!start().contains("curate"), "counted once a day, and 4 is not enough");
+    let (v, _) = env.json(&["status"], "");
+    assert_eq!(v["curate"], 4, "the cache is read once a day: {v}");
 }
 
 #[test]
@@ -4814,137 +4793,10 @@ fn recall_uses_jev_thresholds_when_jev_ranked() {
     assert_eq!(run("j4"), "", "a stale lesson is never injected");
 }
 
-/// A search KB with a fake `pi` for the observer: `--model bad` exits 1, any other model saves its
-/// arguments, prompt and `RKB_OBSERVER`, sleeps `delay` seconds and prints one note.
-fn observer_env(delay: u32) -> Env {
-    let env = search_kb();
-    let fake = env.dir.path().join("fake/pi");
-    env.write_abs(
-        &fake,
-        &format!(
-            "#!/bin/sh\ncase \"$*\" in *'--model bad'*) exit 1;; esac\necho \"$*\" > \"$FAKE_CLAUDE_HOME/args.txt\"\ncat > \"$FAKE_CLAUDE_HOME/prompt.txt\"\necho \"$RKB_OBSERVER\" > \"$FAKE_CLAUDE_HOME/env.txt\"\nsleep {delay}\necho 'Working...'\necho '{OBSERVED_NOTE}'\n"
-        ),
-    );
-    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    observer_chain(&env, "pi = [\"bad\", \"session\"]");
-    env
-}
-
-fn observer_chain(env: &Env, chain: &str) {
-    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), &format!("[observer]\n{chain}\nmin_prompts = 1\ntimeout_secs = 20\n"));
-}
-
 fn with_pi(env: &Env) -> Command {
     let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
     c.env("RKB_PI", env.dir.path().join("fake/pi"));
     c
-}
-
-fn approve_observer(env: &Env) {
-    let (v, code) = env.json(&["approve", "observer"], "");
-    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{v}");
-    let q = v["question"].as_str().unwrap();
-    assert!(q.contains("pi = bad, session") && q.contains("sends it the session's text"), "{v}");
-    env.trust_claude();
-    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
-    c.env("CLAUDECODE", "1");
-    let o = rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", "approve observer", "--format", "json"], "");
-    assert!(o.status.success(), "{}", stdout(&o));
-    assert_eq!(env.json(&["approve", "observer"], "").1, Some(0), "already approved");
-}
-
-fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    let start = std::time::Instant::now();
-    while !done() {
-        assert!(start.elapsed() < std::time::Duration::from_secs(20), "timed out waiting for {what}");
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
-
-const OBSERVED_NOTE: &str = "- 2026-09-20 [high] (pitfall; general) CMake finds ZLIB under /opt/zlib only with -DZLIB_ROOT=/opt/zlib.";
-
-#[test]
-fn observe_needs_approval_and_saves_notes() {
-    let env = observer_env(0);
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/pi.jsonl");
-    let args = [
-        "observe",
-        "--session",
-        "s1",
-        "--transcript",
-        fixture.to_str().unwrap(),
-        "--harness",
-        "pi",
-        "--model",
-        "openai/sol",
-        "--format",
-        "json",
-    ];
-    let run = |args: &[&str]| -> (serde_json::Value, Option<i32>) {
-        let o = rkb_with(with_pi(&env), args, "");
-        (serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o))), o.status.code())
-    };
-    let (v, code) = run(&args);
-    assert_eq!((v["error"]["fix"].as_str(), code), (Some("run `rkb approve observer`"), Some(2)), "{v}");
-    let doctor = env.json(&["doctor"], "").0;
-    let obs = doctor["checks"].as_array().unwrap().iter().find(|c| c["check"] == "observer").unwrap().clone();
-    assert_eq!((obs["status"].as_str(), obs["fix"].as_str()), (Some("warn"), Some("run `rkb approve observer`")), "{obs}");
-
-    approve_observer(&env);
-    let mut other = args.to_vec();
-    other[6] = "omp";
-    assert!(run(&other).0["error"]["message"].as_str().unwrap().contains("no observer model chain for omp"));
-    let (v, code) = run(&args);
-    assert_eq!((v["notes"].as_u64(), v["dropped"].as_u64(), code), (Some(1), Some(1), Some(0)), "{v}");
-    assert_eq!(v["via"], "session (openai/sol) (bad: exit 1)", "{v}");
-    let seen = |f: &str| std::fs::read_to_string(env.dir.path().join(f)).unwrap();
-    assert_eq!(seen("args.txt"), "-p --model openai/sol --no-session --no-tools --no-extensions\n");
-    assert!(seen("prompt.txt").contains("CMake keeps a failed find_package result in the cache"), "a general lesson title");
-    assert!(seen("prompt.txt").contains("[user] The configure step fails") && !seen("prompt.txt").contains("must not appear"));
-    assert_eq!(seen("env.txt"), "1\n");
-    let items = inbox_items(&env);
-    assert_eq!((items.len(), items[0]["kind"].as_str(), items[0]["priority"].as_u64()), (1, Some("observed"), Some(3)));
-    let (show, _) = env.json(&["inbox", "show", items[0]["id"].as_str().unwrap()], "");
-    assert_eq!((show["meta"]["session"].as_str(), show["body"].as_str()), (Some("s1"), Some(OBSERVED_NOTE)));
-
-    let (v, _) = run(&args);
-    assert!(v["skipped"].as_str().unwrap().contains("0 prompts"), "only new entries: {v}");
-    let doctor = env.json(&["doctor"], "").0;
-    let obs = doctor["checks"].as_array().unwrap().iter().find(|c| c["check"] == "observer").unwrap().clone();
-    assert!(obs["status"] == "ok" && obs["detail"].as_str().unwrap().contains("via session"), "{obs}");
-}
-
-#[test]
-fn session_end_starts_the_observer_in_the_background() {
-    let env = observer_env(2);
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/pi.jsonl");
-    // macOS checks a newly linked binary on its first run, which can take a second; time the hook, not that.
-    assert!(env.rkb(&["--version"]).status.success());
-    let end = |id: &str, harness: &str| {
-        let payload = serde_json::json!({ "session_id": id, "transcript_path": fixture, "cwd": env.dir.path(), "model": "openai/sol" });
-        let start = std::time::Instant::now();
-        let o = rkb_with(with_pi(&env), &["hook", "session-end", "--harness", harness], &payload.to_string());
-        assert!(o.status.success() && o.stdout.is_empty(), "{}", stdout(&o));
-        // pi and omp wait for the hook's output to close, within 1.8 s; the observer must not hold it open.
-        assert!(start.elapsed() < std::time::Duration::from_secs(1), "the hook does not wait: {:?}", start.elapsed());
-    };
-    end("unapproved", "pi");
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    assert!(inbox_items(&env).is_empty(), "no observer before approval");
-
-    approve_observer(&env);
-    end("s2", "pi");
-    wait_for("the observed item", || inbox_items(&env).iter().any(|i| i["kind"] == "observed"));
-    assert!(std::fs::read_to_string(env.dir.path().join("args.txt")).unwrap().contains("--model openai/sol"), "the payload's model");
-
-    end("s3", "omp");
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    assert_eq!(inbox_items(&env).len(), 1, "omp has no chain");
-
-    observer_chain(&env, "pi = [\"session\"]");
-    end("s4", "pi");
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    assert_eq!(inbox_items(&env).len(), 1, "a changed chain needs a new approval");
 }
 
 #[test]
@@ -5023,23 +4875,6 @@ fn prompt_hook_reads_only_what_the_user_typed_and_logs_rankings() {
 }
 
 #[test]
-fn install_pins_the_distill_model_from_config() {
-    let env = search_kb();
-    let home = env.dir.path();
-    std::fs::create_dir_all(home.join(".claude")).unwrap();
-    env.write_abs(&home.join("config/rkb/config.toml"), "[distill]\nclaude-code = \"sonnet\"\n");
-    let (v, _) = env.json(&["install", "claude"], "");
-    let tty = home.join("tty");
-    std::fs::write(&tty, "yes\n").unwrap();
-    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
-    c.env("RKB_TTY", &tty);
-    assert!(rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", "install"], "").status.success());
-    let plugin = home.join("data/rkb/claude-plugin/plugins/rkb/commands");
-    assert!(std::fs::read_to_string(plugin.join("distill.md")).unwrap().starts_with("---\nmodel: sonnet\n"));
-    assert!(!std::fs::read_to_string(plugin.join("retro.md")).unwrap().contains("model:"), "retro needs the session's context and model");
-}
-
-#[test]
 fn stop_blocks_only_for_the_users_own_signals() {
     let env = search_kb();
     for r in [
@@ -5101,71 +4936,6 @@ fn status_lists_waiting_work_and_session_injections() {
     assert!(v["injected"][0]["title"].as_str().is_some_and(|t| !t.is_empty()), "{v}");
     assert!(v["requests"].as_array().unwrap().is_empty(), "{v}");
     assert_eq!((tree(&env.kb()), tree(&env.dir.path().join("state"))), before, "status changes no file");
-}
-
-#[test]
-fn model_jobs_run_the_observer_for_another_runner() {
-    let env = observer_env(0);
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/pi.jsonl");
-    let run = |args: &[&str], input: &str| -> (serde_json::Value, Option<i32>) {
-        let mut all = args.to_vec();
-        all.extend(["--format", "json"]);
-        let o = rkb_with(with_pi(&env), &all, input);
-        (serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o))), o.status.code())
-    };
-    let t = fixture.to_str().unwrap();
-    let prepare =
-        |s: &str| run(&["job", "prepare", "observe", "--session", s, "--transcript", t, "--harness", "pi", "--model", "openai/sol"], "");
-    let observe = |s: &str| run(&["observe", "--session", s, "--transcript", t, "--harness", "pi", "--model", "openai/sol"], "");
-    let answer = format!("Working...\n{OBSERVED_NOTE}\n");
-
-    let (v, code) = prepare("s1");
-    assert!(v["job"].is_null() && v["skipped"].as_str().unwrap().contains("not approved") && code == Some(0), "{v}");
-    approve_observer(&env);
-
-    let (a, code) = prepare("s1");
-    assert_eq!(code, Some(0), "{a}");
-    let id = a["job"].as_str().unwrap().to_string();
-    assert_eq!(a["models"], serde_json::json!([{ "entry": "bad", "model": "bad" }, { "entry": "session", "model": "openai/sol" }]));
-    assert_eq!((a["part"].as_u64(), a["parts"].as_u64()), (Some(0), Some(1)), "{a}");
-    let prompt = a["prompt"].as_str().unwrap();
-    assert!(prompt.contains("CMake keeps a failed find_package result in the cache") && prompt.contains("[user] The configure step fails"));
-    assert!(prepare("s3").0["skipped"].as_str().unwrap().contains("another observer run is active"), "one run at a time");
-    assert!(observe("s2").0["skipped"].as_str().unwrap().contains("another observer run is active"), "the CLI runner waits too");
-
-    let finish = |part: &str, model: &str, input: &str| run(&["job", "finish", &id, "--part", part, "--model", model], input);
-    assert_eq!(finish("1", "session", &answer).0["error"]["code"], "usage");
-    assert_eq!(finish("0", "opus", &answer).0["error"]["code"], "usage");
-    let (v, code) = finish("0", "session", &answer);
-    assert_eq!(
-        (v["outcome"].as_str(), v["notes"].as_u64(), v["dropped"].as_u64(), code),
-        (Some("added"), Some(1), Some(1), Some(0)),
-        "{v}"
-    );
-    assert_eq!(v["via"], "session (openai/sol)", "{v}");
-    let (show, _) = env.json(&["inbox", "show", v["id"].as_str().unwrap()], "");
-    assert_eq!((show["meta"]["session"].as_str(), show["body"].as_str()), (Some("s1"), Some(OBSERVED_NOTE)));
-    assert_eq!(finish("0", "session", &answer).0["error"]["code"], "not_found");
-
-    let (v, _) = prepare("s1");
-    assert!(v["job"].is_null() && v["skipped"].as_str().unwrap().contains("0 prompts"), "nothing new to observe: {v}");
-    assert!(observe("s1").0["skipped"].as_str().unwrap().contains("0 prompts"), "session end after the mod: {v}");
-    assert!(!env.dir.path().join("args.txt").exists(), "no model ran for s1 in the CLI runner");
-
-    let (v, _) = observe("s2");
-    let (other, _) = env.json(&["inbox", "show", v["id"].as_str().unwrap()], "");
-    assert_eq!(other["body"], show["body"], "both runners keep the same notes");
-
-    let (b, _) = prepare("s3");
-    let failed = run(&["job", "finish", b["job"].as_str().unwrap(), "--part", "0", "--failed", "session: overloaded"], "").0;
-    assert!(failed["error"]["message"].as_str().unwrap().contains("overloaded"), "{failed}");
-    let (c, _) = prepare("s3");
-    let c_id = c["job"].as_str().expect("the failed job is gone and the point stayed");
-    let path = env.dir.path().join(format!("state/rkb/jobs/{c_id}.json"));
-    let mut stored: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    stored["created"] = 1.into();
-    std::fs::write(&path, stored.to_string()).unwrap();
-    assert_eq!(run(&["job", "finish", c_id, "--part", "0", "--model", "session"], &answer).0["error"]["code"], "expired");
 }
 
 #[test]
@@ -5555,64 +5325,17 @@ fn inbox_done_records_outcomes_for_triage() {
 }
 
 #[test]
-fn install_writes_the_distill_and_curate_agents() {
-    let env = Env::new();
-    let home = env.dir.path();
-    std::fs::create_dir_all(home.join(".pi")).unwrap();
-    std::fs::create_dir_all(home.join(".omp")).unwrap();
-    env.write_abs(&home.join("config/rkb/config.toml"), "[distill]\nomp = \"anthropic/claude-sonnet-5-5\"\n");
-    let (v, code) = json_with_auto(&env, Some("install"), &["install", "pi", "omp"]);
-    assert_eq!(code, Some(0), "{v}");
-    let omp = std::fs::read_to_string(home.join(".omp/agent/agents/rkb-distill.md")).unwrap();
-    assert!(omp.starts_with("---\nname: rkb-distill\n") && omp.contains("model: anthropic/claude-sonnet-5-5\n"), "pinned model: {omp}");
-    assert!(
-        omp.contains("generated-by: rkb install") && omp.contains("rkb_search") && omp.contains("rkb inbox done <item id> --outcome"),
-        "{omp}"
-    );
-    let pi = std::fs::read_to_string(home.join(".pi/agent/agents/rkb-curate.md")).unwrap();
-    assert!(!pi.contains("model:") && pi.contains("rkb dupes"), "pi keeps the session's model: {pi}");
-
-    let mine = home.join(".pi/agent/agents/rkb-distill.md");
-    std::fs::write(&mine, "---\nname: rkb-distill\n---\n\nmy own agent\n").unwrap();
-    let (v, code) = json_with_auto(&env, Some("uninstall"), &["install", "--uninstall", "pi"]);
-    assert_eq!(code, Some(0), "{v}");
-    assert!(mine.exists(), "a file without rkb's marker stays");
-    assert!(!home.join(".pi/agent/agents/rkb-curate.md").exists(), "rkb's own agent file is removed");
-}
-
-#[test]
-fn automatic_runs_are_off_by_default_and_gated() {
-    let env = search_kb();
-    inbox_item(&env, "000000000c", "transcript", &["remember"], "[user] remember that the cluster needs --exclusive for GPU jobs");
-    env.json(&["inbox", "triage"], "");
-    let (v, _) = env.json(&["status"], "");
-    assert_eq!(v["auto"]["distill"]["due"], false, "{v}");
-    assert!(v["auto"]["distill"]["reason"].as_str().unwrap().starts_with("off"), "off by default: {v}");
-    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[distill]\nauto = true\nbatch = 5\n");
-    let (v, _) = env.json(&["status"], "");
-    assert_eq!(v["auto"]["distill"]["due"], false, "a kept candidate of priority 1 is under a batch: {v}");
-    let path = env.dir.path().join("state/rkb/inbox/000000000c.md");
-    let text = std::fs::read_to_string(&path).unwrap().replacen("---\n\n", "priority: 3\n---\n\n", 1);
-    std::fs::write(&path, text).unwrap();
-    let (v, _) = env.json(&["status"], "");
-    assert_eq!(v["auto"]["distill"]["due"], true, "{v}");
-    let (c, _) = env.json(&["auto", "claim", "distill"], "");
-    assert_eq!(c["claimed"], true, "{c}");
-    let (gated, _) = env.json(&["auto", "claim", "distill"], "");
-    assert!(gated["claimed"] == false && gated["reason"].as_str().unwrap().contains("under 6 h"), "gated: {gated}");
-}
-
-#[test]
-fn session_start_leaves_the_inbox_to_automatic_runs() {
+fn session_start_leaves_the_inbox_and_curate_to_status() {
     let env = search_kb();
     for i in 0..5 {
         inbox_item(&env, &format!("00000000d{i}"), "note", &[], "a note to distill");
     }
     let payload = serde_json::json!({ "session_id": "s1", "source": "startup", "cwd": env.kb() });
-    assert!(hook(&env, "session-start", &payload).contains("/rkb:distill"), "the inbox line without auto");
-    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[distill]\nauto = true\n");
     let out = hook(&env, "session-start", &payload);
-    assert!(!out.contains("/rkb:distill") && !out.contains("/rkb:curate") && out.contains("rkb search"), "{out}");
+    assert!(!out.contains("inbox") && !out.contains("/rkb:distill") && !out.contains("/rkb:curate") && out.contains("rkb search"), "{out}");
     let o = env.rkb_in(&["hook", "session-start", "--harness", "pi"], &payload.to_string());
-    assert!(stdout(&o).contains("/rkb-distill"), "pi has no automatic runs");
+    let pi = stdout(&o);
+    assert!(!pi.contains("inbox") && !pi.contains("/rkb-distill") && !pi.contains("/rkb-curate"), "pi too: {pi}");
+    let (v, _) = env.json(&["status"], "");
+    assert_eq!(v["inbox"]["total"], 5, "status still shows the inbox: {v}");
 }

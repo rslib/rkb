@@ -34,8 +34,13 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
+/// Whether the process is alive. A `kill` that cannot run leaves the answer unknown, which counts as
+/// alive: a transient spawn failure must never break a live lock, or two writers would interleave.
 fn alive(pid: u32) -> bool {
-    Command::new("kill").args(["-0", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    match Command::new("kill").args(["-0", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status() {
+        Ok(s) => s.success(),
+        Err(_) => true,
+    }
 }
 
 /// A lock is stale when its process on this host is gone or it is older than `stale_s`.
@@ -92,7 +97,8 @@ pub fn append_line(path: &Path, line: &str) -> Result<()> {
     }
     let _guard = acquire(&path.with_extension("lock"), 60, Duration::from_secs(5))?;
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(io(path))?;
-    writeln!(f, "{line}").map_err(io(path))
+    // One `write_all` and not `writeln!`, so the line and its newline are one atomic append.
+    f.write_all(format!("{line}\n").as_bytes()).map_err(io(path))
 }
 
 #[cfg(test)]

@@ -23,8 +23,15 @@ if grep -E "refused|hook failed|skipped:" "$dir/debug.log" | grep -i "rkb"; then
   echo "Claude Code refused part of the mod; see the lines above" >&2
   exit 1
 fi
-test -f "$dir/.claude-plugin/types/tsconfig.json" || { echo "claude did not write the mod's types" >&2; exit 1; }
-[ -x "$src/node_modules/.bin/tsc" ] || (cd "$src" && npm install --silent)
-"$src/node_modules/.bin/tsc" -p "$dir"
+typed=0
+if [ -f "$dir/.claude-plugin/types/tsconfig.json" ]; then
+  [ -x "$src/node_modules/.bin/tsc" ] || (cd "$src" && npm install --silent)
+  "$src/node_modules/.bin/tsc" -p "$dir"
+  typed=1
+fi
 claude plugin test "$dir"
-echo "claude mod: valid, typed and tested with $(claude --version)"
+if [ "$typed" = 1 ]; then
+  echo "claude mod: valid, typed and tested with $(claude --version)"
+else
+  echo "claude mod: valid and tested with $(claude --version); this Claude Code wrote no mod types, so the type check was skipped"
+fi
