@@ -153,12 +153,15 @@ enum Cmd {
     },
     /// Measure search on a query file: recall at 5 and mean reciprocal rank.
     #[command(
-        after_help = "Example:\n  rkb eval\n  rkb eval --queries tests/fixtures/search/queries.toml --min-recall 0.9\n  rkb eval --rerank jev --recall-sweep\n  rkb eval --replay --days 30"
+        after_help = "Example:\n  rkb eval\n  rkb eval --queries tests/fixtures/search/queries.toml --min-recall 0.9\n  rkb eval --rerank jev --recall-sweep\n  rkb eval --replay --days 30\n  rkb eval --reviewed ~/.local/share/rkb/reviewed.toml --toon"
     )]
     Eval {
         /// Default: $RKB_HOME/eval/queries.toml.
         #[arg(long)]
         queries: Option<String>,
+        /// Evaluate a private, human-reviewed event manifest without changing the knowledge base.
+        #[arg(long, conflicts_with_all = ["queries", "self_check", "replay"])]
+        reviewed: Option<String>,
         /// Instead of a query file, ask for each lesson with the first line of its Symptom or Statement.
         #[arg(long = "self", conflicts_with = "queries")]
         self_check: bool,
@@ -790,10 +793,12 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             kb::open(&root)?;
             searching::find(&env, &words.join(" "), limit)
         }
-        Cmd::Eval { queries, self_check, min_recall, rerank, recall_sweep, replay, days } => {
+        Cmd::Eval { queries, reviewed, self_check, min_recall, rerank, recall_sweep, replay, days } => {
             kb::open(&root)?;
             if replay {
                 searching::replay(&env, days, min_recall, rerank.as_deref())
+            } else if let Some(path) = reviewed {
+                searching::reviewed(&env, &path, rerank.as_deref(), recall_sweep)
             } else {
                 searching::eval(&env, queries, self_check, min_recall, rerank.as_deref().unwrap_or(rkb_core::rerank::BM25), recall_sweep)
             }

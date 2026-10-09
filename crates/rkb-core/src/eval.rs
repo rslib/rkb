@@ -11,6 +11,205 @@ use crate::search::{Mode, Options, Results, search};
 
 pub const DEPTH: usize = 10;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewedDecision {
+    Injected,
+    Silent,
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewedObservation {
+    pub path: EventPath,
+    pub expect: Vec<String>,
+    pub top: Vec<String>,
+    pub scores: Vec<Option<f32>>,
+    pub decision: ReviewedDecision,
+    pub backend: Option<String>,
+    pub ranked_available: bool,
+    pub curve: Vec<(f64, f64, ReviewedDecision)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Metric {
+    pub numerator: usize,
+    pub denominator: usize,
+    pub value: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewedMetrics {
+    pub samples: usize,
+    pub eligible: usize,
+    pub unknown: usize,
+    pub skipped: usize,
+    pub answerable: usize,
+    pub no_answer: usize,
+    pub correct: usize,
+    pub wrong: usize,
+    pub silent_positive: usize,
+    pub silent_negative: usize,
+    pub unavailable: usize,
+    pub recall_at_1: Metric,
+    pub recall_at_5: Metric,
+    pub precision: Metric,
+    pub false_injection: Metric,
+    pub injection_rate: Metric,
+    pub risk: Metric,
+    pub coverage: Metric,
+}
+
+fn metric(numerator: usize, denominator: usize) -> Metric {
+    Metric { numerator, denominator, value: if denominator == 0 { None } else { Some(numerator as f64 / denominator as f64) } }
+}
+
+pub fn reviewed_metrics(rows: &[ReviewedObservation]) -> ReviewedMetrics {
+    let skipped = rows.iter().filter(|r| !r.ranked_available).count();
+    let unavailable = rows.iter().filter(|r| r.ranked_available && r.decision == ReviewedDecision::Unavailable).count();
+    let unknown = unavailable;
+    let eligible = rows.len().saturating_sub(skipped + unknown);
+    let answerable = rows.iter().filter(|r| !r.expect.is_empty() && r.ranked_available).count();
+    let no_answer =
+        rows.iter().filter(|r| r.expect.is_empty() && r.ranked_available && r.decision != ReviewedDecision::Unavailable).count();
+    let at = |n: usize| {
+        metric(
+            rows.iter()
+                .filter(|r| !r.expect.is_empty() && r.ranked_available && r.top.iter().take(n).any(|id| r.expect.contains(id)))
+                .count(),
+            answerable,
+        )
+    };
+    let injections = rows.iter().filter(|r| r.ranked_available && r.decision == ReviewedDecision::Injected).count();
+    let correct = rows
+        .iter()
+        .filter(|r| {
+            r.ranked_available
+                && r.decision == ReviewedDecision::Injected
+                && !r.expect.is_empty()
+                && r.top.first().is_some_and(|id| r.expect.contains(id))
+        })
+        .count();
+    let wrong = injections.saturating_sub(correct);
+    let silent_positive =
+        rows.iter().filter(|r| r.ranked_available && r.decision == ReviewedDecision::Silent && !r.expect.is_empty()).count();
+    let silent_negative =
+        rows.iter().filter(|r| r.ranked_available && r.decision == ReviewedDecision::Silent && r.expect.is_empty()).count();
+    let false_injection =
+        rows.iter().filter(|r| r.ranked_available && r.decision == ReviewedDecision::Injected && r.expect.is_empty()).count();
+    ReviewedMetrics {
+        samples: rows.len(),
+        eligible,
+        unknown,
+        skipped,
+        answerable,
+        no_answer,
+        correct,
+        wrong,
+        silent_positive,
+        silent_negative,
+        unavailable,
+        recall_at_1: at(1),
+        recall_at_5: at(5),
+        precision: metric(correct, injections),
+        false_injection: metric(false_injection, no_answer),
+        injection_rate: metric(injections, eligible),
+        risk: metric(wrong, injections),
+        coverage: metric(injections, eligible),
+    }
+}
+
+/// Computes reviewed metrics for one backend and, optionally, one event path.
+pub fn reviewed_metrics_for(rows: &[ReviewedObservation], backend: Option<&str>, path: Option<EventPath>) -> ReviewedMetrics {
+    let selected: Vec<_> = rows
+        .iter()
+        .filter(|row| backend.is_none_or(|name| row.backend.as_deref() == Some(name)))
+        .filter(|row| path.is_none_or(|kind| row.path == kind))
+        .cloned()
+        .collect();
+    reviewed_metrics(&selected)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EventPath {
+    Failure,
+    Prompt,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewedEvent {
+    pub key: String,
+    pub path: EventPath,
+    pub text: String,
+    pub error: Option<String>,
+    pub command: Option<String>,
+    pub project: Option<String>,
+    pub system: Option<String>,
+    pub expect: Vec<String>,
+    #[serde(default)]
+    pub near_miss: Vec<String>,
+    pub source: String,
+    pub rationale: String,
+    pub worked: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewedFile {
+    version: u32,
+    kb_revision: String,
+    source_fingerprint: String,
+    event: Vec<ReviewedEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewedSet {
+    pub kb_revision: String,
+    pub source_fingerprint: String,
+    pub events: Vec<ReviewedEvent>,
+}
+
+pub fn parse_reviewed(text: &str, root: &Path) -> Result<ReviewedSet> {
+    let file: ReviewedFile = toml::from_str(text).map_err(|e| Error::Refused(format!("invalid reviewed set: {e}")))?;
+    if file.version != 1 || file.kb_revision.trim().is_empty() || file.source_fingerprint.trim().is_empty() {
+        return Err(Error::Refused("reviewed set needs version = 1, kb_revision and source_fingerprint".into()));
+    }
+    let snap = Snapshot::from_dir_where(root, |p| classify(p) == FileKind::Lesson)?;
+    let (lessons, _) = snap.lessons();
+    let active: HashSet<&str> =
+        lessons.iter().filter(|l| l.frontmatter.status == crate::lesson::Status::Active).map(|l| l.frontmatter.id.as_str()).collect();
+    let mut keys = HashSet::new();
+    for event in &file.event {
+        if event.key.trim().is_empty() || !keys.insert(event.key.as_str()) {
+            return Err(Error::Refused(format!("empty or duplicate event key: {}", event.key)));
+        }
+        if event.text.trim().is_empty() || event.source.trim().is_empty() || event.rationale.trim().is_empty() {
+            return Err(Error::Refused(format!("event {} needs text, source and rationale", event.key)));
+        }
+        if event.path == EventPath::Prompt && (event.error.is_some() || event.command.is_some()) {
+            return Err(Error::Refused(format!("event {}: prompt cannot have error", event.key)));
+        }
+        if event.path == EventPath::Failure && event.error.is_some() != event.command.is_some() {
+            return Err(Error::Refused(format!("event {}: error and command must occur together", event.key)));
+        }
+        if event.expect.is_empty() && event.worked.is_some()
+            || !event.expect.is_empty() && event.worked.as_ref().is_none_or(|s| s.trim().is_empty())
+        {
+            return Err(Error::Refused(format!("event {}: positives need a worked reference; negatives cannot have one", event.key)));
+        }
+        for id in event.expect.iter().chain(&event.near_miss) {
+            if !active.contains(id.as_str()) {
+                return Err(Error::Refused(format!("event {} names unknown or inactive lesson {id}", event.key)));
+            }
+        }
+        if event.near_miss.iter().any(|id| event.expect.contains(id)) {
+            return Err(Error::Refused(format!("event {}: a near miss cannot be expected", event.key)));
+        }
+    }
+    Ok(ReviewedSet { kb_revision: file.kb_revision, source_fingerprint: file.source_fingerprint, events: file.event })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Query {
@@ -221,6 +420,197 @@ mod tests {
         let mut with_literal = rows.to_vec();
         with_literal.push(row(&["a"], Some(1), &[("a", None)]));
         assert_eq!(tally(&with_literal, 0.85, 0.05), Some([1, 1, 1]), "a literal query has no verdict and is skipped");
+    }
+
+    #[test]
+    fn reviewed_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let head = "version = 1\nkb_revision = 'commit'\nsource_fingerprint = 'hash'\n";
+        let row = "\n[[event]]\nkey = 'one'\npath = 'failure'\ntext = 'cmake error'\nsource = 'local replay line 1'\nrationale = 'checked no active lesson answers this'\nexpect = []\n";
+        assert_eq!(parse_reviewed(&(head.to_owned() + row), root.path()).unwrap().events.len(), 1);
+        assert!(parse_reviewed(&(head.to_owned() + &row.replace("source = 'local replay line 1'\n", "")), root.path()).is_err());
+        assert!(parse_reviewed(&(head.to_owned() + row + row), root.path()).unwrap_err().to_string().contains("duplicate"));
+        let unknown = row.replace("expect = []", "expect = ['0000000000']\nworked = 'usage line 1'");
+        assert!(parse_reviewed(&(head.to_owned() + &unknown), root.path()).unwrap_err().to_string().contains("unknown"));
+        let unproved = row.replace("expect = []", "expect = ['0000000000']");
+        assert!(parse_reviewed(&(head.to_owned() + &unproved), root.path()).unwrap_err().to_string().contains("worked"));
+    }
+
+    #[test]
+    fn reviewed_metrics_keep_denominators_and_zero_rates_undefined() {
+        let rows = vec![
+            ReviewedObservation {
+                path: EventPath::Failure,
+                expect: vec!["a".into()],
+                top: vec!["a".into()],
+                scores: vec![Some(0.9)],
+                decision: ReviewedDecision::Injected,
+                backend: Some("model".into()),
+                ranked_available: true,
+                curve: vec![],
+            },
+            ReviewedObservation {
+                path: EventPath::Prompt,
+                expect: vec!["a".into()],
+                top: vec!["b".into()],
+                scores: vec![Some(0.9)],
+                decision: ReviewedDecision::Injected,
+                backend: Some("model".into()),
+                ranked_available: true,
+                curve: vec![],
+            },
+            ReviewedObservation {
+                path: EventPath::Prompt,
+                expect: vec![],
+                top: vec!["b".into()],
+                scores: vec![Some(0.9)],
+                decision: ReviewedDecision::Injected,
+                backend: Some("model".into()),
+                ranked_available: true,
+                curve: vec![],
+            },
+            ReviewedObservation {
+                path: EventPath::Prompt,
+                expect: vec![],
+                top: vec![],
+                scores: vec![],
+                decision: ReviewedDecision::Silent,
+                backend: None,
+                ranked_available: true,
+                curve: vec![],
+            },
+            ReviewedObservation {
+                path: EventPath::Failure,
+                expect: vec!["a".into()],
+                top: vec![],
+                scores: vec![],
+                decision: ReviewedDecision::Unavailable,
+                backend: None,
+                ranked_available: true,
+                curve: vec![],
+            },
+        ];
+        let m = reviewed_metrics(&rows);
+        assert_eq!((m.samples, m.eligible, m.unknown, m.skipped), (5, 4, 1, 0));
+        assert_eq!((m.answerable, m.no_answer), (3, 2));
+        assert_eq!((m.correct, m.wrong, m.silent_positive, m.silent_negative, m.unavailable), (1, 2, 0, 1, 1));
+        assert_eq!((m.precision.numerator, m.precision.denominator), (1, 3));
+        assert_eq!((m.false_injection.numerator, m.false_injection.denominator), (1, 2));
+        assert_eq!((m.injection_rate.numerator, m.injection_rate.denominator), (3, 4));
+        assert_eq!(m.recall_at_1.value, Some(1.0 / 3.0));
+        assert_eq!(metric(0, 0).value, None);
+    }
+
+    #[test]
+    fn reviewed_synthetic_positive_negative_near_miss_and_missing_context() {
+        let rows = vec![
+            ReviewedObservation {
+                path: EventPath::Failure,
+                expect: vec!["answer".into()],
+                top: vec!["answer".into()],
+                scores: vec![Some(0.9)],
+                decision: ReviewedDecision::Injected,
+                backend: Some("bm25-bert".into()),
+                ranked_available: true,
+                curve: vec![(0.55, 0.08, ReviewedDecision::Injected)],
+            },
+            ReviewedObservation {
+                path: EventPath::Prompt,
+                expect: vec![],
+                top: vec!["near-miss".into()],
+                scores: vec![Some(0.9)],
+                decision: ReviewedDecision::Injected,
+                backend: Some("bm25-bert".into()),
+                ranked_available: true,
+                curve: vec![(0.55, 0.08, ReviewedDecision::Injected)],
+            },
+            ReviewedObservation {
+                path: EventPath::Prompt,
+                expect: vec![],
+                top: vec![],
+                scores: vec![],
+                decision: ReviewedDecision::Silent,
+                backend: None,
+                ranked_available: true,
+                curve: vec![],
+            },
+            ReviewedObservation {
+                path: EventPath::Failure,
+                expect: vec!["answer".into()],
+                top: vec!["answer".into()],
+                scores: vec![Some(0.9)],
+                decision: ReviewedDecision::Unavailable,
+                backend: Some("bm25-bert".into()),
+                ranked_available: true,
+                curve: vec![(0.55, 0.08, ReviewedDecision::Unavailable)],
+            },
+        ];
+        let m = reviewed_metrics(&rows);
+        assert_eq!((m.recall_at_1.numerator, m.recall_at_1.denominator), (2, 2));
+        assert_eq!((m.false_injection.numerator, m.false_injection.denominator), (1, 2));
+        assert_eq!((m.injection_rate.numerator, m.injection_rate.denominator), (2, 3));
+        assert_eq!((m.eligible, m.unknown, m.skipped), (3, 1, 0));
+        assert_eq!(rows[3].curve[0].2, ReviewedDecision::Unavailable);
+    }
+
+    #[test]
+    fn mixed_backend_metrics_stay_separate() {
+        let rows = vec![
+            ReviewedObservation {
+                path: EventPath::Failure,
+                expect: vec!["answer".into()],
+                top: vec!["answer".into()],
+                scores: vec![],
+                decision: ReviewedDecision::Injected,
+                backend: Some("bm25".into()),
+                ranked_available: true,
+                curve: vec![],
+            },
+            ReviewedObservation {
+                path: EventPath::Failure,
+                expect: vec!["answer".into()],
+                top: vec!["wrong".into()],
+                scores: vec![],
+                decision: ReviewedDecision::Injected,
+                backend: Some("bm25-bert".into()),
+                ranked_available: true,
+                curve: vec![],
+            },
+        ];
+        let bm25 = reviewed_metrics_for(&rows, Some("bm25"), None);
+        assert_eq!((bm25.samples, bm25.correct, bm25.wrong), (1, 1, 0));
+        assert_eq!(reviewed_metrics_for(&rows, Some("bm25-bert"), None).wrong, 1);
+    }
+
+    #[test]
+    fn skipped_rows_are_not_eligible_but_unavailable_ranked_rows_keep_recall() {
+        let rows = vec![
+            ReviewedObservation {
+                path: EventPath::Prompt,
+                expect: vec!["answer".into()],
+                top: vec!["answer".into()],
+                scores: vec![],
+                decision: ReviewedDecision::Silent,
+                backend: None,
+                ranked_available: false,
+                curve: vec![],
+            },
+            ReviewedObservation {
+                path: EventPath::Failure,
+                expect: vec!["answer".into()],
+                top: vec!["answer".into()],
+                scores: vec![],
+                decision: ReviewedDecision::Unavailable,
+                backend: Some("bm25-bert".into()),
+                ranked_available: true,
+                curve: vec![],
+            },
+        ];
+        let m = reviewed_metrics(&rows);
+        assert_eq!((m.eligible, m.unknown, m.skipped), (0, 1, 1));
+        assert_eq!((m.recall_at_1.numerator, m.recall_at_1.denominator), (1, 1));
+        assert_eq!(m.injection_rate.value, None);
+        assert_eq!(m.false_injection.value, None);
     }
 
     #[test]

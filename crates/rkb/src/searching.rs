@@ -362,6 +362,300 @@ pub fn eval(
     Ok(Output { data, human, exit: u8::from(!pass), raw: false })
 }
 
+pub fn reviewed(env: &Env, path: &str, backend: Option<&str>, sweep: bool) -> Result<Output, CliError> {
+    use rkb_core::eval::{EventPath, ReviewedDecision, ReviewedObservation};
+    use rkb_core::hooks;
+    use rkb_core::matching::{Matched, Place, Rule};
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| CliError::new(ErrorCode::NotFound, format!("cannot read {path}: {e}"), "pass a readable reviewed manifest"))?;
+    let set = eval::parse_reviewed(&text, &env.root)
+        .map_err(|e| CliError::new(ErrorCode::Usage, e.to_string(), "fix the reviewed manifest and retry"))?;
+    let current_revision = rkb_core::git::run(&env.root, &["rev-parse", "HEAD"]).map_err(|e| {
+        CliError::new(ErrorCode::Refused, format!("cannot verify KB revision: {e}"), "run against a committed knowledge base")
+    })?;
+    let current_revision = String::from_utf8_lossy(&current_revision).trim().to_string();
+    if current_revision != set.kb_revision {
+        return Err(CliError::new(
+            ErrorCode::Refused,
+            format!("reviewed manifest drift: expected KB revision {}, found {current_revision}", set.kb_revision),
+            "refresh or select a manifest pinned to this KB revision",
+        ));
+    }
+    let settings = Settings::load(&env.root);
+    let requested = backend.unwrap_or("chain").to_string();
+    let mut actual_backends = std::collections::BTreeSet::new();
+    let mut skipped_backends: Vec<(String, String)> = Vec::new();
+    let mut observations = Vec::with_capacity(set.events.len());
+    let cfg = crate::hook::hooks_config(&env.root);
+    for event in &set.events {
+        let unavailable_failure = event.path == EventPath::Failure && (event.error.is_none() || event.command.is_none());
+        let query = match event.path {
+            EventPath::Failure => event
+                .error
+                .as_deref()
+                .zip(event.command.as_deref())
+                .map_or_else(|| event.text.clone(), |(error, command)| hooks::error_query(command, error)),
+            EventPath::Prompt => hooks::typed_text(&event.text),
+        };
+        let skipped_prompt =
+            event.path == EventPath::Prompt && (query.trim_start().starts_with('/') || query.split_whitespace().count() < 3);
+        if skipped_prompt {
+            observations.push(ReviewedObservation {
+                path: event.path,
+                expect: event.expect.clone(),
+                top: vec![],
+                scores: vec![],
+                decision: ReviewedDecision::Silent,
+                backend: None,
+                ranked_available: false,
+                curve: vec![],
+            });
+            continue;
+        }
+        let matched = |name: &Option<String>| name.as_ref().map(|n| Matched { name: n.clone(), rule: Rule::Flag });
+        let place = Place { project: matched(&event.project), system: matched(&event.system), repo: None, dir: None };
+        let facts = Facts::gather(&env.root, &place, &[]);
+        let mut found = search::search(
+            &env.root,
+            &place,
+            &facts,
+            &Mode::Ranked(query.clone()),
+            &Options { all: false, every_status: false, limit: settings.top.max(eval::DEPTH), probes: search::ProbeMode::Cached },
+        )?;
+        let ranked = crate::rerankers::run(&env.root, &settings, backend, &query, &found.hits, std::time::Duration::from_secs(120))?;
+        skipped_backends.extend(ranked.skipped.iter().cloned());
+        if let Some(requested_backend) = backend.filter(|name| *name != BM25)
+            && ranked.backend != requested_backend
+        {
+            return Err(CliError::new(
+                ErrorCode::Refused,
+                format!("requested backend {requested_backend} fell back to {}", ranked.describe()),
+                "run with the requested backend available",
+            ));
+        }
+        actual_backends.insert(ranked.backend.clone());
+        if let Some(scores) = &ranked.scores {
+            search::apply_relevance(&mut found.hits, scores, ranked.order.as_deref());
+        }
+        let ranked_available = true;
+        let top: Vec<String> = found.hits.iter().take(eval::DEPTH).map(|h| h.id.clone()).collect();
+        let scores: Vec<Option<f32>> = found.hits.iter().take(eval::DEPTH).map(|h| h.relevance).collect();
+        let active_backend = ranked.backend.clone();
+        let (min, margin) = recall_thresholds(&env.root, &active_backend);
+        let decision_at = |min: f64, margin: f64| {
+            if unavailable_failure {
+                return ReviewedDecision::Unavailable;
+            }
+            if event.path == EventPath::Failure {
+                let mut strength = hooks::Strength::from_config(&cfg, &active_backend);
+                strength.min_relevance = min;
+                strength.min_margin = margin;
+                let chosen = event.error.as_deref().and_then(|error| {
+                    hooks::would_inject(
+                        &found.hits,
+                        |id| rkb_core::kb::find(&env.root, id).map(|(_, t)| t).unwrap_or_default(),
+                        error,
+                        &strength,
+                    )
+                });
+                if chosen.is_some() { ReviewedDecision::Injected } else { ReviewedDecision::Silent }
+            } else if ranked.scores.is_some() {
+                let score = |h: Option<&rkb_core::search::Hit>| h.and_then(|h| h.relevance).map_or(0.0, f64::from);
+                let inject = hooks::clear_winner(score(found.hits.first()), score(found.hits.get(1)), min, margin)
+                    && found.hits.first().is_some_and(|h| h.applies != Verdict::No && h.status == Status::Active);
+                if inject { ReviewedDecision::Injected } else { ReviewedDecision::Silent }
+            } else {
+                ReviewedDecision::Silent
+            }
+        };
+        let decision = decision_at(min, margin);
+        let mut curve = vec![(min, margin, decision)];
+        if sweep && ranked.scores.is_some() {
+            curve.extend(
+                eval::SWEEP_MIN
+                    .into_iter()
+                    .flat_map(|min| eval::SWEEP_MARGIN.into_iter().map(move |margin| (min, margin, decision_at(min, margin)))),
+            );
+        }
+        observations.push(ReviewedObservation {
+            path: event.path,
+            expect: event.expect.clone(),
+            top,
+            scores,
+            decision,
+            backend: Some(active_backend),
+            ranked_available,
+            curve,
+        });
+    }
+
+    let metric_json = |m: &eval::Metric| json!({ "numerator": m.numerator, "denominator": m.denominator, "value": m.value.map(|v| (v * 1000.0).round() / 1000.0) });
+    let metrics_json = |m: &eval::ReviewedMetrics| {
+        json!({
+            "samples": m.samples,
+            "eligible": m.eligible,
+            "unknown": m.unknown,
+            "skipped": m.skipped,
+            "answerable": m.answerable,
+            "no_answer": m.no_answer,
+            "correct": m.correct,
+            "wrong": m.wrong,
+            "silent_positive": m.silent_positive,
+            "silent_negative": m.silent_negative,
+            "unavailable": m.unavailable,
+            "recall_at_1": metric_json(&m.recall_at_1),
+            "recall_at_5": metric_json(&m.recall_at_5),
+            "precision": metric_json(&m.precision),
+            "false_injection_rate": metric_json(&m.false_injection),
+            "injection_rate": metric_json(&m.injection_rate),
+            "risk": metric_json(&m.risk),
+            "coverage": metric_json(&m.coverage),
+        })
+    };
+    let path_metrics = |path: EventPath| {
+        let rows: Vec<_> = observations.iter().filter(|r| r.path == path).cloned().collect();
+        metrics_json(&eval::reviewed_metrics(&rows))
+    };
+    let all = eval::reviewed_metrics(&observations);
+    let mut backend_metrics = serde_json::Map::new();
+    let mut backend_human = String::new();
+    let mut backend_names: Vec<Option<String>> = actual_backends.iter().cloned().map(Some).collect();
+    if observations.iter().any(|row| row.backend.is_none()) {
+        backend_names.push(None);
+    }
+    for backend_name in backend_names {
+        let rows: Vec<_> = observations.iter().filter(|row| row.backend == backend_name).cloned().collect();
+        let name = backend_name.as_deref().unwrap_or("skipped").to_string();
+        let failure: Vec<_> = rows.iter().filter(|row| row.path == EventPath::Failure).cloned().collect();
+        let prompt: Vec<_> = rows.iter().filter(|row| row.path == EventPath::Prompt).cloned().collect();
+        let f = eval::reviewed_metrics(&failure);
+        let p = eval::reviewed_metrics(&prompt);
+        backend_metrics.insert(name.clone(), json!({ "failure": metrics_json(&f), "prompt": metrics_json(&p) }));
+        backend_human.push_str(&format!("\n{name}: failure {} correct {} wrong {} silent+ {} silent- {} unavailable {}; prompt {} correct {} wrong {} silent+ {} silent- {} unavailable {}",  f.samples, f.correct, f.wrong, f.silent_positive, f.silent_negative, f.unavailable, p.samples, p.correct, p.wrong, p.silent_positive, p.silent_negative, p.unavailable));
+    }
+    let mut curves = Vec::new();
+    let mut curve_specs: Vec<(String, EventPath, f64, f64)> = Vec::new();
+    for row in &observations {
+        if row.backend.as_deref().is_some_and(|name| name != BM25) {
+            for (min, margin, _) in &row.curve {
+                if !curve_specs.iter().any(|(backend_name, path_kind, a, b)| {
+                    backend_name == row.backend.as_ref().unwrap()
+                        && *path_kind == row.path
+                        && a.to_bits() == min.to_bits()
+                        && b.to_bits() == margin.to_bits()
+                }) {
+                    curve_specs.push((row.backend.clone().unwrap(), row.path, *min, *margin));
+                }
+            }
+        }
+    }
+    for (backend_name, path_kind, min, margin) in curve_specs {
+        let rows: Vec<_> = observations
+            .iter()
+            .filter(|r| r.backend.as_deref() == Some(backend_name.as_str()) && r.path == path_kind)
+            .map(|r| {
+                let mut row = r.clone();
+                row.decision = r
+                    .curve
+                    .iter()
+                    .find(|(a, b, _)| a.to_bits() == min.to_bits() && b.to_bits() == margin.to_bits())
+                    .map_or(ReviewedDecision::Unavailable, |(_, _, decision)| *decision);
+                row
+            })
+            .collect();
+        let m = eval::reviewed_metrics(&rows);
+        let literal_gate = path_kind == EventPath::Failure && hooks::Strength::from_config(&cfg, &backend_name).literal_gate;
+        curves.push(json!({ "backend": backend_name, "path": match path_kind { EventPath::Failure => "failure", EventPath::Prompt => "prompt" }, "decision_rule": if literal_gate { "literal-gate" } else { "relevance-threshold" }, "min_relevance": min, "margin": margin, "injections": m.coverage.numerator, "events": m.coverage.denominator, "wrong": m.risk.numerator, "risk": metric_json(&m.risk), "coverage": metric_json(&m.coverage) }));
+    }
+    let mut skipped_counts = std::collections::BTreeMap::<(String, String), usize>::new();
+    for skipped in skipped_backends {
+        *skipped_counts.entry(skipped).or_default() += 1;
+    }
+    let skipped_report: Vec<_> = skipped_counts
+        .into_iter()
+        .map(|((backend_name, reason), count)| json!({ "backend": backend_name, "reason": reason, "count": count }))
+        .collect();
+    let data = json!({
+        "manifest": { "kb_revision": set.kb_revision, "source_fingerprint": set.source_fingerprint },
+        "backend": { "requested": requested, "actual": actual_backends, "fallback": backend.is_none() && !skipped_report.is_empty(), "skipped": skipped_report },
+        "paths": { "failure": path_metrics(EventPath::Failure), "prompt": path_metrics(EventPath::Prompt) },
+        "by_backend": backend_metrics,
+        "metrics": metrics_json(&all),
+        "bm25_decisions": actual_backends.contains(BM25).then(|| {
+            json!({ "backend": BM25, "failure": metrics_json(&eval::reviewed_metrics_for(&observations, Some(BM25), Some(EventPath::Failure))), "prompt": metrics_json(&eval::reviewed_metrics_for(&observations, Some(BM25), Some(EventPath::Prompt))) })
+        }),
+        "model_risk_coverage": curves,
+        "help": ["reviewed evaluation reads the manifest and cached probes only"],
+    });
+    let ratio = |m: &eval::Metric| {
+        m.value.map_or_else(|| format!("{}/{} (-)", m.numerator, m.denominator), |v| format!("{}/{} ({v:.2})", m.numerator, m.denominator))
+    };
+    let mut human = format!(
+        "reviewed evaluation: {} events, KB revision {}\nsource fingerprint: {}\nbackends: {:?}\nfailure: recall@1 {} recall@5 {} precision {} false-injection {} injection {}\nprompt: recall@1 {} recall@5 {} precision {} false-injection {} injection {}",
+        all.samples,
+        set.kb_revision,
+        set.source_fingerprint,
+        actual_backends,
+        ratio(
+            &eval::reviewed_metrics(&observations.iter().filter(|r| r.path == EventPath::Failure).cloned().collect::<Vec<_>>()).recall_at_1
+        ),
+        ratio(
+            &eval::reviewed_metrics(&observations.iter().filter(|r| r.path == EventPath::Failure).cloned().collect::<Vec<_>>()).recall_at_5
+        ),
+        ratio(
+            &eval::reviewed_metrics(&observations.iter().filter(|r| r.path == EventPath::Failure).cloned().collect::<Vec<_>>()).precision
+        ),
+        ratio(
+            &eval::reviewed_metrics(&observations.iter().filter(|r| r.path == EventPath::Failure).cloned().collect::<Vec<_>>())
+                .false_injection
+        ),
+        ratio(
+            &eval::reviewed_metrics(&observations.iter().filter(|r| r.path == EventPath::Failure).cloned().collect::<Vec<_>>())
+                .injection_rate
+        ),
+        ratio(
+            &eval::reviewed_metrics(&observations.iter().filter(|r| r.path == EventPath::Prompt).cloned().collect::<Vec<_>>()).recall_at_1
+        ),
+        ratio(
+            &eval::reviewed_metrics(&observations.iter().filter(|r| r.path == EventPath::Prompt).cloned().collect::<Vec<_>>()).recall_at_5
+        ),
+        ratio(&eval::reviewed_metrics(&observations.iter().filter(|r| r.path == EventPath::Prompt).cloned().collect::<Vec<_>>()).precision),
+        ratio(
+            &eval::reviewed_metrics(&observations.iter().filter(|r| r.path == EventPath::Prompt).cloned().collect::<Vec<_>>())
+                .false_injection
+        ),
+        ratio(
+            &eval::reviewed_metrics(&observations.iter().filter(|r| r.path == EventPath::Prompt).cloned().collect::<Vec<_>>())
+                .injection_rate
+        )
+    );
+    let counts = |m: &eval::ReviewedMetrics| {
+        format!(
+            "samples {} eligible {} unknown {} skipped {} correct {} wrong {} silent+ {} silent- {} unavailable {}",
+            m.samples, m.eligible, m.unknown, m.skipped, m.correct, m.wrong, m.silent_positive, m.silent_negative, m.unavailable
+        )
+    };
+    let failure_rows: Vec<_> = observations.iter().filter(|r| r.path == EventPath::Failure).cloned().collect();
+    let prompt_rows: Vec<_> = observations.iter().filter(|r| r.path == EventPath::Prompt).cloned().collect();
+    human.push_str(&format!(
+        "\ncounts: failure {}\nprompt {}{}",
+        counts(&eval::reviewed_metrics(&failure_rows)),
+        counts(&eval::reviewed_metrics(&prompt_rows)),
+        backend_human
+    ));
+    let unavailable_failure =
+        observations.iter().filter(|r| r.path == EventPath::Failure && r.decision == ReviewedDecision::Unavailable).count();
+    let unavailable_prompt =
+        observations.iter().filter(|r| r.path == EventPath::Prompt && r.decision == ReviewedDecision::Unavailable).count();
+    human.push_str(&format!(
+        "\nunavailable: failure {unavailable_failure}, prompt {unavailable_prompt}; risk {} coverage {}; curve points {} (see JSON/TOON model_risk_coverage)",
+        ratio(&all.risk),
+        ratio(&all.coverage),
+        data["model_risk_coverage"].as_array().map_or(0, Vec::len)
+    ));
+    Ok(Output { data, human, exit: 0, raw: false })
+}
+
 /// `rkb eval --replay`: reruns this machine's logged failure queries with the failure hook's own rule.
 /// Ground truth is a heuristic: a lesson written in a session (in `written.jsonl`, or an older lesson's `meta.source.session`) most likely
 /// fixes one of that session's failures.
