@@ -12,13 +12,34 @@ use serde_json::json;
 use crate::output::{CliError, ErrorCode, Output};
 use crate::writes::{self, Env};
 
-/// The 5 closest active lessons to `text`, as `id: title`.
-fn closest(env: &Env, text: &str) -> Vec<String> {
+/// A lesson close to the item, with the status that marks a tombstone.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Closest {
+    pub id: String,
+    pub title: String,
+    pub status: rkb_core::lesson::Status,
+}
+
+impl Closest {
+    /// How the promotion prompt shows it: a tombstone is marked, so the model does not propose the
+    /// same claim again.
+    fn label(&self) -> String {
+        if self.status.is_current() {
+            format!("{}: {}", self.id, self.title)
+        } else {
+            format!("{}: {} ({} tombstone)", self.id, self.title, self.status.as_str())
+        }
+    }
+}
+
+/// The 5 closest lessons to `text`, tombstones included, as `id: title`.
+fn closest(env: &Env, text: &str) -> Vec<Closest> {
     let place = env.place.clone().unwrap_or(rkb_core::matching::Place { project: None, system: None, repo: None, dir: None });
     let facts = Facts::gather(&env.root, &place, &[]);
-    let options = Options { all: false, every_status: false, limit: 5, probes: search::ProbeMode::Cached };
+    // `every_status` so an archived lesson is in the prompt and can block the same claim again.
+    let options = Options { all: false, every_status: true, limit: 5, probes: search::ProbeMode::Cached, tier: None };
     match search::search(&env.root, &place, &facts, &Mode::Ranked(text.to_string()), &options) {
-        Ok(found) => found.hits.iter().take(5).map(|h| format!("{}: {}", h.id, h.title)).collect(),
+        Ok(found) => found.hits.iter().take(5).map(|h| Closest { id: h.id.clone(), title: h.title.clone(), status: h.status }).collect(),
         Err(_) => vec![],
     }
 }
@@ -96,7 +117,8 @@ pub fn run(env: &Env, max: Option<usize>, harness: &str) -> Result<Output, CliEr
         if !item.meta.signatures.is_empty() {
             distill::remove_signatures(&env.state, &item.meta.signatures, &item.id);
         }
-        let lessons = closest(env, &item.body);
+        let matches = closest(env, &item.body);
+        let lessons: Vec<String> = matches.iter().map(Closest::label).collect();
         let prompt = promote::prompt(item, &lessons);
         let model = cfg.chain(harness).first().cloned().unwrap_or_else(|| "session".into());
         let (program, args) = observer::command(harness, Some(&model));
@@ -226,6 +248,59 @@ mod tests {
         for heading in ["## Symptom", "## Cause", "## Fix", "## Evidence"] {
             assert!(text.contains(heading), "{heading} missing: {text}");
         }
+    }
+
+    #[test]
+    fn a_tombstone_reaches_the_prompt_labelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("kb");
+        let write = |name: &str, id: &str, status: &str, title: &str| {
+            let p = root.join(format!("general/a/{name}.md"));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let why = if status == "archived" { "\n## Why archived\nRetired.\n" } else { "" };
+            let text = format!(
+                "---\nschema: 1\nid: {id}\ntype: fact\nstatus: {status}\nverified: 2026-09-25\nverified_how: ran\n---\n\n# {title}\n\n## Statement\nUndefined reference to vtable means a missing virtual definition.\n\n## Evidence\nSeen.{why}"
+            );
+            std::fs::write(p, text).unwrap();
+        };
+        write("live", "0000000001", "active", "A live note");
+        write("gone", "0000000002", "archived", "Undefined reference to vtable means a missing virtual definition");
+        let env = Env {
+            root: root.clone(),
+            lint: rkb_core::lint::LintEnv { user: None, home: None },
+            state: dir.path().join("state"),
+            colored: false,
+            place: None,
+        };
+        // The closest lessons come from BM25, so a tombstone reaches the model through the prompt.
+        let matches = closest(&env, "undefined reference to vtable");
+        let gone = matches.iter().find(|c| c.id == "0000000002").expect("the tombstone is in the closest list");
+        assert!(!gone.status.is_current());
+        let lessons: Vec<String> = matches.iter().map(Closest::label).collect();
+        let item = rkb_core::distill::Item {
+            id: "0a1b2c3d4e".into(),
+            meta: rkb_core::distill::Meta {
+                kind: rkb_core::distill::Kind::Note,
+                time: 1,
+                harness: None,
+                session: None,
+                cwd: None,
+                signals: vec![],
+                signatures: vec![],
+                priority: None,
+                source: None,
+                candidates: vec![],
+            },
+            body: "undefined reference to vtable for Widget".into(),
+        };
+        let p = promote::prompt(&item, &lessons);
+        assert!(
+            p.contains("0000000002: Undefined reference to vtable means a missing virtual definition (archived tombstone)"),
+            "the prompt marks the tombstone: {p}"
+        );
+        assert!(p.contains("marked (archived tombstone) was retired"), "the prompt says what the mark means: {p}");
+        let current = Closest { id: "0000000001".into(), title: "A live note".into(), status: rkb_core::lesson::Status::Active };
+        assert_eq!(current.label(), "0000000001: A live note", "a live lesson carries no tombstone mark");
     }
 
     #[test]

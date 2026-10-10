@@ -232,7 +232,7 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
         &hooks::Strength::from_config(&cfg, &ranked.backend),
     );
     let seen = chosen.is_some_and(|h| hooks::read(state, session).iter().any(|r| r["kind"] == "injected" && r["id"] == h.id.as_str()));
-    let hit = chosen.filter(|_| !seen).cloned();
+    let push = chosen.filter(|_| !seen).and_then(|h| hooks::may_push(h, hooks::explore_used(state, session)).map(|explore| (h, explore)));
     if cfg.get("replay_log").and_then(toml::Value::as_bool) != Some(false) {
         let name = |m: &Option<rkb_core::matching::Matched>| m.as_ref().map(|m| m.name.clone());
         hooks::log_replay(
@@ -243,20 +243,25 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
                 project: name(&place.project),
                 system: name(&place.system),
                 query: query.clone(),
-                injected: hit.as_ref().map(|h| h.id.clone()),
+                injected: push.map(|(h, _)| h.id.clone()),
             },
         )?;
     }
-    let Some(hit) = hit else {
+    let Some((hit, explore)) = push else {
         if !seen {
             once("nohit")?;
         }
         return Ok(None);
     };
     let (_, text) = kb::find(&root, &hit.id)?;
-    hooks::append(state, session, &json!({ "kind": "injected", "id": hit.id, "hook": "tool-failed", "time": rkb_core::request::now() }))?;
-    record_use(&root, state, &hit.id, "injected", session, Some(format!("tool-failed, {}", ranked.describe())))?;
-    let context = hooks::render(&[injected(&hit, missing_note(&place, &hit.path, &text))]);
+    hooks::append(
+        state,
+        session,
+        &json!({ "kind": "injected", "id": hit.id, "hook": "tool-failed", "explore": explore, "time": rkb_core::request::now() }),
+    )?;
+    let reason = if explore { format!("explore, {}", ranked.describe()) } else { format!("tool-failed, {}", ranked.describe()) };
+    record_use(&root, state, &hit.id, "injected", session, Some(reason))?;
+    let context = hooks::render(&[injected(hit, missing_note(&place, &hit.path, &text))]);
     Ok(Some(reply("PostToolUseFailure", "additionalContext", json!(context))))
 }
 
@@ -297,7 +302,8 @@ fn ranked_search(
     let place = state::locate(root, &cwd(p), &Hints::default(), state)?;
     let facts = Facts::gather(root, &place, &[]);
     let settings = rerank::Settings::load(root);
-    let opts = Options { all: false, every_status: false, limit: settings.top.max(1), probes: rkb_core::search::ProbeMode::Cached };
+    let opts =
+        Options { all: false, every_status: false, limit: settings.top.max(1), probes: rkb_core::search::ProbeMode::Cached, tier: None };
     let mut found = search::search(root, &place, &facts, &Mode::Ranked(query.to_string()), &opts)?;
     let timeout = cfg.get("hook_timeout_ms").and_then(toml::Value::as_integer).map_or(DEFAULT_HOOK_TIMEOUT_MS, |v| v.max(0) as u64);
     let start = std::time::Instant::now();
@@ -346,19 +352,26 @@ fn recall(p: &Value, state: &Path, session: &str, text: &str) -> Result<Option<S
     let score = |h: Option<&search::Hit>| h.and_then(|h| h.relevance).map_or(0.0, f64::from);
     let (top, next) = (score(hits.first()), score(hits.get(1)));
     let seen = hooks::read(state, session);
-    let strong: Vec<search::Hit> = hits
+    let explore = hooks::explore_used(state, session);
+    let strong: Vec<(search::Hit, bool)> = hits
         .into_iter()
         .take(1)
         .filter(|h| hooks::clear_winner(top, next, min, margin) && h.applies != Verdict::No && h.status == rkb_core::lesson::Status::Active)
         .filter(|h| !seen.iter().any(|r| r["kind"] == "injected" && r["id"] == h.id.as_str()))
+        .filter_map(|h| hooks::may_push(&h, explore).map(|e| (h, e)))
         .collect();
     if strong.is_empty() {
         return Ok(None);
     }
     let mut blocks = vec![];
-    for h in &strong {
-        hooks::append(state, session, &json!({ "kind": "injected", "id": h.id, "hook": "recall", "time": rkb_core::request::now() }))?;
-        record_use(&root, state, &h.id, "injected", session, Some(format!("recall, {}", ranked.describe())))?;
+    for (h, explore) in &strong {
+        hooks::append(
+            state,
+            session,
+            &json!({ "kind": "injected", "id": h.id, "hook": "recall", "explore": explore, "time": rkb_core::request::now() }),
+        )?;
+        let reason = if *explore { format!("explore, {}", ranked.describe()) } else { format!("recall, {}", ranked.describe()) };
+        record_use(&root, state, &h.id, "injected", session, Some(reason))?;
         let text = kb::find(&root, &h.id).map(|(_, t)| t).unwrap_or_default();
         blocks.push(injected(h, missing_note(&place, &h.path, &text)));
     }

@@ -127,6 +127,7 @@ fn inputs() -> Vec<Value> {
                 "query": { "type": "string", "description": "Words from the problem or the error message" },
                 "limit": { "type": "integer", "minimum": 1, "description": "Most results to return. Default: 10" },
                 "all": { "type": "boolean", "description": "Also show lessons that do not apply here and other projects' lessons" },
+                "tier": { "type": "string", "enum": ["candidate", "proven", "archive"], "description": "Show only lessons of this tier. `archive` shows tombstones" },
             }, "required": ["query"], "additionalProperties": false },
         }),
         json!({

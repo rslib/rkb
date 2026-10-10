@@ -19,6 +19,15 @@ fn applies_color(v: Verdict) -> &'static str {
     }
 }
 
+/// The color of a tier in the result line: proven is good, archive is a tombstone.
+fn tier_color(t: rkb_core::tier::Tier) -> &'static str {
+    match t {
+        rkb_core::tier::Tier::Proven => "32",
+        rkb_core::tier::Tier::Candidate => "2",
+        rkb_core::tier::Tier::Archive => "33",
+    }
+}
+
 fn hidden_text(r: &Results) -> Option<String> {
     (r.hidden > 0).then(|| {
         let keys: Vec<String> = r.hidden_by.keys().cloned().collect();
@@ -89,6 +98,7 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options, only: Option<
     human.push('\n');
     for h in &r.hits {
         let mut right = vec![];
+        right.push(paint(c, tier_color(h.tier), h.tier.as_str()));
         if h.status != Status::Active {
             right.push(paint(c, "33", h.status.as_str()));
         }
@@ -131,6 +141,7 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options, only: Option<
                 "title": h.title,
                 "path": h.path,
                 "status": h.status.as_str(),
+                "tier": h.tier.as_str(),
                 "applies": h.applies.as_str(),
                 "worked": u.worked,
                 "failed": u.failed,
@@ -420,7 +431,13 @@ pub fn reviewed(env: &Env, path: &str, backend: Option<&str>, sweep: bool) -> Re
             &place,
             &facts,
             &Mode::Ranked(query.clone()),
-            &Options { all: false, every_status: false, limit: settings.top.max(eval::DEPTH), probes: search::ProbeMode::Cached },
+            &Options {
+                all: false,
+                every_status: false,
+                limit: settings.top.max(eval::DEPTH),
+                probes: search::ProbeMode::Cached,
+                tier: None,
+            },
         )?;
         let ranked = crate::rerankers::run(&env.root, &settings, backend, &query, &found.hits, std::time::Duration::from_secs(120))?;
         skipped_backends.extend(ranked.skipped.iter().cloned());
@@ -458,7 +475,12 @@ pub fn reviewed(env: &Env, path: &str, backend: Option<&str>, sweep: bool) -> Re
                         &strength,
                     )
                 });
-                if chosen.is_some() { ReviewedDecision::Injected } else { ReviewedDecision::Silent }
+                // The hook pushes a proven lesson, or one candidate as its explore push.
+                if chosen.is_some_and(|h| hooks::may_push(h, false).is_some()) {
+                    ReviewedDecision::Injected
+                } else {
+                    ReviewedDecision::Silent
+                }
             } else if ranked.scores.is_some() {
                 let score = |h: Option<&rkb_core::search::Hit>| h.and_then(|h| h.relevance).map_or(0.0, f64::from);
                 let inject = hooks::clear_winner(score(found.hits.first()), score(found.hits.get(1)), min, margin)
@@ -706,7 +728,7 @@ pub fn replay(env: &Env, days: u64, min_recall: Option<f64>, backend: Option<&st
         let matched = |name: &Option<String>| name.as_ref().map(|n| Matched { name: n.clone(), rule: Rule::Flag });
         let place = Place { project: matched(&r.project), system: matched(&r.system), repo: None, dir: None };
         let facts = Facts::gather(&env.root, &place, &[]);
-        let opts = Options { all: false, every_status: false, limit: settings.top.max(1), probes: search::ProbeMode::Cached };
+        let opts = Options { all: false, every_status: false, limit: settings.top.max(1), probes: search::ProbeMode::Cached, tier: None };
         let mut res = search::search(&env.root, &place, &facts, &Mode::Ranked(r.query.clone()), &opts)?;
         let ranked = crate::rerankers::run(&env.root, &settings, backend, &r.query, &res.hits, timeout)?;
         if let Some(scores) = &ranked.scores {
@@ -718,7 +740,10 @@ pub fn replay(env: &Env, days: u64, min_recall: Option<f64>, backend: Option<&st
             found.insert(r.session.clone());
         }
         let text_of = |id: &str| rkb_core::kb::find(&env.root, id).map(|(_, t)| t).unwrap_or_default();
-        match hooks::would_inject(&res.hits, text_of, &r.query, &hooks::Strength::from_config(&cfg, &ranked.backend)) {
+        // The hook pushes a proven lesson, or one candidate as its explore push.
+        let chosen = hooks::would_inject(&res.hits, text_of, &r.query, &hooks::Strength::from_config(&cfg, &ranked.backend))
+            .filter(|h| hooks::may_push(h, false).is_some());
+        match chosen {
             Some(h) => {
                 would += 1;
                 would_irrelevant += usize::from(irrelevant.contains(&(r.session.clone(), h.id.clone())));

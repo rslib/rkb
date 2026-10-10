@@ -10,6 +10,7 @@ use crate::kb::{FileKind, Snapshot, classify};
 use crate::lesson::{Lesson, LessonType, Status};
 use crate::matching::Place;
 use crate::text::{each_token, edit_distance, is_version, summary, tokens};
+use crate::tier::Tier;
 
 pub const RANKED_BY: &str = "bm25";
 
@@ -37,6 +38,8 @@ pub struct Options {
     pub limit: usize,
     /// Whether approved `Probe` scripts of the top results may run, or only their cached results count.
     pub probes: ProbeMode,
+    /// Show only lessons of this tier; `None` keeps the status behavior.
+    pub tier: Option<Tier>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -143,6 +146,8 @@ pub struct Hit {
     /// The `verified` date (`YYYY-MM-DD`) and how (`ran`, `read`, `told` or `checked`).
     pub verified: String,
     pub verified_how: String,
+    /// The lesson's tier from its use counts: `candidate`, `proven` or `archive`.
+    pub tier: Tier,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -213,6 +218,8 @@ fn hit(l: &Lesson, score: f64, line: Option<(usize, String)>) -> Hit {
         relevance: None,
         verified: fm.verified.to_string(),
         verified_how: serde_json::to_value(fm.verified_how).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default(),
+        // Filled from the use counts in `search`; the other callers do not use the tier.
+        tier: Tier::Candidate,
     }
 }
 
@@ -452,10 +459,9 @@ pub fn search(root: &Path, place: &Place, facts: &Facts, mode: &Mode, opts: &Opt
     let raw: HashMap<&str, &str> = loaded.iter().map(|(l, t)| (l.path.as_str(), t.as_str())).collect();
     let lessons: Vec<&Lesson> = loaded.iter().map(|(l, _)| l).filter(|l| opts.every_status || l.frontmatter.status.is_current()).collect();
 
+    let counts = crate::usage::counts(root);
     let ordered: Vec<Hit> = match mode {
-        Mode::Ranked(q) => {
-            rank(&lessons, place, q, &crate::usage::counts(root)).into_iter().map(|(i, s)| hit(lessons[i], s, None)).collect()
-        }
+        Mode::Ranked(q) => rank(&lessons, place, q, &counts).into_iter().map(|(i, s)| hit(lessons[i], s, None)).collect(),
         Mode::Literal(_) | Mode::Regex(_) => {
             let re = match mode {
                 Mode::Literal(t) => Regex::new(&regex::escape(t)),
@@ -479,8 +485,10 @@ pub fn search(root: &Path, place: &Place, facts: &Facts, mode: &Mode, opts: &Opt
     let by_id: HashMap<&str, &&Lesson> = lessons.iter().map(|l| (l.frontmatter.id.as_str(), l)).collect();
     let evaluated: Vec<(Hit, crate::conditions::Applies)> = ordered
         .into_iter()
-        .map(|h| {
-            let a = evaluate(&by_id[h.id.as_str()].frontmatter.when, facts);
+        .map(|mut h| {
+            let l = by_id[h.id.as_str()];
+            h.tier = crate::tier::of(l.frontmatter.status, counts.get(&h.id));
+            let a = evaluate(&l.frontmatter.when, facts);
             (h, a)
         })
         .collect();
@@ -492,6 +500,9 @@ pub fn search(root: &Path, place: &Place, facts: &Facts, mode: &Mode, opts: &Opt
     for (mut h, applies) in evaluated {
         if out.hits.len() >= opts.limit {
             break;
+        }
+        if opts.tier.is_some_and(|t| t != h.tier) {
+            continue;
         }
         let mut no_keys: Vec<String> = applies.keys.iter().filter(|k| k.result == Verdict::No).map(|k| k.key.clone()).collect();
         h.applies = match probes.get(&h.id) {
@@ -595,7 +606,7 @@ mod tests {
     }
 
     fn opts() -> Options {
-        Options { all: false, every_status: false, limit: 10, probes: ProbeMode::Off }
+        Options { all: false, every_status: false, limit: 10, probes: ProbeMode::Off, tier: None }
     }
 
     fn ids(r: &Results) -> Vec<&str> {
@@ -624,6 +635,31 @@ mod tests {
         let after = search(r, &place(None), &facts, &q, &opts()).unwrap();
         assert_eq!(ids(&after)[0], other, "the lesson that worked three times ranks first");
         assert_eq!(after.hits.len(), 2, "nothing is hidden");
+    }
+
+    #[test]
+    fn the_tier_shows_and_the_filter_hides_a_candidate() {
+        let kb = tempfile::tempdir().unwrap();
+        let r = kb.path();
+        write(r, "general/a/x.md", "0000000001", "Striping large files", "", "Words.");
+        write(r, "general/a/y.md", "0000000002", "Striping large files", "", "Words.");
+        let dir = r.join(crate::usage::DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("m-0000.jsonl"),
+            serde_json::to_string(&crate::usage::now("0000000001", "worked", None, None)).unwrap() + "\n",
+        )
+        .unwrap();
+        let facts = Facts { values: Default::default(), ancestry: None };
+        let q = Mode::Ranked("striping".into());
+        let all = search(r, &place(None), &facts, &q, &opts()).unwrap();
+        let tier = |id: &str| all.hits.iter().find(|h| h.id == id).unwrap().tier;
+        assert_eq!(tier("0000000001"), Tier::Proven);
+        assert_eq!(tier("0000000002"), Tier::Candidate);
+        let proven = search(r, &place(None), &facts, &q, &Options { tier: Some(Tier::Proven), ..opts() }).unwrap();
+        assert_eq!(ids(&proven), ["0000000001"], "--tier proven hides the candidate");
+        let candidates = search(r, &place(None), &facts, &q, &Options { tier: Some(Tier::Candidate), ..opts() }).unwrap();
+        assert_eq!(ids(&candidates), ["0000000002"]);
     }
 
     #[test]
@@ -719,6 +755,7 @@ mod tests {
             relevance: None,
             verified: String::new(),
             verified_how: String::new(),
+            tier: Tier::Candidate,
         };
         let mut hits = vec![h("a"), h("b"), h("c"), h("d")];
         apply_relevance(&mut hits, &[Some(0.2), None, Some(0.9)], None);

@@ -38,6 +38,7 @@ pub mod site;
 pub mod state;
 pub mod sync;
 pub mod text;
+pub mod tier;
 pub mod tools;
 pub mod triage;
 pub mod usage;

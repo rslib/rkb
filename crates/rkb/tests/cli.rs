@@ -735,6 +735,33 @@ fn stuck_third_edit_and_ping_pong_ask() {
 }
 
 #[test]
+fn a_demote_that_needs_the_user_exits_three() {
+    let env = kb_with_topics();
+    env.trust_claude();
+    let v = stuck_cmd(&env, &["add", "--topic", "cmake"], &lesson_with("Demote question"));
+    assert_eq!(v["status"], "written", "{v}");
+    let id = v["id"].as_str().unwrap().to_string();
+    let (a, _) = current(&env, &id);
+    let b = a.replace("Set HDF5_ROOT.", "Set HDF5_ROOT to the prefix.");
+    assert_eq!(stuck_cmd(&env, &["edit", &id, "--base", &current(&env, &id).1], &b)["status"], "written");
+    let used = |args: &[&str]| {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.env("RKB_SESSION", "s1");
+        let o = rkb_with(c, &[args, &["--format", "json"]].concat(), "");
+        (serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap(), o.status.code())
+    };
+    let (v, code) = used(&["used", &id, "--irrelevant", "--reason", "a"]);
+    assert_eq!((v["status"].as_str(), code), (Some("recorded"), Some(0)), "{v}");
+    // Two bad reports on a lesson this session already wrote twice: the demote archive is the third
+    // write, so the stuck guard asks. The question must reach the caller with exit 3.
+    let (v, code) = used(&["used", &id, "--irrelevant", "--reason", "b"]);
+    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "the demote archive asks the user: {v}");
+    assert!(v["question"].as_str().unwrap().contains("may be stuck"), "{v}");
+    assert_eq!(v["recorded"]["result"], "irrelevant", "the report is kept: {v}");
+    assert!(current(&env, &id).0.contains("status: active"), "nothing was archived yet");
+}
+
+#[test]
 fn stuck_ignores_bulk_adds() {
     let env = kb_with_topics();
     for i in 0..12 {
@@ -864,6 +891,9 @@ fn flag_revive_used_and_log() {
     assert_eq!(v["status"], "recorded");
     assert!(show(&env, &id)["last_worked"].is_string());
     assert!(show(&env, &id)["last_failed"].is_null());
+    // Two worked reports keep the harmful count at or below the helpful one, so the failure below
+    // flags the lesson without also demoting it.
+    assert_eq!(env.json(&["used", &id, "--worked"], "").0["status"], "recorded");
     let (v, _) = env.json(&["used", &id, "--irrelevant", "--reason", "about pi events, not sed"], "");
     assert_eq!((v["status"].as_str(), v.get("flag")), (Some("recorded"), None), "{v}");
     assert!(current(&env, &id).0.contains("status: active"), "irrelevant never flags");
@@ -1592,7 +1622,7 @@ fn search_outputs_and_hidden_results() {
     let (v, _) = env.json(&["find", "undefind vtable"], "");
     assert_eq!(v["results"][0]["id"], "1a00000012");
     let toon = stdout(&env.rkb(&["search", "git rebase", "--toon"]));
-    assert!(toon.contains("results[3]{id,type,title,path,status,applies,worked,failed,injected,irrelevant,summary}:"), "{toon}");
+    assert!(toon.contains("results[3]{id,type,title,path,status,tier,applies,worked,failed,injected,irrelevant,summary}:"), "{toon}");
     assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
 }
 
@@ -2460,6 +2490,11 @@ fn hook_full_session() {
     let injections: Vec<_> = usage_records(&env).into_iter().filter(|r| r["event"] == "injected").collect();
     assert_eq!(injections.len(), 1);
     assert_eq!((injections[0]["id"].as_str(), injections[0]["session"].as_str()), (Some("1a00000012"), Some("s1")));
+    assert!(
+        injections[0]["reason"].as_str().unwrap().starts_with("explore"),
+        "the first push of a candidate is an explore: {}",
+        injections[0]
+    );
     assert_eq!(hook(&env, "tool-ok", &bash("s1", &cwd, "g++ main.o -o app")), "");
     assert_eq!(hook(&env, "tool-ok", &bash("s1", &cwd, "g++ main.o -o app")), "", "a second success infers nothing new");
     let inferred: Vec<_> = usage_records(&env).into_iter().filter(|r| r["event"] == "inferred").collect();
@@ -2470,10 +2505,11 @@ fn hook_full_session() {
     assert_eq!((v["signals"]["injected"].as_u64(), v["signals"]["injected_then_helped"].as_u64()), (Some(1), Some(1)), "{v}");
     assert_eq!(env.json(&["used", "1a00000012", "--irrelevant", "--session", "s1"], "").0["status"], "recorded");
     let (v, _) = env.json(&["review", "--signals"], "");
-    let path = &v["signals"]["paths"]["tool-failed"];
+    let path = &v["signals"]["paths"]["explore"];
     assert_eq!((path["injected"].as_u64(), path["helped"].as_u64(), path["irrelevant"].as_u64()), (Some(1), Some(1), Some(1)), "{v}");
+    assert_eq!(v["signals"]["paths"]["tool-failed"]["injected"], 0, "a candidate push is not a proven push: {v}");
     assert_eq!(v["signals"]["paths"]["recall"]["injected"], 0, "{v}");
-    assert!(stdout(&env.rkb(&["review", "--signals"])).contains("tool-failed: 1 injected, 1 then helped (100%), 1 marked irrelevant"));
+    assert!(stdout(&env.rkb(&["review", "--signals"])).contains("explore: 1 injected, 1 then helped (100%), 1 marked irrelevant"));
 
     let mut weak = bash("s1", &cwd, "make");
     weak["error"] = "Exit code 2\nerror: the build did not work today\n".into();
@@ -2690,6 +2726,19 @@ fn auto_confirm_answers_only_listed_options() {
     assert_eq!(code, Some(0), "{v}");
     assert_eq!(v["auto_confirmed"], "install (RKB_AUTO_CONFIRM)");
     assert!(ext.exists());
+}
+
+#[test]
+fn install_list_shows_the_tier_docs() {
+    let env = Env::new();
+    let skill = env.dir.path().join(".pi/agent/skills/rkb/SKILL.md");
+    std::fs::create_dir_all(env.dir.path().join(".pi")).unwrap();
+    let (v, code) = json_with_auto(&env, Some("install"), &["install", "pi"]);
+    assert_eq!(code, Some(0), "{v}");
+    let text = std::fs::read_to_string(&skill).unwrap();
+    assert!(text.contains("rkb tier") && text.contains("`candidate`") && text.contains("`proven`"), "the skill documents the tiers");
+    let (v, _) = env.json(&["install", "--list"], "");
+    assert_eq!(v["harnesses"][1]["current"].as_bool(), Some(true), "the installed skill matches this rkb: {v}");
 }
 
 #[test]
@@ -3082,6 +3131,110 @@ fn trusted_confirm(env: &Env, request: &str, choice: &str) -> serde_json::Value 
     c.env("CLAUDECODE", "1");
     let o = rkb_with(c, &["confirm", request, "--choice", choice, "--format", "json"], "");
     serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)))
+}
+
+#[test]
+fn tier_reports_counts_and_changes_nothing() {
+    let env = fixture_kb();
+    let before = (commit_count(&env), stdout(&env.git(&["status", "--porcelain"])));
+    let (v, code) = env.json(&["tier"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(
+        (v["counts"]["candidate"].as_u64(), v["counts"]["proven"].as_u64(), v["counts"]["archive"].as_u64()),
+        (Some(5), Some(0), Some(0)),
+        "{v}"
+    );
+    assert_eq!((commit_count(&env), stdout(&env.git(&["status", "--porcelain"]))), before, "tier changes nothing");
+
+    let (v, _) = env.json(&["used", "7f3a9c2b41", "--worked"], "");
+    assert_eq!(v["status"], "recorded", "{v}");
+    let (v, _) = env.json(&["tier"], "");
+    assert_eq!(v["counts"]["proven"], 1, "{v}");
+    assert_eq!(v["proven"][0]["id"], "7f3a9c2b41", "{v}");
+    assert_eq!(v["proven"][0]["helpful"], 1.0, "{v}");
+}
+
+#[test]
+fn search_tier_filter_and_display() {
+    let env = fixture_kb();
+    let (v, _) = env.json(&["used", "2b81d05e77", "--worked"], "");
+    assert_eq!(v["status"], "recorded", "{v}");
+
+    let human = stdout(&env.rkb(&["search", "--no-model", "--all", "--format", "human", "stripe"]));
+    assert!(human.contains("proven") && human.contains("candidate"), "the result line shows the tier: {human}");
+
+    let (v, _) = env.json(&["search", "--no-model", "--all", "--tier", "proven", "stripe"], "");
+    assert_eq!(
+        v["results"].as_array().unwrap().iter().map(|r| r["id"].clone()).collect::<Vec<_>>(),
+        [serde_json::json!("2b81d05e77")],
+        "{v}"
+    );
+    assert!(v["results"].as_array().unwrap().iter().all(|r| r["tier"] == "proven"), "{v}");
+
+    let (v, _) = env.json(&["archive", "c04e11a9f3", "--reason", "tier test"], "");
+    assert_eq!(v["status"], "written", "{v}");
+    let (v, _) = env.json(&["search", "--no-model", "--all", "--tier", "archive", "stripe"], "");
+    assert!(v["results"].as_array().unwrap().iter().any(|r| r["id"] == "c04e11a9f3"), "--tier archive reads a tombstone: {v}");
+    let (v, _) = env.json(&["search", "--no-model", "--all", "stripe"], "");
+    assert!(!v["results"].as_array().unwrap().iter().any(|r| r["id"] == "c04e11a9f3"), "a tombstone stays hidden by default: {v}");
+}
+
+#[test]
+fn used_demotes_a_lesson_with_bad_signals() {
+    let env = fixture_kb();
+    let id = "7f3a9c2b41";
+    let path = env.kb().join("projects/dftracer/cmake/cmake-needs-hdf5-root.md");
+    let (v, _) = env.json(&["used", id, "--worked"], "");
+    assert_eq!(v["status"], "recorded", "{v}");
+    let (v, _) = env.json(&["used", id, "--irrelevant", "--reason", "not this"], "");
+    assert_eq!(v["status"], "recorded", "{v}");
+    assert!(v.get("demote").is_none(), "one bad report cannot remove a lesson that worked: {v}");
+    assert!(std::fs::read_to_string(&path).unwrap().contains("status: active\n"), "still active");
+    let (v, _) = env.json(&["used", id, "--irrelevant", "--reason", "not this either"], "");
+    assert_eq!(v["demote"]["status"], "written", "two bad reports and one worked is more harmful: {v}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("status: archived\n"), "{text}");
+    assert!(text.contains("## Why archived\ndemoted: more harmful than helpful"), "{text}");
+}
+
+#[test]
+fn unarchive_records_the_restoration_and_keeps_the_tier() {
+    let env = fixture_kb();
+    let id = "c04e11a9f3";
+    let (v, _) = env.json(&["used", id, "--worked"], "");
+    assert_eq!(v["status"], "recorded", "{v}");
+    let (v, _) = env.json(&["archive", id, "--reason", "retired for the test"], "");
+    assert_eq!(v["status"], "written", "{v}");
+    let (v, _) = env.json(&["tier"], "");
+    assert_eq!(v["counts"]["archive"], 1, "{v}");
+    let (v, _) = env.json(&["unarchive", id], "");
+    assert_eq!(v["status"], "written", "{v}");
+    let restored: Vec<_> = usage_records(&env).into_iter().filter(|r| r["id"] == id && r["event"] == "restored").collect();
+    assert_eq!(restored.len(), 1, "the restoration is recorded: {restored:?}");
+    let (v, _) = env.json(&["tier"], "");
+    assert_eq!((v["counts"]["proven"].as_u64(), v["counts"]["archive"].as_u64()), (Some(1), Some(0)), "{v}");
+    assert_eq!(v["proven"][0]["id"], id, "a restored lesson with a worked record is proven: {v}");
+}
+
+#[test]
+fn a_restored_lesson_is_not_demoted_by_its_old_reports() {
+    let env = fixture_kb();
+    let id = "7f3a9c2b41";
+    let path = env.kb().join("projects/dftracer/cmake/cmake-needs-hdf5-root.md");
+    let (v, _) = env.json(&["used", id, "--worked"], "");
+    assert_eq!(v["status"], "recorded", "{v}");
+    let (v, _) = env.json(&["used", id, "--irrelevant", "--reason", "not this"], "");
+    assert!(v.get("demote").is_none(), "one bad report is not enough: {v}");
+    let (v, _) = env.json(&["used", id, "--irrelevant", "--reason", "not this either"], "");
+    assert_eq!(v["demote"]["status"], "written", "{v}");
+    assert!(std::fs::read_to_string(&path).unwrap().contains("status: archived\n"));
+    let (v, _) = env.json(&["unarchive", id], "");
+    assert_eq!(v["status"], "written", "{v}");
+    // The counts restart at the restoration, so the old bad reports do not archive it again.
+    let (v, _) = env.json(&["used", id, "--worked"], "");
+    assert_eq!(v["status"], "recorded", "{v}");
+    assert!(v.get("demote").is_none(), "the restored lesson is not archived again: {v}");
+    assert!(std::fs::read_to_string(&path).unwrap().contains("status: active\n"), "the lesson stays active");
 }
 
 #[test]

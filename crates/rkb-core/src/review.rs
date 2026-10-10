@@ -127,7 +127,7 @@ pub struct PathSignals {
 pub fn signals(root: &Path, state: &Path) -> Signals {
     let records = usage::records(root);
     let mut out = Signals::default();
-    for path in ["tool-failed", "recall"] {
+    for path in ["tool-failed", "recall", "explore"] {
         out.paths.insert(path.into(), PathSignals::default());
     }
     for e in std::fs::read_dir(state.join("sessions")).into_iter().flatten().flatten() {
@@ -138,7 +138,7 @@ pub fn signals(root: &Path, state: &Path) -> Signals {
         let in_session: Vec<&usage::Record> = records.iter().filter(|u| u.session.as_deref() == Some(session.as_str())).collect();
         for r in in_session.iter().filter(|u| u.event == "injected") {
             let prefix = r.reason.as_deref().and_then(|x| x.split(',').next()).unwrap_or_default();
-            let path = if matches!(prefix, "tool-failed" | "recall") { prefix } else { "other" };
+            let path = if matches!(prefix, "tool-failed" | "recall" | "explore") { prefix } else { "other" };
             let followed = |event: &str| in_session.iter().any(|u| u.id == r.id && u.event == event);
             let p = out.paths.entry(path.into()).or_default();
             p.injected += 1;
@@ -404,4 +404,37 @@ pub fn curate_nudge(root: &Path, state: &Path, command: &str) -> Option<String> 
             "rkb curate: {n} lessons or pairs may need a merge, a sharper text or archiving. At a natural pause in the work, run {command}, without waiting for the user."
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signals_keep_explore_pushes_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, state) = (dir.path().join("kb"), dir.path().join("state"));
+        let usage_dir = root.join(usage::DIR);
+        std::fs::create_dir_all(&usage_dir).unwrap();
+        std::fs::create_dir_all(state.join("sessions")).unwrap();
+        let line = |id: &str, reason: &str| {
+            let r = usage::Record {
+                time: "2026-10-09T00:00:00Z".into(),
+                id: id.into(),
+                event: "injected".into(),
+                session: Some("s1".into()),
+                reason: Some(reason.into()),
+            };
+            serde_json::to_string(&r).unwrap() + "\n"
+        };
+        let mut text = line("a", "explore, bm25");
+        text.push_str(&line("b", "tool-failed, bm25"));
+        std::fs::write(usage_dir.join("m-0000.jsonl"), text).unwrap();
+        std::fs::write(state.join("sessions/s1.jsonl"), "{\"kind\":\"injected\",\"id\":\"a\"}\n{\"kind\":\"injected\",\"id\":\"b\"}\n")
+            .unwrap();
+        let s = signals(&root, &state);
+        assert_eq!(s.paths["explore"].injected, 1, "an explore push has its own count");
+        assert_eq!(s.paths["tool-failed"].injected, 1);
+        assert_eq!(s.paths["recall"].injected, 0);
+    }
 }

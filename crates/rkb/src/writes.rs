@@ -300,7 +300,16 @@ pub fn label(env: &Env, folder: String, assignment: Option<String>, unset: bool)
 
 pub fn lifecycle(env: &Env, action: Action) -> Result<Output, CliError> {
     kb::open(&env.root)?;
-    outcome(env, write::apply(&env.ctx(), &action, &[])?)
+    let restored = match &action {
+        Action::Unarchive { id } => Some(id.clone()),
+        _ => None,
+    };
+    let out = outcome(env, write::apply(&env.ctx(), &action, &[])?)?;
+    // A restoration is recorded, so the tombstone and its revival both stay auditable.
+    if let Some(id) = restored.filter(|_| out.data["status"] == "written") {
+        usage::record(&env.root, &paths::config_dir(), &env.state, &usage::now(&id, "restored", usage::env_session(), None))?;
+    }
+    Ok(out)
 }
 
 /// `result` is `worked`, `failed` (also flags) or `irrelevant`.
@@ -317,12 +326,35 @@ pub fn used(env: &Env, id: String, result: &str, reason: Option<String>, session
     let mut data = json!({ "status": "recorded", "id": id, "result": result, "session": session });
     let mut human = format!("Recorded: {id} {result}");
     if failed {
-        let reason = reason.unwrap_or_default();
-        let flagged = outcome(env, write::apply(&env.ctx(), &Action::Flag { id, reason }, &[])?)?;
+        let reason = reason.clone().unwrap_or_default();
+        let flagged = outcome(env, write::apply(&env.ctx(), &Action::Flag { id: id.clone(), reason }, &[])?)?;
         human.push_str(&format!("\n{}", flagged.human));
         data["flag"] = flagged.data;
     }
+    // The demote rule: bad signals move a lesson to archive, never age alone.
+    if let Some(reason) = demote_reason(env, &id)? {
+        let archived = outcome(env, write::apply(&env.ctx(), &Action::Archive { target: id.clone(), reason }, &[])?)?;
+        if archived.exit == 3 {
+            // The archive waits for the user; the question must reach the caller with exit 3.
+            let mut out = archived;
+            out.human = format!("{human}\n{}", out.human);
+            out.data["recorded"] = data;
+            return Ok(out);
+        }
+        human.push_str(&format!("\n{}", archived.human));
+        data["demote"] = archived.data;
+    }
     Ok(Output { data, human, exit: 0, raw: false })
+}
+
+/// The demote reason for `id` on the records after its last restoration, or `None` when it stays. A
+/// restored lesson starts again, so its old bad reports do not archive it. A lesson that is already
+/// a tombstone is left alone.
+fn demote_reason(env: &Env, id: &str) -> Result<Option<String>, CliError> {
+    let counts = usage::counts_since_restore(&env.root, id);
+    let Some(why) = rkb_core::tier::demote(&counts) else { return Ok(None) };
+    let (lesson, _) = kb::find(&env.root, id)?;
+    Ok(lesson.frontmatter.status.is_current().then(|| format!("demoted: {why}")))
 }
 
 pub fn log(env: &Env, id: String) -> Result<Output, CliError> {

@@ -57,6 +57,7 @@ fn run_tool(name: &str, args: &Value) -> Result<Output, CliError> {
             regex: None,
             all: args["all"].as_bool().unwrap_or(false),
             status: None,
+            tier: args["tier"].as_str().map(String::from),
             limit: args["limit"].as_u64().map_or(10, |n| n as usize),
             rerank: None,
             no_model: false,

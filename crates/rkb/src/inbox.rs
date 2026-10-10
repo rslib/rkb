@@ -135,7 +135,8 @@ fn novelty(env: &Env, item: &Item, text: &str) -> Option<(String, f32)> {
     if crate::rerankers::item_jev_guard(&env.root, project.as_deref()).is_err() {
         settings.chain.retain(|b| b != "jev");
     }
-    let opts = Options { all: false, every_status: false, limit: settings.top.max(1), probes: search::ProbeMode::Cached };
+    // `every_status` so a tombstone matches too: the same claim is not added again.
+    let opts = Options { all: false, every_status: true, limit: settings.top.max(1), probes: search::ProbeMode::Cached, tier: None };
     let query: String = text.chars().take(1000).collect();
     let mut found = search::search(&env.root, &place, &facts, &Mode::Ranked(query.clone()), &opts).ok()?;
     let timeout = std::time::Duration::from_millis(settings.timeout_ms);

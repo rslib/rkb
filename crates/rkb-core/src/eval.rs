@@ -371,7 +371,7 @@ pub fn run(root: &Path, queries: &[Query], depth: usize, rerank: &mut dyn FnMut(
             &place,
             &facts,
             &mode,
-            &Options { all: false, every_status: false, limit: DEPTH.max(depth), probes: crate::search::ProbeMode::Off },
+            &Options { all: false, every_status: false, limit: DEPTH.max(depth), probes: crate::search::ProbeMode::Off, tier: None },
         )?;
         if let Mode::Ranked(text) = &mode {
             rerank(text, &mut res)?;

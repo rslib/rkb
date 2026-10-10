@@ -92,6 +92,9 @@ pub fn run(root: &Path, place: &Place, state_dir: &Path, config_dir: &Path, env:
     });
     if kb_ok {
         kb_checks(root, place, state_dir, env, &mut out);
+        if let Some(c) = tier_check(root) {
+            out.push(c);
+        }
     }
     out.push(trust_check(config_dir));
     out.push(observer_check(config_dir, state_dir));
@@ -107,6 +110,23 @@ pub fn run(root: &Path, place: &Place, state_dir: &Path, config_dir: &Path, env:
     out.extend(hook_checks(&home, state_dir));
     out.extend(permission_check(&home));
     out
+}
+
+/// The count of lessons in each memory tier, so the growth of the store and the size of the proven
+/// set are visible. Reads only.
+pub fn tier_check(root: &Path) -> Option<Check> {
+    let snap = kb::Snapshot::from_dir(root).ok()?;
+    let (lessons, _) = snap.lessons();
+    let counts = crate::usage::counts(root);
+    let mut n = [0usize; 3];
+    for l in &lessons {
+        match crate::tier::of(l.frontmatter.status, counts.get(&l.frontmatter.id)) {
+            crate::tier::Tier::Candidate => n[0] += 1,
+            crate::tier::Tier::Proven => n[1] += 1,
+            crate::tier::Tier::Archive => n[2] += 1,
+        }
+    }
+    Some(check("tiers", Level::Ok, format!("{} candidate, {} proven, {} archive", n[0], n[1], n[2]), None))
 }
 
 /// A warning when Claude Code's default permission mode never shows the `rkb confirm` question to a person.
@@ -530,6 +550,39 @@ pub fn break_lock(path: &str, holder: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tier_check_reports_the_three_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |i: usize, status: &str| {
+            let id = format!("{i:010x}");
+            let p = root.join(format!("general/a/{i}.md"));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let text = format!(
+                "---\nschema: 1\nid: {id}\ntype: fact\nstatus: {status}\nverified: 2026-09-25\nverified_how: ran\n---\n\n# T\n\n## Statement\nX.\n\n## Evidence\nSeen.\n"
+            );
+            std::fs::write(p, text).unwrap();
+        };
+        for i in 0..600 {
+            write(i, "active");
+        }
+        for i in 600..715 {
+            write(i, "active");
+        }
+        for i in 715..730 {
+            write(i, "archived");
+        }
+        let usage = root.join(crate::usage::DIR);
+        std::fs::create_dir_all(&usage).unwrap();
+        let lines: String = (600..715)
+            .map(|i| serde_json::to_string(&crate::usage::now(&format!("{i:010x}"), "worked", None, None)).unwrap() + "\n")
+            .collect();
+        std::fs::write(usage.join("m-0000.jsonl"), lines).unwrap();
+        let c = tier_check(root).unwrap();
+        assert_eq!(c.name, "tiers");
+        assert_eq!(c.detail, "600 candidate, 115 proven, 15 archive");
+    }
 
     #[test]
     fn triage_check_warns_on_a_wide_band() {

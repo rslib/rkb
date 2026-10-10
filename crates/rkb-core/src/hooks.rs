@@ -350,7 +350,8 @@ impl Strength {
 
 /// The lesson the failed-command hook adds for these ranked hits, if any: the top hit, unless it does
 /// not apply here or is not strong enough. `text_of` reads a lesson's text for the coverage rule. The
-/// hook and `rkb eval --replay` both decide here, so they cannot drift.
+/// hook and `rkb eval --replay` both decide the strength here, so they cannot drift; the caller then
+/// applies the tier rule with `may_push`, which also limits a candidate to one explore push per session.
 pub fn would_inject<'a>(hits: &'a [Hit], text_of: impl FnOnce(&str) -> String, error: &str, t: &Strength) -> Option<&'a Hit> {
     // A stale lesson (flagged, often after it failed) is never pushed into a session unasked.
     let top = hits.first().filter(|h| h.applies != Verdict::No && h.status == crate::lesson::Status::Active)?;
@@ -361,6 +362,21 @@ pub fn would_inject<'a>(hits: &'a [Hit], text_of: impl FnOnce(&str) -> String, e
         strong_enough(top.relevance, next, || coverage(error, &text_of(&top.id)), t)
     };
     strong.then_some(top)
+}
+
+/// Whether a hook may push this hit: a `proven` lesson, or the session's one explore candidate.
+/// Returns `Some(explore)` when it may push, `None` when it may not. A tombstone is never pushed.
+pub fn may_push(hit: &Hit, explore_used: bool) -> Option<bool> {
+    match hit.tier {
+        crate::tier::Tier::Proven => Some(false),
+        crate::tier::Tier::Candidate if !explore_used => Some(true),
+        _ => None,
+    }
+}
+
+/// Whether this session already used its one explore push, from the session records.
+pub fn explore_used(state: &Path, session: &str) -> bool {
+    read(state, session).iter().any(|r| r["kind"] == "injected" && r["explore"] == true)
 }
 
 pub const REPLAYS: &str = "replays.jsonl";
@@ -885,6 +901,7 @@ mod tests {
             relevance: None,
             verified: "2026-09-25".into(),
             verified_how: "ran".into(),
+            tier: crate::tier::Tier::Candidate,
         };
         let hits: Vec<_> = ["a", "b", "c", "d", "e", "f"].iter().map(|i| hit(i)).collect();
         let ranked = crate::rerank::Ranked { backend: "bm25".into(), scores: None, order: None, skipped: vec![] };
@@ -892,5 +909,38 @@ mod tests {
         let text = std::fs::read_to_string(state.join(RANKINGS)).unwrap();
         assert!(text.contains("\"ids\":[\"a\",\"b\",\"c\",\"d\",\"e\"]"), "{text}");
         assert!(!text.contains("\"query\""), "{text}");
+    }
+
+    #[test]
+    fn only_proven_pushes_and_one_explore_candidate() {
+        let hit = |tier| crate::search::Hit {
+            id: "a".into(),
+            kind: crate::lesson::LessonType::Fact,
+            title: "t".into(),
+            path: "general/a.md".into(),
+            status: crate::lesson::Status::Active,
+            applies: crate::conditions::Verdict::Yes,
+            summary: "s".into(),
+            score: 1.0,
+            line: None,
+            relevance: None,
+            verified: "2026-09-25".into(),
+            verified_how: "ran".into(),
+            tier,
+        };
+        assert_eq!(may_push(&hit(crate::tier::Tier::Proven), false), Some(false), "a proven lesson is pushed");
+        assert_eq!(may_push(&hit(crate::tier::Tier::Proven), true), Some(false), "explore does not block a proven push");
+        assert_eq!(may_push(&hit(crate::tier::Tier::Candidate), false), Some(true), "the first candidate is an explore push");
+        assert_eq!(may_push(&hit(crate::tier::Tier::Candidate), true), None, "no second explore push in one session");
+        assert_eq!(may_push(&hit(crate::tier::Tier::Archive), false), None, "a tombstone is never pushed");
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = dir.path();
+        assert!(!explore_used(s, "s1"));
+        append(s, "s1", &serde_json::json!({ "kind": "injected", "id": "a", "explore": true })).unwrap();
+        assert!(explore_used(s, "s1"));
+        assert!(!explore_used(s, "s2"), "another session has its own explore slot");
+        append(s, "s2", &serde_json::json!({ "kind": "injected", "id": "b", "explore": false })).unwrap();
+        assert!(!explore_used(s, "s2"), "a proven push does not use the slot");
     }
 }

@@ -13,6 +13,7 @@ mod searching;
 mod session;
 mod setup;
 mod site;
+mod tier;
 mod writes;
 
 use std::process::ExitCode;
@@ -98,6 +99,9 @@ enum Cmd {
         /// `all` also shows superseded and archived lessons.
         #[arg(long, value_parser = ["all"])]
         status: Option<String>,
+        /// Show only lessons of this tier: candidate, proven or archive.
+        #[arg(long, value_parser = ["candidate", "proven", "archive"])]
+        tier: Option<String>,
         #[arg(long, default_value_t = 10)]
         limit: usize,
         /// Rerank with this backend for this call instead of the chain in kb.toml: jev, bm25-bert or bm25.
@@ -262,6 +266,9 @@ enum Cmd {
         #[arg(long)]
         reason: String,
     },
+    /// Show the count of lessons in each memory tier and the proven lessons by helpful count. Changes nothing.
+    #[command(after_help = "Example:\n  rkb tier\n  rkb tier --toon")]
+    Tier,
     /// List lessons that may no longer matter (retired place, unsupported versions, long stale, missing commit). Changes nothing.
     #[command(after_help = "Example:\n  rkb review\n  rkb review systems/quartz")]
     Review {
@@ -740,7 +747,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         return Ok(session::status(&env, &s));
     };
     match cmd {
-        Cmd::Search { query, literal, regex, all, status, limit, rerank, no_model } => {
+        Cmd::Search { query, literal, regex, all, status, limit, rerank, no_model, tier } => {
             kb::open(&root)?;
             let mode = match (query, literal, regex) {
                 (_, Some(t), _) => rkb_core::search::Mode::Literal(t),
@@ -750,7 +757,10 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             };
             rkb_core::facts::refresh(&root, &env.place.clone().unwrap_or_default());
             let facts = rkb_core::conditions::Facts::gather(&root, &env.place.clone().unwrap_or_default(), with);
-            let opts = rkb_core::search::Options { all, every_status: status.is_some(), limit, probes: rkb_core::search::ProbeMode::Run };
+            let tier = tier.as_deref().and_then(rkb_core::tier::Tier::from_name);
+            // `--tier archive` reads the tombstones without `--status all`.
+            let every_status = status.is_some() || tier == Some(rkb_core::tier::Tier::Archive);
+            let opts = rkb_core::search::Options { all, every_status, limit, probes: rkb_core::search::ProbeMode::Run, tier };
             let only = if no_model { Some(rkb_core::rerank::BM25.to_string()) } else { rerank };
             searching::search(&env, &facts, mode, opts, only.as_deref())
         }
@@ -803,6 +813,10 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Add { topic, kind, template, text, assets, from_inbox } => writes::add(&env, topic, kind, template, text, assets, from_inbox),
         Cmd::Edit { id, base, assets, text } => writes::edit(&env, id, base, assets, text),
         Cmd::Flag { id, reason } => writes::flag(&env, id, reason),
+        Cmd::Tier => {
+            kb::open(&root)?;
+            tier::tier(&env)
+        }
         Cmd::Review { folder, signals } => {
             kb::open(&root)?;
             if signals {

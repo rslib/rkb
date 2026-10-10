@@ -17,7 +17,7 @@ pub const DIR: &str = ".rkb/usage";
 pub struct Record {
     pub time: String,
     pub id: String,
-    /// `worked`, `failed`, `irrelevant`, `injected` or `inferred`. Records written before the knowledge-base store
+    /// `worked`, `failed`, `irrelevant`, `injected`, `inferred` or `restored`. Records written before the knowledge-base store
     /// called it `result`.
     #[serde(alias = "result")]
     pub event: String,
@@ -34,7 +34,7 @@ pub struct Counts {
     pub failed: u32,
     pub injected: u32,
     pub inferred: u32,
-    /// Offered for a problem it did not fit. Never part of the ranking factor: fit depends on the query.
+    /// Offered for a problem it did not fit. Harmful, so it lowers the ranking factor a little.
     pub irrelevant: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_worked: Option<String>,
@@ -47,11 +47,23 @@ pub struct Counts {
 }
 
 impl Counts {
-    /// The ranking factor: a little up for lessons that worked, a little down for ones that failed,
+    /// The helpful count: each `worked` is 1, each `inferred` is 0.5. An inference is weaker
+    /// evidence than a report, so it counts for less.
+    pub fn helpful(&self) -> f64 {
+        f64::from(self.worked) + 0.5 * f64::from(self.inferred)
+    }
+
+    /// The harmful count: each `failed` and each `irrelevant` is 1. Both say the lesson did not
+    /// help where it was offered.
+    pub fn harmful(&self) -> f64 {
+        f64::from(self.failed) + f64::from(self.irrelevant)
+    }
+
+    /// The ranking factor: a little up for lessons that helped, a little down for ones that harmed,
     /// never outside 0.9–1.1, so usage reorders close results but never hides a lesson.
     pub fn factor(&self) -> f64 {
-        let up = 0.05 * (1.0 + f64::from(self.worked) + 0.5 * f64::from(self.inferred)).ln();
-        let down = 0.1 * f64::from(self.failed.min(3)) / 3.0;
+        let up = 0.05 * (1.0 + self.helpful()).ln();
+        let down = 0.1 * self.harmful().min(3.0) / 3.0;
         (1.0 + up - down).clamp(0.9, 1.1)
     }
 }
@@ -149,26 +161,47 @@ pub fn records(root: &Path) -> Vec<Record> {
 pub fn counts(root: &Path) -> BTreeMap<String, Counts> {
     let mut out: BTreeMap<String, Counts> = BTreeMap::new();
     for r in records(root) {
-        let c = out.entry(r.id.clone()).or_default();
-        let date = r.time.get(..10).unwrap_or(&r.time).to_string();
-        match r.event.as_str() {
-            "worked" => {
-                c.worked += 1;
-                c.last_worked = max(c.last_worked.take(), &date);
-            }
-            "failed" => {
-                c.failed += 1;
-                c.last_failed = max(c.last_failed.take(), &date);
-            }
-            "injected" => {
-                c.injected += 1;
-                c.last_injected = max(c.last_injected.take(), &date);
-            }
-            "inferred" => c.inferred += 1,
-            "irrelevant" => c.irrelevant += 1,
-            _ => continue,
+        add(out.entry(r.id.clone()).or_default(), &r);
+    }
+    out
+}
+
+/// Adds one record to a lesson's counts.
+fn add(c: &mut Counts, r: &Record) {
+    let date = r.time.get(..10).unwrap_or(&r.time).to_string();
+    match r.event.as_str() {
+        "worked" => {
+            c.worked += 1;
+            c.last_worked = max(c.last_worked.take(), &date);
         }
-        c.last_any = max(c.last_any.take(), &date);
+        "failed" => {
+            c.failed += 1;
+            c.last_failed = max(c.last_failed.take(), &date);
+        }
+        "injected" => {
+            c.injected += 1;
+            c.last_injected = max(c.last_injected.take(), &date);
+        }
+        "inferred" => c.inferred += 1,
+        "irrelevant" => c.irrelevant += 1,
+        // A restoration carries no signal of its own, but it is a use event for the dates.
+        "restored" => {}
+        _ => return,
+    }
+    c.last_any = max(c.last_any.take(), &date);
+}
+
+/// The counts for one lesson from the records after its last `restored` record. A restoration starts
+/// the counts again, so a lesson that was restored is not demoted for its old bad reports.
+pub fn counts_since_restore(root: &Path, id: &str) -> Counts {
+    let records = records(root);
+    let last = records.iter().filter(|r| r.id == id && r.event == "restored").map(|r| r.time.as_str()).max();
+    let mut out = Counts::default();
+    for r in records.iter().filter(|r| r.id == id) {
+        if last.is_some_and(|t| r.time.as_str() <= t) {
+            continue;
+        }
+        add(&mut out, r);
     }
     out
 }
@@ -251,7 +284,43 @@ mod tests {
         assert!(Counts { worked: 3, ..Default::default() }.factor() > 1.0);
         assert!((Counts { worked: 10_000, ..Default::default() }.factor() - 1.1).abs() < 1e-9);
         assert!((Counts { failed: 9, ..Default::default() }.factor() - 0.9).abs() < 1e-9);
+        // `irrelevant` is harmful too, so it lowers the factor like `failed` does.
         let worked = Counts { worked: 2, ..Default::default() };
-        assert_eq!(Counts { irrelevant: 7, ..worked.clone() }.factor(), worked.factor());
+        assert!(Counts { irrelevant: 7, ..worked.clone() }.factor() < worked.factor());
+        assert!((Counts { irrelevant: 7, ..worked.clone() }.factor() - 0.955).abs() < 0.005);
+        let one = Counts { irrelevant: 1, ..worked }.factor();
+        assert!((0.9..=1.1).contains(&one) && one > 0.9, "{one}");
+    }
+
+    #[test]
+    fn helpful_and_harmful_counts() {
+        let c = Counts { worked: 2, inferred: 2, failed: 1, irrelevant: 1, ..Default::default() };
+        assert!((c.helpful() - 3.0).abs() < 1e-9);
+        assert!((c.harmful() - 2.0).abs() < 1e-9);
+        assert_eq!(Counts::default().helpful(), 0.0);
+    }
+
+    #[test]
+    fn a_restoration_restarts_the_counts() {
+        let kb = tempfile::tempdir().unwrap();
+        let dir = kb.path().join(DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = |event: &str, time: &str| Record { time: time.into(), id: "a".into(), event: event.into(), session: None, reason: None };
+        let lines: String = [
+            rec("worked", "2026-10-01T00:00:00Z"),
+            rec("irrelevant", "2026-10-02T00:00:00Z"),
+            rec("irrelevant", "2026-10-03T00:00:00Z"),
+            rec("restored", "2026-10-04T00:00:00Z"),
+            rec("worked", "2026-10-05T00:00:00Z"),
+        ]
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap() + "\n")
+        .collect();
+        std::fs::write(dir.join("m-0000.jsonl"), lines).unwrap();
+        let all = &counts(kb.path())["a"];
+        assert_eq!((all.worked, all.irrelevant), (2, 2));
+        let since = counts_since_restore(kb.path(), "a");
+        assert_eq!((since.worked, since.irrelevant), (1, 0), "only the record after the restoration counts");
+        assert_eq!(counts_since_restore(kb.path(), "b"), Counts::default(), "a lesson with no record is empty");
     }
 }
