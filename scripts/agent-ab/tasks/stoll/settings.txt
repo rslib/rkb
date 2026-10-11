@@ -1,2 +1,0 @@
-timeout_s=1.5
-limit=-5

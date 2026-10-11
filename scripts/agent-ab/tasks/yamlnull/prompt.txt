@@ -1,1 +1,0 @@
-`python3 greet.py` crashes. It must print one line `Hello, <name>` for each name in users.yaml, in order. Fix it so it works for these names and any other list of plain names.
