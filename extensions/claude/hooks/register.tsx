@@ -103,7 +103,6 @@ export function statusLine(s: Status | null): string | undefined {
   if (!s) return undefined
   const parts: string[] = []
   if (s.inbox > 0) parts.push(`${s.inbox} inbox (${s.high} high)`)
-  if (s.curate > 0) parts.push(`${s.curate} curate`)
   if (s.requests.length > 0) parts.push(plural(s.requests.length, 'request'))
   return parts.length === 0 ? undefined : parts.join(DOT)
 }
@@ -115,7 +114,6 @@ async function refresh($: EngineInterface, session: Session): Promise<void> {
   const s: Status = {
     inbox: d.inbox?.total ?? 0,
     high: d.inbox?.priority?.['3'] ?? 0,
-    curate: d.curate ?? 0,
     requests: (d.requests ?? []).map((q: Json): Request => ({ id: q.id, question: q.question, options: q.options ?? [] })),
   }
   await update($, status, () => s)
@@ -203,15 +201,6 @@ async function answer($: EngineInterface, session: Session, q: Request): Promise
 async function used($: EngineInterface, session: Session | undefined, id: string, result: 'worked' | 'irrelevant'): Promise<void> {
   const r = await rkb($, ['used', `--${result}`, id, ...(session ? ['--session', session.id] : [])], { cwd: session?.cwd })
   await say($, r.ok ? 'ok' : 'fail', r.ok ? `Recorded ${id} as ${result}.` : (r.data?.error?.message ?? 'rkb used failed'))
-}
-
-/**
- * Queues one of the plugin's commands (`/rkb:distill` and so on) as if the person typed it. It runs as a
- * turn once the session is idle, so the button does not wait for it.
- */
-async function runCommand($: EngineInterface, name: 'distill' | 'curate' | 'retro'): Promise<void> {
-  await say($, 'busy', `Queued /rkb:${name}; it runs as a turn when the session is idle.`)
-  void $.command.run({ command: `rkb:${name}` }).catch(() => say($, 'fail', `Claude Code did not run /rkb:${name}.`))
 }
 
 /** Runs triage on the inbox and redraws it with the verdicts; triage changes no lesson. */
@@ -491,8 +480,6 @@ export const register: Register = on => {
           <Text dimColor>
             {s.inbox} inbox{DOT}
             <Text color={s.high > 0 ? 'red' : undefined}>{s.high} high</Text>
-            {DOT}
-            {s.curate} curate
           </Text>
         )}
       </Box>
@@ -630,14 +617,11 @@ export const register: Register = on => {
       const actions = (
         <Box key="actions" gap={3} marginBottom={1}>
           {button('triage', 'Triage', hot('g'), () => triageNow($, live.session?.cwd), rows.some(row => !row.verdicts))}
-          {button('distill', 'Distill', hot('d'), () => runCommand($, 'distill'), rows.length > 0)}
-          {button('curate', `Curate ${s?.curate ?? 0}`, hot('c'), () => runCommand($, 'curate'), (s?.curate ?? 0) > 0)}
-          {button('retro', 'Retro', hot('t'), () => runCommand($, 'retro'))}
         </Box>
       )
       const list =
         rows.length === 0 ? (
-          empty('The inbox is empty.', 'Notes and session extracts wait here until distill turns them into lessons.')
+          empty('The inbox is empty.', 'Notes and session extracts wait here until they are promoted to lessons.')
         ) : (
           <Box flexDirection="column" gap={1}>
             {[3, 2, 1].map(p => {

@@ -9,7 +9,7 @@ const STOP = { session_id: 's1', transcript_path: '/t/s1.jsonl', cwd: '/work/dem
 const REQUEST = { id: 'r-4f2a9c', question: 'Add this lesson although it is close to 2b81d05e77?', options: ['add anyway', 'cancel'] }
 
 function statusOf(over: Json = {}): Json {
-  return { inbox: { total: 31, priority: { '1': 20, '2': 2, '3': 9 } }, curate: 11, requests: [REQUEST], injected: [], ...over }
+  return { inbox: { total: 31, priority: { '1': 20, '2': 2, '3': 9 } }, requests: [REQUEST], injected: [], ...over }
 }
 
 /** A fake rkb: answers each subcommand from `replies`, records every call. */
@@ -59,14 +59,14 @@ test('status line shows waiting work', async ($, on) => {
   const calls: Call[] = []
   fakeRkb(on, { status: statusOf(), 'job prepare': { job: null, skipped: 'not approved' } }, calls)
   await stop($, clock)
-  expect(seen.statuses.at(-1)).toBe('31 inbox (9 high) \u00b7 11 curate \u00b7 1 request')
+  expect(seen.statuses.at(-1)).toBe('31 inbox (9 high) \u00b7 1 request')
   expect(calls.find(c => c.args[0] === 'status')?.args).toEqual(['status', '--session', 's1', '--format', 'json'])
 })
 
 test('status line is empty when nothing waits', async ($, on) => {
   const clock = mock.clock(on)
   const seen = world(on)
-  fakeRkb(on, { status: statusOf({ inbox: { total: 0, priority: {} }, curate: 0, requests: [] }), 'job prepare': { job: null } }, [])
+  fakeRkb(on, { status: statusOf({ inbox: { total: 0, priority: {} }, requests: [] }), 'job prepare': { job: null } }, [])
   await stop($, clock)
   expect(seen.statuses.at(-1)).toBe(undefined)
 })
@@ -310,25 +310,6 @@ test('search is allowed and edit still asks', async ($, on) => {
   expect((await $.tool.check({ tool: 'mcp__rkb__search', input: {} })).decision).toBe('allow')
   expect((await $.tool.check({ tool: 'mcp__rkb__edit', input: {} })).decision).toBe('ask')
 })
-
-test('the inbox actions queue the plugin commands', async ($, on) => {
-  const clock = mock.clock(on)
-  world(on)
-  const ran: string[] = []
-  on('command.run', (_$, e) => {
-    ran.push(e.command)
-    return {}
-  })
-  fakeRkb(on, { status: statusOf(), 'job prepare': { job: null }, inbox: { items: [] } }, [])
-  await stop($, clock)
-  const ui = await pane($)
-  await ui.press({ key: 'view-inbox' })
-  for (const key of ['distill', 'curate', 'retro']) await ui.press({ key })
-  await clock.settle()
-  expect(ran).toEqual(['rkb:distill', 'rkb:curate', 'rkb:retro'])
-  expect((await ui.find({ key: 'notice' }))?.text).toContain('Queued /rkb:retro')
-})
-
 
 for (const surface of ['terminal', 'desktop'] as const) {
   test(`the inbox shows verdicts and triages from the pane (${surface})`, async ($, on) => {

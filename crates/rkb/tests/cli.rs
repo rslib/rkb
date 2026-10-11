@@ -1813,21 +1813,6 @@ fn dupes_hide_pairs_rated_different_unless_all() {
 }
 
 #[test]
-fn dupes_hide_pairs_from_the_curate_count() {
-    let (env, url, _) = dupes_jev("different");
-    let count = |env: &Env| {
-        let _ = std::fs::remove_file(env.dir.path().join("state/rkb/curate.json"));
-        let (v, _) = env.json(&["status"], "");
-        assert!(env.dir.path().join("state/rkb/curate.json").exists(), "status refreshes the daily curate cache");
-        v["curate"].as_u64().unwrap()
-    };
-    let before = count(&env);
-    dupes_run(&env, &url, &["dupes", "--check"]);
-    assert!(!env.dir.path().join("state/rkb/curate.json").exists(), "--check drops the cached count");
-    assert_eq!(count(&env) + 1, before);
-}
-
-#[test]
 fn add_names_a_similar_lesson_in_another_folder() {
     let env = search_kb();
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2187,7 +2172,7 @@ fn install_from_an_agent_needs_the_user() {
     assert!(std::fs::read_to_string(home.join("config/rkb/trust.toml")).unwrap().contains("gated = true"));
     assert_eq!(settings["permissions"]["allow"].as_array().unwrap().len(), 4, "the plugin tools are allowed");
     let message = v["message"].as_str().unwrap();
-    assert!(message.contains("Restart Claude Code") && !message.contains("rkb-retro.md"), "{message}");
+    assert!(message.contains("Restart Claude Code"), "{message}");
     let (v, _) = env.json(&["install", "--list"], "");
     assert_eq!((v["harnesses"][0]["current"].as_bool(), v["harnesses"][1]["current"].as_bool()), (Some(true), Some(true)), "{v}");
 
@@ -2284,7 +2269,7 @@ fn session_end_saves_an_extract_only_after_a_signal() {
 }
 
 #[test]
-fn session_start_names_no_inbox_or_curate_count() {
+fn session_start_names_no_inbox_count() {
     let env = search_kb();
     let start =
         |env: &Env| hook(env, "session-start", &serde_json::json!({ "session_id": "s", "cwd": env.dir.path(), "source": "startup" }));
@@ -2293,16 +2278,13 @@ fn session_start_names_no_inbox_or_curate_count() {
     }
     let text = start(&env);
     assert!(text.contains("rkb: ") && text.contains("rkb search \"<words>\" --toon"), "the context lines: {text}");
-    assert!(
-        !text.contains("inbox") && !text.contains("/rkb:distill") && !text.contains("/rkb:curate"),
-        "a full inbox adds no work nudge: {text}"
-    );
+    assert!(!text.contains("inbox"), "a full inbox adds no work nudge: {text}");
     let o = env.rkb_in(
         &["hook", "session-start", "--harness", "pi"],
         &serde_json::json!({ "session_id": "p", "cwd": env.dir.path() }).to_string(),
     );
     let pi = String::from_utf8_lossy(&o.stdout);
-    assert!(!pi.contains("inbox") && !pi.contains("/rkb-distill") && !pi.contains("/rkb-curate"), "pi too: {pi}");
+    assert!(!pi.contains("inbox"), "pi too: {pi}");
     let (v, _) = env.json(&["status"], "");
     assert_eq!(v["inbox"]["total"], 5, "the count stays in rkb status: {v}");
 }
@@ -2405,19 +2387,6 @@ fn hook_never_fails() {
     assert_eq!(hook(&env, "session-start", &serde_json::json!({ "session_id": "s", "cwd": env.dir.path() })), "");
     assert_eq!(hook(&env, "no-such-event", &serde_json::json!({})), "");
     assert!(env.dir.path().join("state/rkb/heartbeat/claude-code").exists());
-}
-
-#[test]
-fn status_reports_the_curate_count_not_the_session_start() {
-    let env = search_kb();
-    let start = || hook(&env, "session-start", &serde_json::json!({ "session_id": "s", "source": "startup", "cwd": env.kb() }));
-    assert!(!start().contains("curate"), "session start names no curate count");
-    let (v, _) = env.json(&["status"], "");
-    assert_eq!(v["curate"], 10, "10 vague Evidence sections, reported by status: {v}");
-    let cache = env.dir.path().join("state/rkb/curate.json");
-    std::fs::write(&cache, std::fs::read_to_string(&cache).unwrap().replace("\"count\":10", "\"count\":4")).unwrap();
-    let (v, _) = env.json(&["status"], "");
-    assert_eq!(v["curate"], 4, "the cache is read once a day: {v}");
 }
 
 #[test]
@@ -4443,7 +4412,7 @@ fn tree(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
         let p = e.path();
         if p.is_dir() {
             out.extend(tree(&p));
-        } else if p.file_name().is_some_and(|n| n != "curate.json") {
+        } else {
             out.push((p.clone(), std::fs::read(&p).unwrap()));
         }
     }
@@ -4856,17 +4825,17 @@ fn inbox_done_records_outcomes_for_triage() {
 }
 
 #[test]
-fn session_start_leaves_the_inbox_and_curate_to_status() {
+fn session_start_leaves_the_inbox_to_status() {
     let env = search_kb();
     for i in 0..5 {
         inbox_item(&env, &format!("00000000d{i}"), "note", &[], "a note to distill");
     }
     let payload = serde_json::json!({ "session_id": "s1", "source": "startup", "cwd": env.kb() });
     let out = hook(&env, "session-start", &payload);
-    assert!(!out.contains("inbox") && !out.contains("/rkb:distill") && !out.contains("/rkb:curate") && out.contains("rkb search"), "{out}");
+    assert!(!out.contains("inbox") && out.contains("rkb search"), "{out}");
     let o = env.rkb_in(&["hook", "session-start", "--harness", "pi"], &payload.to_string());
     let pi = stdout(&o);
-    assert!(!pi.contains("inbox") && !pi.contains("/rkb-distill") && !pi.contains("/rkb-curate"), "pi too: {pi}");
+    assert!(!pi.contains("inbox"), "pi too: {pi}");
     let (v, _) = env.json(&["status"], "");
     assert_eq!(v["inbox"]["total"], 5, "status still shows the inbox: {v}");
 }

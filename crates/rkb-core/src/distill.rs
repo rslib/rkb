@@ -631,21 +631,6 @@ pub fn digest(steps: &[Step]) -> Digest {
     Digest { parts, prompts }
 }
 
-/// The session-start line, only when the inbox holds at least 5 items or its oldest is over 7 days old.
-pub fn nudge(state: &Path, now: u64, command: &str, batch: usize) -> Option<String> {
-    let items = list(state);
-    let oldest = items.iter().map(|i| i.meta.time).min()?;
-    let days = now.saturating_sub(oldest) / 86400;
-    let urgent = items.iter().filter(|i| i.meta.priority() == 3).count();
-    (items.len() >= 5 || days > 7 || urgent > 0).then(|| {
-        let high = if urgent > 0 { format!(" ({urgent} of high priority)") } else { String::new() };
-        format!(
-            "rkb inbox: {} items wait{high}, the oldest {days} days old. At a natural pause in the work, run {command} for up to {batch} of them, without waiting for the user.",
-            items.len()
-        )
-    })
-}
-
 /// Session-state signals that make a session worth an extract.
 const CAPTURE_SIGNALS: [&str; 3] = ["fixed", "correction", "remember"];
 
@@ -850,14 +835,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn priority_order_nudge_and_collapse() {
+    fn priority_order_and_collapse() {
         let dir = tempfile::tempdir().unwrap();
         let old = add(dir.path(), note(100), "old low").unwrap();
         let high = add(dir.path(), Meta { priority: Some(3), ..note(200) }, "new high").unwrap();
         let ids: Vec<String> = list(dir.path()).into_iter().map(|i| i.id).collect();
         assert_eq!(ids, [high.id.clone(), old.id.clone()], "priority first, then oldest");
-        let line = nudge(dir.path(), 300, "/rkb:distill", 5).expect("a high-priority item is enough");
-        assert!(line.contains("1 of high priority") && line.contains("without waiting for the user"), "{line}");
 
         let steps = vec![Step::Command {
             command: "cc a.c".into(),
@@ -1132,18 +1115,6 @@ mod tests {
         let huge = digest(&[Step::Text("y".repeat(DIGEST_PART * 2))]);
         assert_eq!(huge.parts.len(), 1);
         assert!(huge.parts[0].chars().count() < DIGEST_PART);
-    }
-
-    #[test]
-    fn nudge_on_count_or_age() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = dir.path();
-        let day = 86400;
-        assert_eq!(nudge(s, 100 * day, "/rkb-distill", 5), None);
-        add(s, note(90 * day), "old").unwrap();
-        assert!(nudge(s, 97 * day, "/rkb-distill", 5).is_none(), "7 days is not yet old");
-        assert!(nudge(s, 98 * day, "/rkb-distill", 5).unwrap().contains("the oldest 8 days old"));
-        assert!(nudge(s, 98 * day, "/rkb-distill", 5).unwrap().contains("for up to 5 of them"));
     }
 
     #[test]

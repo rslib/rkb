@@ -9,27 +9,21 @@ pub const SKILL: &str = include_str!("../../../skills/rkb/SKILL.md");
 /// The Claude Code mod and its state contract, with `"__RKB__"` where the rkb binary goes.
 const MOD: &str = include_str!("../../../extensions/claude/hooks/register.tsx");
 const MOD_TYPES: &str = include_str!("../../../extensions/claude/types/index.d.ts");
-/// The `/rkb-retro` and `/rkb-curate` command prompts: file name and text with frontmatter.
-pub const COMMANDS: [(&str, &str); 2] = [
-    ("rkb-retro.md", include_str!("../../../skills/rkb/commands/rkb-retro.md")),
-    ("rkb-curate.md", include_str!("../../../skills/rkb/commands/rkb-curate.md")),
-];
-/// The steps of the curate agent. The command hands the work to this agent and falls back to the
-/// same steps where no agent can run.
-pub const AGENT_STEPS: [(&str, &str); 1] = [("curate", include_str!("../../../skills/rkb/agents/curate.md"))];
-
-/// The steps of agent `name`.
-pub fn agent_steps(name: &str) -> String {
-    AGENT_STEPS.iter().find(|(n, _)| *n == name).map_or("", |(_, t)| t).trim_end().to_string()
-}
-
-/// The line in every command file rkb writes; uninstall removes only files that have it.
+/// The line in every command and agent file an earlier rkb wrote; install and uninstall remove only files that have it.
 const COMMAND_MARKER: &str = "\ngenerated-by: rkb install";
 
-/// A command prompt without its frontmatter, as a harness sends it to the model.
-pub fn command_body(text: &str) -> &str {
-    text.strip_prefix("---\n").and_then(|t| t.split_once("\n---\n")).map_or(text, |(_, body)| body.trim_start())
-}
+/// The commands an earlier rkb wrote as `rkb-<name>.md` into `~/.claude/commands`.
+const LEGACY_COMMANDS: [&str; 2] = ["retro", "curate"];
+/// The agents an earlier rkb wrote as `rkb-<name>.md` into `<harness home>/agent/agents` for pi and omp.
+const LEGACY_AGENTS: [&str; 2] = ["curate", "distill"];
+/// The plugin files an earlier rkb wrote and this version no longer ships, relative to `plugin_dir`.
+const LEGACY_PLUGIN_FILES: [&str; 5] = [
+    "plugins/rkb/commands/retro.md",
+    "plugins/rkb/commands/curate.md",
+    "plugins/rkb/commands/distill.md",
+    "plugins/rkb/agents/curate.md",
+    "plugins/rkb/agents/distill.md",
+];
 
 /// The Claude Code permission rule that asks the user before `rkb confirm`.
 pub const ASK_RULE: &str = "Bash(rkb confirm:*)";
@@ -59,57 +53,6 @@ pub fn claude_program() -> String {
     std::env::var("RKB_CLAUDE").unwrap_or_else(|_| "claude".into())
 }
 
-/// The Claude Code model for the curate agent: `claude-code` under `[distill]` in this machine's
-/// `config.toml`, when it is a plain model name. Unit tests never read the user's file.
-pub fn distill_model() -> Option<String> {
-    distill_model_for("claude-code")
-}
-
-/// `[distill] <harness>` in this machine's `config.toml`, when it is a plain model name.
-fn distill_model_for(harness: &str) -> Option<String> {
-    if cfg!(test) {
-        return None;
-    }
-    let (_, t) = crate::config::machine(&crate::paths::config_dir()).ok()?;
-    let m = t.get("distill")?.get(harness)?.as_str()?.trim().to_string();
-    (!m.is_empty() && m.chars().all(|c| c.is_ascii_alphanumeric() || "._:/-[]".contains(c))).then_some(m)
-}
-
-/// What each agent does, for the harness's agent list.
-const AGENT_ABOUT: [(&str, &str); 1] = [(
-    "curate",
-    "Merges near-duplicate rkb lessons, sharpens weak ones and archives ones that do not help. Use it for the rkb curate command.",
-)];
-
-/// An agent file: frontmatter with rkb's marker, the model and the tools, then the agent's steps.
-/// `harness` is `claude-code`, `pi` or `omp`; Claude Code names its plugin agents without the prefix.
-pub fn agent_file(harness: &str, name: &str) -> String {
-    let about = AGENT_ABOUT.iter().find(|(n, _)| *n == name).map_or("", |(_, a)| a);
-    let tools: Vec<String> = ["search", "show", "add", "note", "used", "flag", "edit"]
-        .iter()
-        .flat_map(|t| match harness {
-            // Claude Code uses the mod's native tools; the extension registers the same names in pi and omp.
-            "claude-code" => vec![format!("mcp__rkb__{t}")],
-            _ => vec![format!("rkb_{t}")],
-        })
-        .collect();
-    let (title, shell, model) = match harness {
-        "claude-code" => (name.to_string(), "Bash, Read", Some(distill_model_for(harness).unwrap_or_else(|| "sonnet".into()))),
-        _ => (format!("rkb-{name}"), "bash, read", distill_model_for(harness)),
-    };
-    let model = model.map(|m| format!("model: {m}\n")).unwrap_or_default();
-    format!(
-        "---\nname: {title}\ndescription: {about}{COMMAND_MARKER} (rkb install --uninstall removes this file)\n{model}tools: {shell}, {}\n---\n\n{}\n",
-        tools.join(", "),
-        agent_steps(name)
-    )
-}
-
-/// The curate command, with the agent's steps as its fallback.
-fn curate_command() -> String {
-    COMMANDS[1].1.replace("__STEPS__", &agent_steps("curate"))
-}
-
 /// The marketplace files, relative to `plugin_dir`, and the plugin version, which carries a hash of
 /// the content so a changed binary path or prompt makes `claude plugin update` pick it up.
 pub fn plugin_files(bin: &str) -> (Vec<(String, String)>, String) {
@@ -125,9 +68,6 @@ pub fn plugin_files(bin: &str) -> (Vec<(String, String)>, String) {
     let pretty = |v: serde_json::Value| serde_json::to_string_pretty(&v).expect("json serializes") + "\n";
     let mut files = vec![
         ("plugins/rkb/skills/rkb/SKILL.md".to_string(), SKILL.to_string()),
-        ("plugins/rkb/commands/retro.md".to_string(), COMMANDS[0].1.to_string()),
-        ("plugins/rkb/commands/curate.md".to_string(), curate_command()),
-        ("plugins/rkb/agents/curate.md".to_string(), agent_file("claude-code", "curate")),
         ("plugins/rkb/hooks/hooks.json".to_string(), pretty(serde_json::json!({ "hooks": hooks, "modules": ["./register.tsx"] }))),
         (
             "plugins/rkb/hooks/register.tsx".to_string(),
@@ -276,11 +216,8 @@ impl Harness {
 
     /// The extension text for this harness.
     pub fn extension(self) -> String {
-        let json = |t: &str| serde_json::to_string(command_body(t)).expect("a string serializes");
         EXTENSION
             .replace("__HARNESS__", self.trust_name())
-            .replace("\"__RETRO__\"", &json(COMMANDS[0].1))
-            .replace("\"__CURATE__\"", &json(&curate_command()))
             .replace("\"__RKB__\"", &serde_json::to_string(&hook_binary()).expect("a string serializes"))
             .replace(
                 "\"__TOOLS__\"",
@@ -361,8 +298,8 @@ pub fn plan(home: &Path, config_dir: &Path, harnesses: &[Harness], uninstall: bo
             }
             // What earlier versions wrote outside the plugin.
             steps.push(Step::RemoveHooks { settings });
-            for (name, _) in COMMANDS {
-                steps.push(Step::RemoveCommand { file: home.join(".claude/commands").join(name) });
+            for name in LEGACY_COMMANDS {
+                steps.push(Step::RemoveCommand { file: home.join(".claude/commands").join(format!("rkb-{name}.md")) });
             }
             steps.push(Step::RemoveSkill { dir });
         } else {
@@ -371,19 +308,10 @@ pub fn plan(home: &Path, config_dir: &Path, harnesses: &[Harness], uninstall: bo
         if let Some(file) = h.extension_file(home) {
             steps.push(if uninstall { Step::RemoveExtension { file } } else { Step::WriteExtension { file, text: h.extension() } });
         }
-        // pi's subagent extension and omp's task tool read agents from `<harness home>/agent/agents/`.
+        // Remove the agent files an earlier rkb wrote for pi's subagent extension and omp's task tool.
         if *h != Harness::Claude {
-            for (name, _) in AGENT_STEPS {
-                let file = h.home(home).join(format!("agent/agents/rkb-{name}.md"));
-                steps.push(if uninstall {
-                    Step::RemoveCommand { file }
-                } else {
-                    Step::WriteExtension { file, text: agent_file(h.trust_name(), name) }
-                });
-            }
-            if !uninstall {
-                // Remove the distill agent an earlier rkb wrote.
-                steps.push(Step::RemoveCommand { file: h.home(home).join("agent/agents/rkb-distill.md") });
+            for name in LEGACY_AGENTS {
+                steps.push(Step::RemoveCommand { file: h.home(home).join("agent/agents").join(format!("rkb-{name}.md")) });
             }
         }
         let (file, name) = (config_dir.join("trust.toml"), h.trust_name());
@@ -503,10 +431,13 @@ fn write_plugin(dir: &Path, bin: &str) -> Result<bool> {
         changed = true;
     }
     // Remove files an earlier rkb wrote and this version no longer ships.
-    for rel in ["plugins/rkb/commands/distill.md", "plugins/rkb/agents/distill.md"] {
+    for rel in LEGACY_PLUGIN_FILES {
         if remove_command(&dir.join(rel))? {
             changed = true;
         }
+    }
+    for rel in ["plugins/rkb/commands", "plugins/rkb/agents"] {
+        let _ = std::fs::remove_dir(dir.join(rel));
     }
     Ok(changed)
 }
@@ -884,11 +815,26 @@ mod tests {
         let commands = home.join(".claude/commands");
         std::fs::create_dir_all(&commands).unwrap();
         std::fs::write(
-            commands.join("rkb-retro.md"),
+            commands.join(format!("rkb-{}.md", LEGACY_COMMANDS[0])),
             "old prompt\n<!-- Generated by rkb install; rkb install --uninstall removes this file. -->\n",
         )
         .unwrap();
         std::fs::write(commands.join("mine.md"), "the user's own command").unwrap();
+        let marked = "old prompt\n---\ngenerated-by: rkb install\n---\n";
+        let plugin = home.join(".local/share/rkb/claude-plugin/plugins/rkb");
+        for (rel, text) in [
+            ("commands/retro.md", marked),
+            ("commands/curate.md", marked),
+            ("agents/curate.md", marked),
+            ("agents/keep.md", "the user's own agent"),
+        ] {
+            std::fs::create_dir_all(plugin.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(plugin.join(rel), text).unwrap();
+        }
+        let pi_agents = home.join(".pi/agent/agents");
+        std::fs::create_dir_all(&pi_agents).unwrap();
+        std::fs::write(pi_agents.join(format!("rkb-{}.md", LEGACY_AGENTS[0])), marked).unwrap();
+        std::fs::write(pi_agents.join(format!("rkb-{}.md", LEGACY_AGENTS[1])), "the user's own file named like rkb's").unwrap();
         std::fs::create_dir_all(home.join(".claude/skills/rkb")).unwrap();
         std::fs::write(home.join(".claude/skills/rkb/SKILL.md"), "old skill").unwrap();
 
@@ -899,12 +845,20 @@ mod tests {
         assert_eq!(v["permissions"]["ask"], serde_json::json!(["Bash(rm:*)", ASK_RULE]));
         assert_eq!(v["permissions"]["allow"], serde_json::json!(TOOL_RULES));
         assert_eq!(v["hooks"], serde_json::json!({ "SessionStart": [mine] }), "old rkb hook entries go, the user's stay");
-        assert!(!commands.join("rkb-retro.md").exists() && commands.join("mine.md").exists());
+        assert!(!commands.join(format!("rkb-{}.md", LEGACY_COMMANDS[0])).exists() && commands.join("mine.md").exists());
         assert!(!home.join(".claude/skills/rkb").exists());
 
         let dir = home.join(".local/share/rkb/claude-plugin/plugins/rkb");
         assert_eq!(std::fs::read_to_string(dir.join("skills/rkb/SKILL.md")).unwrap(), SKILL);
-        assert_eq!(std::fs::read_to_string(dir.join("commands/retro.md")).unwrap(), COMMANDS[0].1);
+        for rel in ["commands/retro.md", "commands/curate.md", "agents/curate.md"] {
+            assert!(!dir.join(rel).exists(), "{rel}: an older rkb's file goes");
+        }
+        assert!(!dir.join("commands").exists(), "the empty commands folder goes");
+        assert!(dir.join("agents/keep.md").exists(), "a file that is not rkb's stays");
+        assert!(
+            !pi_agents.join(format!("rkb-{}.md", LEGACY_AGENTS[0])).exists()
+                && pi_agents.join(format!("rkb-{}.md", LEGACY_AGENTS[1])).exists()
+        );
         let hooks: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("hooks/hooks.json")).unwrap()).unwrap();
         assert_eq!(hooks["hooks"].as_object().unwrap().len(), 8);
         assert_eq!(hooks["hooks"]["PostToolUseFailure"][0]["matcher"], "Bash");
@@ -955,17 +909,10 @@ mod tests {
     }
 
     #[test]
-    fn plugin_carries_the_agents() {
+    fn plugin_ships_no_commands_or_agents() {
         let (files, _) = plugin_files("rkb");
-        let file = |p: &str| files.iter().find(|(path, _)| path == p).map(|(_, t)| t.clone()).unwrap_or_default();
-        let curate = file("plugins/rkb/agents/curate.md");
-        assert!(curate.starts_with("---\nname: curate\n") && curate.contains("\nmodel: sonnet\n"), "{curate}");
-        assert!(curate.contains("mcp__rkb__search") && !curate.contains("mcp__plugin_rkb_rkb") && curate.contains(COMMAND_MARKER));
-        assert!(curate.contains("rkb archive"));
-        let before = plugin_files("rkb").1;
-        assert_eq!(before, plugin_files("rkb").1, "stable");
-        let without: Vec<_> = files.iter().filter(|(p, _)| !p.contains("/agents/")).collect();
-        assert!(without.len() + 1 == files.len(), "one agent file");
+        assert!(files.iter().all(|(p, _)| !p.contains("/commands/") && !p.contains("/agents/")), "{files:?}");
+        assert_eq!(plugin_files("rkb").1, plugin_files("rkb").1, "stable");
     }
 
     #[test]
@@ -1119,19 +1066,6 @@ mod tests {
     }
 
     #[test]
-    fn command_body_drops_the_frontmatter() {
-        let curate = agent_steps("curate");
-        for word in ["rkb dupes", "rkb review", "rkb supersede", "rkb edit", "rkb archive"] {
-            assert!(curate.contains(word), "{word}");
-        }
-        assert!(command_body(&curate_command()).contains("`subagent_type: \"rkb:curate\"`") && curate_command().contains("rkb dupes"));
-        for (_, text) in COMMANDS {
-            assert!(text.contains(COMMAND_MARKER), "the marker is in the frontmatter");
-            assert!(!command_body(text).contains("generated-by") && !command_body(text).contains("<!--"), "the model never sees it");
-        }
-    }
-
-    #[test]
     fn hook_binary_and_path_repair() {
         let d = tempfile::tempdir().unwrap();
         let (a, b) = (d.path().join("a"), d.path().join("b"));
@@ -1161,10 +1095,5 @@ mod tests {
         assert!(hooks(&settings, None).unwrap());
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(v, serde_json::json!({ "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "my-own stop hook" }] }] } }));
-    }
-
-    #[test]
-    fn command_body_drops_the_frontmatter_again() {
-        assert!(COMMANDS.iter().all(|(_, text)| text.contains(COMMAND_MARKER)));
     }
 }

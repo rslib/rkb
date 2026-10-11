@@ -23,7 +23,7 @@ fn next_list(place: &Place) -> String {
 }
 
 /// `rkb status`: what waits for the user and what the session injected, for a harness UI. Writes no lesson,
-/// inbox item or request; it only refreshes the daily curate cache and drops expired requests.
+/// inbox item or request; it only drops expired requests.
 pub fn waiting(env: &Env, session: Option<&str>) -> Result<Output, CliError> {
     kb::open(&env.root)?;
     let items = rkb_core::distill::list(&env.state);
@@ -31,7 +31,6 @@ pub fn waiting(env: &Env, session: Option<&str>) -> Result<Output, CliError> {
     for i in &items {
         by_priority[usize::from(i.meta.priority()) - 1] += 1;
     }
-    let curate = rkb_core::review::curate_count(&env.root, &env.state)?;
     let requests: Vec<Value> = rkb_core::request::open(&env.state.join("requests"))
         .iter()
         .map(|r| json!({ "id": r.id, "question": r.question, "options": r.options() }))
@@ -51,7 +50,7 @@ pub fn waiting(env: &Env, session: Option<&str>) -> Result<Output, CliError> {
             json!({ "id": id, "title": titles.get(id), "hook": r["hook"], "time": r["time"] })
         })
         .collect();
-    let mut human = format!("inbox: {} ({} high)\ncurate: {curate}\nrequests: {}\n", items.len(), by_priority[2], requests.len());
+    let mut human = format!("inbox: {} ({} high)\nrequests: {}\n", items.len(), by_priority[2], requests.len());
     for r in &requests {
         human.push_str(&format!("  {} {}\n", r["id"].as_str().unwrap_or_default(), r["question"].as_str().unwrap_or_default()));
     }
@@ -68,7 +67,6 @@ pub fn waiting(env: &Env, session: Option<&str>) -> Result<Output, CliError> {
     }
     let data = json!({
         "inbox": { "total": items.len(), "priority": { "1": by_priority[0], "2": by_priority[1], "3": by_priority[2] } },
-        "curate": curate,
         "requests": requests,
         "injected": injected,
     });

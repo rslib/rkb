@@ -366,46 +366,6 @@ pub fn changes(root: &Path, since: &str) -> Result<Vec<Change>> {
         .collect())
 }
 
-/// How many things `/rkb:curate` would look at: review candidates, likely duplicate pairs and lessons with
-/// quality warnings. Counted at most once a day and kept in `curate.json` in the state folder, because
-/// review reads git history.
-pub fn curate_count(root: &Path, state: &Path) -> Result<usize> {
-    let today = jiff::Zoned::now().date().to_string();
-    let path = state.join("curate.json");
-    let cached: Option<serde_json::Value> = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok());
-    if let Some(c) = cached.filter(|c| c["date"] == today.as_str())
-        && let Some(n) = c["count"].as_u64()
-    {
-        return Ok(n as usize);
-    }
-    let candidates = review(root, state, None)?.len();
-    let keep = crate::triage::Thresholds::load(&crate::paths::config_dir()).keep;
-    let pairs =
-        crate::dupes::shown(&crate::graph::Graph::load(root)?, crate::graph::min_similarity(root), &crate::dupes::load(state), keep).len();
-    let snap = Snapshot::from_dir(root)?;
-    let mut weak: Vec<String> = crate::lint::lint(&snap, &crate::lint::LintEnv::default(), None)
-        .into_iter()
-        .filter(|f| f.rule.starts_with("quality/"))
-        .map(|f| f.path)
-        .collect();
-    weak.sort();
-    weak.dedup();
-    let n = candidates + pairs + weak.len();
-    let _ = std::fs::create_dir_all(state);
-    let _ = std::fs::write(&path, serde_json::json!({ "date": today, "count": n }).to_string());
-    Ok(n)
-}
-
-/// The session-start line asking the agent to curate, when 5 or more things wait.
-pub fn curate_nudge(root: &Path, state: &Path, command: &str) -> Option<String> {
-    let n = curate_count(root, state).ok()?;
-    (n >= 5).then(|| {
-        format!(
-            "rkb curate: {n} lessons or pairs may need a merge, a sharper text or archiving. At a natural pause in the work, run {command}, without waiting for the user."
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -113,13 +113,7 @@ if (harness === "omp") {
   assert.ok(!existsSync(`${process.env.XDG_STATE_HOME}/rkb/sessions/someone-else.jsonl`) || !readFileSync(`${process.env.XDG_STATE_HOME}/rkb/sessions/someone-else.jsonl`, "utf8").includes("extracted"), "another session never gets this session's file");
 }
 
-// The commands send their prompts as user messages.
-assert.deepEqual(Object.keys(commands).sort(), ["rkb-curate", "rkb-retro", "rkb-status"]);
-await commands["rkb-retro"].handler("the cmake part", ctx());
-assert.match(sent.at(-1), /^Review the work of this session/);
-assert.match(sent.at(-1), /Focus from the user, if any: the cmake part/);
-await commands["rkb-curate"].handler("", ctx());
-assert.ok(sent.at(-1).length > 0, "the curate command sends its prompt");
+assert.deepEqual(Object.keys(commands), ["rkb-status"]);
 
 // The agent tools run `rkb tool` and return its TOON text; failures throw, as pi expects.
 assert.deepEqual(Object.keys(tools).sort(), ["rkb_add", "rkb_edit", "rkb_flag", "rkb_note", "rkb_search", "rkb_show", "rkb_used"]);
@@ -234,7 +228,6 @@ const until = async (cond, what) => {
 const quiet = (ms = 300) => new Promise((r) => setTimeout(r, ms));
 canned("status", {
   inbox: { total: 12, priority: { 1: 8, 2: 1, 3: 3 } },
-  curate: 0,
   requests: [{ id: "r-1a2b", question: "Install the rkb plugin", options: ["yes", "no"] }],
   injected: [{ id: "2b00000034", title: "Stale build cache", hook: "prompt" }],
 });
@@ -332,7 +325,7 @@ const open = async (c = uc) => {
 const opened = open();
 await until(() => popup, "popup");
 let view = render();
-assert.match(view, /rkb\s+12 inbox \| 3 high \| 0 curate/);
+assert.match(view, /rkb\s+12 inbox \| 3 high/);
 assert.match(view, /\[Search\]\s+Inbox 12\s+Requests 1/);
 assert.match(view, /Search lessons/);
 popup.handleInput("s");
@@ -359,7 +352,7 @@ view = render();
 assert.ok(view.indexOf("* high 1") < view.indexOf("make fails") && view.indexOf("make fails") < view.indexOf("* low 1"), view);
 assert.match(view, /make fails with a stale cache\s+1 keep \| 2 min/);
 assert.match(view, /observed\s+prefer ninja over make\s+1 h/);
-assert.match(view, /g Triage \| c Curate 0 \| t Retro/);
+assert.match(view, /g Triage/);
 await key("\r", () => /line 0 of a long/.test(render()));
 view = render(50);
 assert.match(view, /\[NOTE\] make fails with a stale cache\s+cd236c6b0b/);
@@ -407,15 +400,6 @@ assert.match(view, /yes \/ no/);
 // Esc closes.
 popup.handleInput("\x1b");
 await opened;
-// Curate from the inbox closes the popup and sends the prompt.
-const second = open();
-await until(() => popup, "popup again");
-sent.length = 0;
-popup.handleInput("i");
-await until(() => /make fails/.test(render()), "inbox again");
-popup.handleInput("c");
-await second;
-assert.match(sent.at(-1), /Curate/);
 
 // A request is answered through `select` and `rkb confirm`; a dismissed dialog leaves it open.
 canned("confirm", { id: "done" });
@@ -466,7 +450,6 @@ console.log = out;
 assert.deepEqual(lines, ["inbox: 12 items"]);
 canned("status", {
   inbox: { total: 12, priority: { 1: 8, 2: 1, 3: 3 } },
-  curate: 0,
   requests: [],
   injected: [],
 });

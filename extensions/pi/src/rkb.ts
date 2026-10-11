@@ -18,8 +18,6 @@ const NO_UI = "rkb confirm needs the user: ask them to run this command in their
 const DECLINED = "The user declined this rkb confirm.";
 // omp stops a session_shutdown handler after 2 s.
 const SHUTDOWN_TIMEOUT_MS = 1800;
-const RETRO: string = "__RETRO__";
-const CURATE: string = "__CURATE__";
 const TOOLS_JSON: string = "__TOOLS__";
 // A tool runs a search or a write, which may load a model, so it gets longer than a hook.
 const TOOL_TIMEOUT_MS = 60000;
@@ -136,10 +134,6 @@ function transcript(ctx: any): string | undefined {
   return stopSession.file && (!id || id === stopSession.id) ? stopSession.file : undefined;
 }
 
-function prompt(text: string, args: string): string {
-  return text.replace("$ARGUMENTS", args.trim() || "none");
-}
-
 function bash(event: any): string | undefined {
   return event?.toolName === "bash" ? String(event?.input?.command ?? "") : undefined;
 }
@@ -199,7 +193,6 @@ interface Injected {
 interface Status {
   inbox: number;
   high: number;
-  curate: number;
   requests: Request[];
   injected: Injected[];
 }
@@ -229,7 +222,7 @@ interface Doc {
 }
 type Tone = "ok" | "fail" | "busy";
 type View = "search" | "inbox" | "item" | "lesson" | "requests";
-type Outcome = { do: "close" } | { do: "send"; name: "retro" | "curate" } | { do: "answer"; id: string };
+type Outcome = { do: "close" } | { do: "answer"; id: string };
 interface Pane {
   view: View;
   typing: boolean;
@@ -287,7 +280,6 @@ function parseStatus(d: Json): Status {
   return {
     inbox: d.inbox?.total ?? 0,
     high: d.inbox?.priority?.["3"] ?? 0,
-    curate: d.curate ?? 0,
     requests: (d.requests ?? []).map((q: Json) => ({ id: q.id, question: q.question, options: q.options ?? [] })),
     injected: (d.injected ?? []).map((i: Json) => ({ id: i.id, title: i.title ?? null, hook: i.hook ?? null })),
   };
@@ -296,7 +288,6 @@ function parseStatus(d: Json): Status {
 function statusLine(s: Status): string | undefined {
   const parts: string[] = [];
   if (s.inbox > 0) parts.push(`${s.inbox} inbox${s.high > 0 ? ` (${s.high} high)` : ""}`);
-  if (s.curate > 0) parts.push(`${s.curate} curate`);
   if (s.requests.length > 0) parts.push(plural(s.requests.length, "request"));
   return parts.length === 0 ? undefined : `rkb: ${parts.join(SEP)}`;
 }
@@ -388,8 +379,6 @@ function paneComponent(T: Tui, tui: any, theme: any, done: (o: Outcome) => void,
       const row = p.rows[p.rowAt];
       if (row && k(data, "enter", "o")) go(act.item(row));
       else if (k(data, "g")) go(act.triage());
-      else if (k(data, "c")) return done({ do: "send", name: "curate" });
-      else if (k(data, "t")) return done({ do: "send", name: "retro" });
     } else if (p.view === "item") {
       if (!scroll(data) && k(data, "b")) p.view = "inbox";
     } else if (p.view === "lesson") {
@@ -436,7 +425,7 @@ function paneComponent(T: Tui, tui: any, theme: any, done: (o: Outcome) => void,
     };
     const tab = (label: string, on: boolean) => (on ? theme.bold(fg("accent", `[${label}]`)) : fg("muted", ` ${label} `));
     const out: string[] = [];
-    out.push(`${theme.bold(fg("accent", "rkb"))}${s ? fg("muted", `  ${s.inbox} inbox${SEP}${s.high} high${SEP}${s.curate} curate`) : ""}`);
+    out.push(`${theme.bold(fg("accent", "rkb"))}${s ? fg("muted", `  ${s.inbox} inbox${SEP}${s.high} high`) : ""}`);
     out.push(
       [
         tab("Search", p.view === "search" || p.view === "lesson"),
@@ -465,7 +454,7 @@ function paneComponent(T: Tui, tui: any, theme: any, done: (o: Outcome) => void,
       out.push(...windowed(lines, sel, room()));
       hint = p.typing ? "Enter search | Tab results | Esc close" : "s or / type a search | Up/Down select | Enter open | i inbox | r requests | Esc close";
     } else if (p.view === "inbox") {
-      out.push(fg("dim", `g Triage${SEP}c Curate ${s?.curate ?? 0}${SEP}t Retro`));
+      out.push(fg("dim", "g Triage"));
       if (p.rows.length === 0) out.push("", "The inbox is empty.", fg("dim", "Notes and session extracts wait here until a promotion turns them into lessons."));
       const lines: string[] = [];
       let sel = 0;
@@ -735,7 +724,6 @@ export default function rkb(pi: ExtensionAPI) {
     const lib = T;
     for (;;) {
       const out = (await custom((tui: any, theme: any, _keys: any, done: (o: Outcome) => void) => paneComponent(lib, tui, theme, done, p, actions(ctx, p), () => status))) as Outcome | undefined;
-      if (out?.do === "send") pi.sendUserMessage(prompt({ retro: RETRO, curate: CURATE }[out.name], ""));
       const q = out?.do === "answer" ? status?.requests.find((r) => r.id === out.id) : undefined;
       if (!q) return;
       await answer(ctx, q);
@@ -849,18 +837,6 @@ export default function rkb(pi: ExtensionAPI) {
       return undefined;
     }),
   );
-
-  for (const [name, text, description] of [
-    ["rkb-retro", RETRO, "Record the durable lessons of this session in rkb now"],
-    ["rkb-curate", CURATE, "Merge near-duplicate lessons, sharpen weak ones and archive ones that do not help"],
-  ]) {
-    pi.registerCommand(name, {
-      description,
-      handler: async (args: string) => {
-        pi.sendUserMessage(prompt(text, String(args ?? "")));
-      },
-    });
-  }
 
   pi.registerCommand("rkb-status", {
     description: "Search lessons, read the inbox and answer rkb requests",
