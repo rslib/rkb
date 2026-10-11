@@ -1,4 +1,4 @@
-//! What `rkb site` publishes: the lessons the `web` sink allows in the clear, the lessons the
+//! What `rkb publish` writes: the lessons the `web` sink allows in the clear, the lessons the
 //! `web-protected` sink allows behind the site password, the links that would point at an
 //! unpublished lesson, and the `site.json` index the rs-web template reads.
 

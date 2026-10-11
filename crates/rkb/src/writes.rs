@@ -472,18 +472,12 @@ fn confirm_choice(env: &Env, id: String, choice: String, auto: bool) -> Result<O
     if choice != "cancel" && !answered && !auto && request::trusted_harness(&paths::config_dir()).is_none() {
         ask_terminal(&req, &choice)?;
     }
-    if let request::Action::Publish { ids, encrypted, out, serve } = &req.action {
+    if let request::Action::Publish { ids, encrypted, out } = &req.action {
         request::remove(&env.state.join("requests"), &req.id);
         if choice == "cancel" {
             return outcome(env, Outcome::Cancelled);
         }
-        return crate::site::run(
-            env,
-            out.clone(),
-            *serve,
-            &crate::site::Approved { clear: ids.clone(), encrypted: encrypted.clone() },
-            false,
-        );
+        return crate::site::run(env, out.clone(), &crate::site::Approved { clear: ids.clone(), encrypted: encrypted.clone() }, false);
     }
     let o = write::confirm(&env.ctx(), &req, &choice)?;
     outcome(env, o)

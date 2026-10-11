@@ -285,9 +285,6 @@ fn kb_checks(root: &Path, place: &Place, state_dir: &Path, env: &LintEnv, out: &
         Err(e) => out.push(check("lint", Level::Fail, e.to_string(), Some("run `rkb lint`".into()))),
     }
 
-    if let Some(c) = site_workflow(root) {
-        out.push(c);
-    }
     if let Some(c) = site_approvals(root, state_dir) {
         out.push(c);
     }
@@ -345,8 +342,8 @@ fn kb_checks(root: &Path, place: &Place, state_dir: &Path, env: &LintEnv, out: &
     }
 }
 
-/// Lessons the site would publish but the publish record has not seen, with this shell's passwords.
-/// No check without `[sinks.web]`; a knowledge base the site cannot build is `rkb site build`'s to report.
+/// Lessons `rkb publish` would publish but the record has not seen, with this shell's passwords.
+/// No check without `[sinks.web]`; a knowledge base that cannot be published is `rkb publish`'s to report.
 fn site_approvals(root: &Path, state_dir: &Path) -> Option<Check> {
     let s = crate::site::collect(root, |v| std::env::var(v).is_ok_and(|x| !x.is_empty())).ok()?;
     let (clear, enc) = crate::site::pending(&s, &crate::site::published(root, state_dir));
@@ -367,26 +364,8 @@ fn site_approvals(root: &Path, state_dir: &Path) -> Option<Check> {
         "site approvals",
         Level::Warn,
         format!("{} lessons wait for a first-publication yes, so CI leaves them out: {}", names.len(), names.join("; ")),
-        Some("run `rkb site build`, answer `publish`, and push the knowledge base".into()),
+        Some("run `rkb publish <dir>`, answer `publish`, and push the knowledge base".into()),
     ))
-}
-
-/// The rkb version `.github/workflows/site.yml` downloads, against the running one.
-fn site_workflow(root: &Path) -> Option<Check> {
-    const PATH: &str = ".github/workflows/site.yml";
-    let text = std::fs::read_to_string(root.join(PATH)).ok()?;
-    let pinned = text.lines().find_map(|l| l.trim().strip_prefix("RKB_VERSION:"))?.trim().trim_matches('"').to_string();
-    let ours = env!("CARGO_PKG_VERSION");
-    Some(if pinned == ours {
-        check("site workflow", Level::Ok, format!("{PATH} uses rkb {ours}"), None)
-    } else {
-        check(
-            "site workflow",
-            Level::Warn,
-            format!("{PATH} downloads rkb {pinned}, but this is rkb {ours}"),
-            Some(format!("set `RKB_VERSION: \"{ours}\"` in {PATH} once rkb {ours} is released, or delete the file and run `rkb site ci`")),
-        )
-    })
 }
 
 /// A project matched by remote whose note lacks the repository's single root commit.
@@ -690,6 +669,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(observer_check(&config, &state).detail, "claude-code = sonnet, haiku; triage claude-code = haiku; approved here");
+    }
+
+    #[test]
+    fn site_approvals_warns_until_the_user_says_yes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        assert!(site_approvals(root, &state).is_none(), "no [sinks.web], no check");
+        std::fs::write(root.join("kb.toml"), "[sinks.web]\nallow = { sensitivity = [\"public\"] }\n").unwrap();
+        let lesson = |id: &str, labels: &str| {
+            let labels = if labels.is_empty() { String::new() } else { format!("labels:\n{labels}\n") };
+            let p = root.join(format!("general/a/{id}.md"));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(
+                p,
+                format!(
+                    "---\nschema: 1\nid: {id}\ntype: fact\nstatus: active\nverified: 2026-09-25\nverified_how: ran\n{labels}---\n\n# T\n\n## Statement\nX.\n\n## Evidence\nSeen.\n"
+                ),
+            )
+            .unwrap();
+        };
+        lesson("1a00000001", "");
+        lesson("1a00000002", "  sensitivity: public\n");
+
+        let c = site_approvals(root, &state).unwrap();
+        assert_eq!(c.level, Level::Warn, "{c:?}");
+        assert!(c.detail.contains("wait for a first-publication yes") && c.detail.contains("1a00000002"), "{}", c.detail);
+        assert!(!c.detail.contains("1a00000001"), "an internal lesson is not waiting: {}", c.detail);
+        assert_eq!(c.fix.as_deref(), Some("run `rkb publish <dir>`, answer `publish`, and push the knowledge base"));
+
+        std::fs::create_dir_all(root.join("site")).unwrap();
+        std::fs::write(root.join("site/published.json"), r#"{"clear":["1a00000002"],"encrypted":{}}"#).unwrap();
+        let c = site_approvals(root, &state).unwrap();
+        assert_eq!((c.name, c.level, c.detail.as_str()), ("site approvals", Level::Ok, "every lesson the site publishes is recorded"));
     }
 
     #[test]

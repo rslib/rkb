@@ -151,7 +151,7 @@ pub fn lint(snap: &Snapshot, env: &LintEnv, focus: Option<&BTreeSet<String>>) ->
         };
         out.error("kb.toml", None, "config/jev", message);
     }
-    // The file itself usually sits in site/, which lint does not read; `rkb site build` reports it missing.
+    // The file itself usually sits in site/, which lint does not read; `rkb publish` reports it missing.
     if let Some(img) = kb.as_ref().and_then(|k| k.site.image.as_deref()) {
         let ext = img.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
         if !["png", "jpg", "jpeg"].contains(&ext.as_str()) {

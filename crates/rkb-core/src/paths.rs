@@ -18,7 +18,7 @@ pub fn cache_dir() -> PathBuf {
     xdg(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"), ".cache")
 }
 
-/// Downloaded files such as model weights and rs-web. Never synced.
+/// The folder with the downloaded tools. rkb downloads no rs-web, so only the rerank model lives here.
 pub fn data_dir() -> PathBuf {
     xdg(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"), ".local/share")
 }

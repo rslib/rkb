@@ -3644,53 +3644,40 @@ fn probes_decide_applies_in_search() {
     assert!(marker.exists(), "search runs approved probes");
 }
 
-const FAKE_RS_WEB: &str = r#"#!/bin/sh
-case "$1" in
---version) echo "rs-web ${FAKE_RS_WEB_VERSION:-0.4.3}" ;;
-serve)
-  echo "$*" > serve-args
-  while [ ! -f stop ]; do sleep 0.1; done
-  ;;
-build)
-  if [ -n "$FAKE_RS_WEB_FAIL" ]; then
-    echo "boom: template error" >&2
-    exit 1
-  fi
-  mkdir -p dist
-  if [ -z "$FAKE_RS_WEB_NO_INDEX" ]; then
-    cp site.json dist/index.json
-  fi
-  if [ -f site.json ]; then
-    python3 -c 'import json; v=json.load(open("site.json")); print(json.dumps({"lessons": [{"id": r["id"], "tags": r.get("tags", []), "queries": r.get("queries", [])} for r in v["lessons"]]}))' > dist/public.json
-  fi
-  if [ -n "$FAKE_RS_WEB_EXTRA" ]; then
-    mkdir -p "dist/$(dirname "$FAKE_RS_WEB_EXTRA")"
-    printf '%s' "$FAKE_RS_WEB_TEXT" > "dist/$FAKE_RS_WEB_EXTRA"
-  fi
-  ;;
-esac
-"#;
-
-/// The search fixture with two git lessons labeled public, the fake rs-web and a trusted harness for confirm.
-fn site_kb() -> Env {
+/// The search fixture with two git lessons labeled public, committed, and a template in `site/`.
+fn publish_kb() -> Env {
     let env = search_kb();
     for f in ["general/git/rebase-with-local-edits-using-autostash.md", "general/git/squash-fixups-with-autosquash.md"] {
         let p = env.kb().join(f);
         let text = std::fs::read_to_string(&p).unwrap().replacen("\n---\n", "\nlabels:\n  sensitivity: public\n---\n", 1);
         std::fs::write(p, text).unwrap();
     }
-    assert!(env.git(&["-c", "user.name=T", "-c", "user.email=t@example.org", "commit", "-qam", "label"]).status.success());
-    let fake = env.dir.path().join("fake/rs-web");
-    env.write_abs(&fake, FAKE_RS_WEB);
-    std::os::unix::fs::PermissionsExt::set_mode(&mut std::fs::metadata(&fake).unwrap().permissions(), 0o755);
-    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let tpl = env.kb().join("site");
+    std::fs::create_dir_all(tpl.join("templates")).unwrap();
+    std::fs::create_dir_all(tpl.join("static")).unwrap();
+    std::fs::write(tpl.join("config.lua"), CONFIG_LUA).unwrap();
+    std::fs::write(tpl.join("templates/index.html"), "<html><body>{{ title }}</body></html>\n").unwrap();
+    std::fs::write(tpl.join("static/site.css"), "body { color: red }\n").unwrap();
+    env.git(&["add", "-A"]);
+    assert!(env.git(&["-c", "user.name=T", "-c", "user.email=t@example.org", "commit", "-qm", "publish"]).status.success());
     env.trust_claude();
     env
 }
 
-fn site(env: &Env, args: &[&str], vars: &[(&str, &str)]) -> (serde_json::Value, Option<i32>) {
+/// The rs-web template the publish tests build from. rkb does not run rs-web, so it only has to sit there.
+const CONFIG_LUA: &str = r#"local rs = require("rs-web")
+return {
+  site = { title = "t", description = "", base_url = "", author = "" },
+  build = { output_dir = "dist" },
+  pages = function() return { { path = "/", template = "index.html", title = "t" } } end,
+}
+"#;
+
+const PASSWORD: &str = "correct-horse-battery-staple";
+
+fn publish(env: &Env, args: &[&str], vars: &[(&str, &str)]) -> (serde_json::Value, Option<i32>) {
     let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
-    c.env("RKB_RS_WEB", env.dir.path().join("fake/rs-web")).env("CLAUDECODE", "1").env_remove("SITE_PASSWORD");
+    c.env("CLAUDECODE", "1").env_remove("SITE_PASSWORD");
     for (k, v) in vars {
         c.env(k, v);
     }
@@ -3700,63 +3687,13 @@ fn site(env: &Env, args: &[&str], vars: &[(&str, &str)]) -> (serde_json::Value, 
     (serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o))), o.status.code())
 }
 
-/// Builds once, confirming the first publication.
-fn site_built(env: &Env, out: &str) -> serde_json::Value {
-    let (v, code) = site(env, &["site", "build", "--out", out], &[]);
+/// Publishes once, confirming the first publication.
+fn published_ok(env: &Env, dir: &str) -> serde_json::Value {
+    let (v, code) = publish(env, &["publish", dir], &[]);
     assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{v}");
-    let (v, code) = site(env, &["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], &[]);
-    assert_eq!((v["status"].as_str(), code), (Some("built"), Some(0)), "{v}");
+    let (v, code) = publish(env, &["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], &[]);
+    assert_eq!((v["status"].as_str(), code), (Some("published"), Some(0)), "{v}");
     v
-}
-
-#[test]
-fn site_build_publishes_only_allowed_lessons() {
-    let env = site_kb();
-    let out = env.dir.path().join("out");
-    let out_s = out.to_str().unwrap();
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &[]);
-    assert_eq!(code, Some(3), "{v}");
-    let q = v["question"].as_str().unwrap();
-    assert!(q.contains("Publish 2 lessons") && q.contains("1a00000003") && q.contains("1a00000005"), "{q}");
-    assert!(!out.exists(), "nothing is written before the answer");
-
-    let v = site_built(&env, out_s);
-    assert_eq!(v["lessons"], 2, "{v}");
-    let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("index.json")).unwrap()).unwrap();
-    let got: Vec<&str> = index["lessons"].as_array().unwrap().iter().map(|l| l["id"].as_str().unwrap()).collect();
-    assert_eq!(got, ["1a00000003", "1a00000005"]);
-    let stage = env.dir.path().join("cache/rkb/site/stage");
-    assert!(stage.join("lessons/general/git/squash-fixups-with-autosquash.md").is_file());
-    assert!(!stage.join("lessons/general/git/shallow-clones-break-git-describe.md").exists());
-
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &[]);
-    assert_eq!((v["status"].as_str(), code), (Some("built"), Some(0)), "published before, so no question: {v}");
-
-    let before = std::fs::read_to_string(out.join("index.json")).unwrap();
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &[("FAKE_RS_WEB_FAIL", "1")]);
-    assert_eq!(code, Some(1), "{v}");
-    assert!(v["error"]["message"].as_str().unwrap().contains("boom: template error"), "{v}");
-    let home = format!("{}/secret", env.dir.path().display());
-    let (v, code) =
-        site(&env, &["site", "build", "--out", out_s], &[("FAKE_RS_WEB_EXTRA", "about/index.html"), ("FAKE_RS_WEB_TEXT", &home)]);
-    assert_eq!(code, Some(1), "{v}");
-    assert!(v["error"]["message"].as_str().unwrap().contains("about/index.html"), "{v}");
-    let (v, code) = site(
-        &env,
-        &["site", "build", "--out", out_s],
-        &[("FAKE_RS_WEB_EXTRA", "lessons/1a00000004/index.html"), ("FAKE_RS_WEB_TEXT", "x")],
-    );
-    assert_eq!(code, Some(1), "{v}");
-    assert!(v["error"]["message"].as_str().unwrap().contains("not published"), "{v}");
-    assert_eq!(std::fs::read_to_string(out.join("index.json")).unwrap(), before, "a failed build leaves --out as it was");
-
-    let p = env.kb().join("general/git/squash-fixups-with-autosquash.md");
-    std::fs::write(&p, std::fs::read_to_string(&p).unwrap().replace("sensitivity: public", "sensitivity: internal")).unwrap();
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &[]);
-    assert_eq!(code, Some(0), "{v}");
-    let notes = v["notes"].to_string();
-    assert!(notes.contains("no longer published") && notes.contains("1a00000005"), "{v}");
-    assert!(notes.contains("internal lessons were left out; set SITE_PASSWORD"), "{v}");
 }
 
 /// Adds `projects/rait` with a note that has no labels and one unlabeled lesson, committed.
@@ -3769,51 +3706,72 @@ fn with_rait(env: &Env) {
 }
 
 #[test]
-fn folder_labels_show_set_and_ask() {
-    let env = search_kb();
-    env.trust_claude();
-    with_rait(&env);
-    let (v, code) = env.json(&["label", "projects/rait"], "");
-    assert_eq!(code, Some(0), "{v}");
-    assert_eq!((v["own"].clone(), v["effective"]["sensitivity"].as_str()), (serde_json::json!({}), Some("internal")), "{v}");
-    assert_eq!(v["lessons"], serde_json::json!([{ "key": "sensitivity", "value": "internal", "count": 1 }]), "{v}");
+fn publish_writes() {
+    let env = publish_kb();
+    let out = env.dir.path().join("out");
+    let out_s = out.to_str().unwrap();
 
-    let before = commit_count(&env);
-    let (v, code) = env.json(&["label", "projects/rait", "sensitivity=public"], "");
+    let (v, code) = publish(&env, &["publish", out_s], &[]);
     assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{v}");
-    assert_eq!(v["options"][0], "loosen sensitivity to public", "{v}");
-    assert!(v["question"].as_str().unwrap().contains("1 lesson(s) under projects/rait"), "{v}");
-    assert_eq!(commit_count(&env), before);
-    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
-    c.env("CLAUDECODE", "1");
-    let o = rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", "loosen sensitivity to public", "--format", "json"], "");
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!(v["status"], "written", "{v}");
-    let note = std::fs::read_to_string(env.kb().join("projects/rait/README.md")).unwrap();
-    assert_eq!(note, "---\nremotes:\n  - github.com/example/rait\nlabels:\n  sensitivity: public\n---\n\n# rait\n");
-    assert_eq!(stdout(&env.git(&["log", "-1", "--format=%s"])).trim(), "label(projects/rait): sensitivity public");
+    let q = v["question"].as_str().unwrap();
+    assert!(q.contains("Publish 2 lessons") && q.contains("1a00000003") && q.contains("1a00000005"), "{q}");
+    assert!(!out.exists(), "nothing is written before the answer");
 
-    let (v, _) = env.json(&["label", "projects/rait", "sensitivity=internal"], "");
-    assert_eq!(v["status"], "written", "stricter writes at once: {v}");
-    let (v, _) = env.json(&["label", "projects/rait", "sensitivity", "--unset"], "");
-    assert_eq!(v["status"], "written", "back to the default, which is not looser: {v}");
-    assert_eq!(stdout(&env.git(&["log", "-1", "--format=%s"])).trim(), "label(projects/rait): sensitivity unset");
-    assert!(!std::fs::read_to_string(env.kb().join("projects/rait/README.md")).unwrap().contains("labels"));
+    let v = published_ok(&env, out_s);
+    assert_eq!(v["lessons"], 2, "{v}");
+    assert_eq!(v["out"].as_str().unwrap(), out_s, "{v}");
+    // The knowledge base's template, as it is in the repository.
+    assert_eq!(std::fs::read_to_string(out.join("config.lua")).unwrap(), CONFIG_LUA);
+    assert_eq!(std::fs::read_to_string(out.join("templates/index.html")).unwrap(), "<html><body>{{ title }}</body></html>\n");
+    assert_eq!(std::fs::read_to_string(out.join("static/site.css")).unwrap(), "body { color: red }\n");
+    // The allowed lessons and their paths, and the index rs-web reads.
+    assert!(out.join("lessons/general/git/squash-fixups-with-autosquash.md").is_file());
+    assert!(!out.join("lessons/general/git/shallow-clones-break-git-describe.md").exists());
+    assert!(!out.join("protected").exists());
+    let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("site.json")).unwrap()).unwrap();
+    let got: Vec<&str> = index["lessons"].as_array().unwrap().iter().map(|l| l["id"].as_str().unwrap()).collect();
+    assert_eq!(got, ["1a00000003", "1a00000005"], "{index}");
+    let css = index["assets"]["site_css"].as_str().unwrap();
+    let hash = css.strip_prefix("/static/v/").and_then(|r| r.strip_suffix("/site.css")).unwrap_or_default();
+    assert_eq!(hash.len(), 12, "{css}");
+    assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "{css}");
 
-    let (v, code) = env.json(&["label", "general", "sensitivity=secret"], "");
-    assert_eq!((v["error"]["code"].as_str(), code), (Some("refused"), Some(1)), "{v}");
-    assert!(v["error"]["message"].as_str().unwrap().contains("public, internal, confidential"), "{v}");
-    let (v, _) = env.json(&["label", "no/such", "sensitivity=internal"], "");
-    assert_eq!(v["error"]["code"], "not_found", "{v}");
-    assert_eq!(env.rkb(&["label", "general", "sensitivity=public", "--unset"]).status.code(), Some(2));
+    // An earlier rs-web output in the folder is left alone, and the second publish changes nothing.
+    std::fs::create_dir_all(out.join("dist")).unwrap();
+    std::fs::write(out.join("dist/index.html"), "built").unwrap();
+    let (v, code) = publish(&env, &["publish", out_s], &[]);
+    assert_eq!((v["status"].as_str(), code), (Some("published"), Some(0)), "{v}");
+    assert_eq!(std::fs::read_to_string(out.join("dist/index.html")).unwrap(), "built");
+
+    let p = env.kb().join("general/git/squash-fixups-with-autosquash.md");
+    std::fs::write(&p, std::fs::read_to_string(&p).unwrap().replace("sensitivity: public", "sensitivity: internal")).unwrap();
+    let (v, code) = publish(&env, &["publish", out_s], &[]);
+    assert_eq!(code, Some(0), "{v}");
+    let notes = v["notes"].to_string();
+    assert!(notes.contains("no longer published") && notes.contains("1a00000005"), "{v}");
+    assert!(notes.contains("internal lessons were left out; set SITE_PASSWORD"), "{v}");
+    assert!(!out.join("lessons/general/git/squash-fixups-with-autosquash.md").exists(), "the lesson is staged out again");
 }
 
 #[test]
-fn site_names_folders_that_are_internal_by_default() {
-    let env = site_kb();
+fn publish_refuses_a_folder_it_did_not_write() {
+    let env = publish_kb();
+    let out = env.dir.path().join("mine");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("notes.txt"), "keep").unwrap();
+    let (v, code) = publish(&env, &["publish", out.to_str().unwrap()], &[]);
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("no site.json"), "{v}");
+    assert_eq!(std::fs::read_to_string(out.join("notes.txt")).unwrap(), "keep");
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1, "nothing was written");
+}
+
+#[test]
+fn publish_names_folders_that_are_internal_by_default() {
+    let env = publish_kb();
     with_rait(&env);
     let out = env.dir.path().join("out");
-    let v = site_built(&env, out.to_str().unwrap());
+    let v = published_ok(&env, out.to_str().unwrap());
     let notes = v["notes"].to_string();
     assert!(
         notes.contains("1 lesson(s) in projects/rait are internal by default")
@@ -3822,478 +3780,31 @@ fn site_names_folders_that_are_internal_by_default() {
     );
 }
 
-const PASSWORD: &str = "correct-horse-battery-staple";
-
 #[test]
-fn site_protects_internal_lessons_with_a_password() {
-    let env = site_kb();
+fn publish_needs_a_template() {
+    let env = publish_kb();
     let out = env.dir.path().join("out");
-    let out_s = out.to_str().unwrap();
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &[("SITE_PASSWORD", "hunter2")]);
-    assert_eq!(code, Some(1), "{v}");
-    assert!(
-        v["error"]["message"].as_str().unwrap().contains("at least 16") && v["error"]["fix"].as_str().unwrap().contains("openssl rand"),
-        "{v}"
-    );
-
-    let pw = [("SITE_PASSWORD", PASSWORD), ("FAKE_RS_WEB_NO_INDEX", "1")];
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &pw);
-    assert_eq!(code, Some(3), "{v}");
-    let q = v["question"].as_str().unwrap();
-    let (clear, enc) = q.split_once("Encrypted with SITE_PASSWORD:").unwrap_or_else(|| panic!("{q}"));
-    assert!(clear.contains("In the clear:") && clear.contains("1a00000003") && !clear.contains("1a00000004"), "{q}");
-    assert!(enc.contains("1a00000004 Shallow clones break git describe"), "{q}");
-    let (v, code) = site(&env, &["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], &pw);
-    assert_eq!((v["status"].as_str(), code), (Some("built"), Some(0)), "{v}");
-    assert!(v["protected"].as_u64().unwrap() > 0, "{v}");
-    let stage = env.dir.path().join("cache/rkb/site/stage");
-    let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(stage.join("site.json")).unwrap()).unwrap();
-    let prot: Vec<&str> = index["protected"].as_array().unwrap().iter().map(|l| l["id"].as_str().unwrap()).collect();
-    assert!(prot.contains(&"1a00000004") && !index["tags"].to_string().contains("1a00000004"), "{index}");
-    assert!(stage.join("protected/general/git/shallow-clones-break-git-describe.md").is_file());
-    let published = std::fs::read_to_string(env.kb().join("site/published.json")).unwrap();
-    assert!(published.contains("\"encrypted\"") && published.contains("1a00000004"), "{published}");
-
-    let (v, code) = site(
-        &env,
-        &["site", "build", "--out", out_s],
-        &[
-            pw[0],
-            pw[1],
-            ("FAKE_RS_WEB_EXTRA", "cipher/index.html"),
-            ("FAKE_RS_WEB_TEXT", "<div data-encrypted=\"Shallow clones break git describe\"></div>"),
-        ],
-    );
-    assert_eq!(code, Some(0), "text inside ciphertext attributes is not plain text: {v}");
-    let (v, code) = site(
-        &env,
-        &["site", "build", "--out", out_s],
-        &[pw[0], pw[1], ("FAKE_RS_WEB_EXTRA", "about/index.html"), ("FAKE_RS_WEB_TEXT", "Shallow clones break git describe")],
-    );
-    assert_eq!(code, Some(1), "{v}");
-    let m = v["error"]["message"].as_str().unwrap();
-    assert!(m.contains("about/index.html: shows protected lesson `1a00000004` in plain text"), "{m}");
-    assert!(!m.contains("Shallow clones"), "the finding names the lesson by id only: {m}");
-    let public_query = "public searchable phrase";
-    let p = env.kb().join("general/git/rebase-with-local-edits-using-autostash.md");
-    let text = std::fs::read_to_string(&p).unwrap().replacen("\n---\n", &format!("\nqueries:\n  - {public_query}\n---\n"), 1);
-    std::fs::write(p, text).unwrap();
-    let p = env.kb().join("general/git/shallow-clones-break-git-describe.md");
-    let text = std::fs::read_to_string(&p).unwrap().replacen("\n---\n", &format!("\nqueries:\n  - {public_query}\n---\n"), 1);
-    std::fs::write(p, text).unwrap();
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &[pw[0], pw[1]]);
-    assert_eq!(code, Some(0), "a query shared with a public lesson is not a leak: {v}");
-    let public_index: serde_json::Value = serde_json::from_slice(&std::fs::read(out.join("public.json")).unwrap()).unwrap();
-    assert!(
-        public_index["lessons"].as_array().unwrap().iter().any(|lesson| lesson["id"] == "1a00000003"),
-        "the public lesson is still published: {public_index}"
-    );
-    assert!(public_index.to_string().contains("public searchable phrase"), "the public query is present in rendered metadata");
-    assert!(public_index.to_string().contains("rebase"), "public tags are present in rendered metadata");
-    let protected_path = env.dir.path().join("cache/rkb/site/stage/protected/general/git/shallow-clones-break-git-describe.md");
-    assert!(std::fs::read_to_string(protected_path).unwrap().contains(public_query), "the query remains in the protected lesson copy");
-    let public_lesson = env.dir.path().join("cache/rkb/site/stage/lessons/general/git/rebase-with-local-edits-using-autostash.md");
-    assert!(std::fs::read_to_string(public_lesson).unwrap().contains(public_query), "the query is published in its public lesson");
-    let (v, code) = site(
-        &env,
-        &["site", "build", "--out", out_s],
-        &[pw[0], pw[1], ("FAKE_RS_WEB_EXTRA", "general/git/shallow-clones-break-git-describe/index.html"), ("FAKE_RS_WEB_TEXT", "x")],
-    );
-    assert_eq!(code, Some(1), "{v}");
-    let m = v["error"]["message"].as_str().unwrap();
-    assert!(m.contains("a page at the path of protected lesson `1a00000004`"), "{m}");
-
-    let p = env.kb().join("general/git/shallow-clones-break-git-describe.md");
-    std::fs::write(&p, std::fs::read_to_string(&p).unwrap().replacen("\n---\n", "\nlabels:\n  sensitivity: public\n---\n", 1)).unwrap();
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &pw);
-    assert_eq!(code, Some(3), "encrypted before, public now: asks again: {v}");
-    let q = v["question"].as_str().unwrap();
-    assert!(q.contains("In the clear:\n  1a00000004"), "{q}");
+    published_ok(&env, out.to_str().unwrap());
+    let site = env.kb().join("site");
+    std::fs::remove_file(site.join("config.lua")).unwrap();
+    std::fs::remove_dir_all(site.join("templates")).unwrap();
+    let other = env.dir.path().join("other");
+    let (v, code) = publish(&env, &["publish", other.to_str().unwrap()], &[]);
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("not_found"), Some(1)), "{v}");
+    assert!(v["error"]["fix"].as_str().unwrap().contains("site/config.lua"), "{v}");
+    assert!(!other.exists(), "no template, nothing written: {v}");
 }
 
 #[test]
-fn site_group_passwords() {
-    let env = site_kb();
-    let out = env.dir.path().join("out");
-    let out_s = out.to_str().unwrap();
-    let toml = env.kb().join("kb.toml");
-    std::fs::write(&toml, std::fs::read_to_string(&toml).unwrap().replacen("[labels]\n", "[labels]\npassword = [\"team-a\"]\n", 1))
-        .unwrap();
-    let p = env.kb().join("general/git/squash-fixups-with-autosquash.md");
-    std::fs::write(
-        &p,
-        std::fs::read_to_string(&p).unwrap().replace("  sensitivity: public\n", "  sensitivity: public\n  password: team-a\n"),
-    )
-    .unwrap();
-    let no_index = ("FAKE_RS_WEB_NO_INDEX", "1");
-
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &[no_index, ("SITE_PASSWORD_TEAM_A", "short")]);
-    assert_eq!(code, Some(1), "{v}");
-    assert!(v["error"]["message"].as_str().unwrap().contains("SITE_PASSWORD_TEAM_A has 5 characters"), "{v}");
-
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &[no_index]);
-    assert_eq!(code, Some(3), "{v}");
-    let q = v["question"].as_str().unwrap();
-    assert!(q.contains("1a00000003") && !q.contains("1a00000005"), "a lesson whose password is unset is left out: {q}");
-    let (v, code) = site(&env, &["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], &[no_index]);
-    assert_eq!(code, Some(0), "{v}");
-    assert!(v["notes"].to_string().contains("1 lessons were left out; set SITE_PASSWORD_TEAM_A"), "{v}");
-
-    let team = [no_index, ("SITE_PASSWORD_TEAM_A", PASSWORD)];
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &team);
-    assert_eq!(code, Some(3), "{v}");
-    let q = v["question"].as_str().unwrap();
-    assert!(q.contains("Encrypted with SITE_PASSWORD_TEAM_A:\n  1a00000005"), "a password label protects a public lesson: {q}");
-    let (v, code) = site(&env, &["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], &team);
-    assert_eq!(code, Some(0), "{v}");
-    let published = std::fs::read_to_string(env.kb().join("site/published.json")).unwrap();
-    assert!(published.contains("\"1a00000005\": \"team-a\""), "{published}");
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &team);
-    assert_eq!(code, Some(0), "published with this password before, so no question: {v}");
-
-    std::fs::write(
-        &p,
-        std::fs::read_to_string(&p).unwrap().replace("  sensitivity: public\n  password: team-a\n", "  sensitivity: internal\n"),
-    )
-    .unwrap();
-    let site_pw = [no_index, ("SITE_PASSWORD", PASSWORD)];
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &site_pw);
-    assert_eq!(code, Some(3), "another password asks again: {v}");
-    let q = v["question"].as_str().unwrap();
-    assert!(q.contains("Encrypted with SITE_PASSWORD:\n") && q.contains("1a00000005"), "{q}");
-
-    std::fs::remove_file(env.kb().join("site/published.json")).unwrap();
-    std::fs::write(
-        env.dir.path().join("state/rkb/site-published.json"),
-        r#"{"clear":["1a00000003"],"encrypted":["1a00000001","1a00000002","1a00000004","1a00000005","1a00000006","1a00000007","1a00000008","1a00000009","1a00000010","1a00000011","1a00000012","1a00000013","1a00000014","1a00000015","1a00000016"]}"#,
-    )
-    .unwrap();
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &site_pw);
-    assert_eq!(code, Some(0), "an old record's encrypted list is the site password: {v}");
-    let published = std::fs::read_to_string(env.kb().join("site/published.json")).unwrap();
-    assert!(published.contains("\"1a00000016\": \"\""), "the old per-machine record is merged into the knowledge base: {published}");
-}
-
-#[test]
-fn site_record_travels_with_the_knowledge_base() {
-    let env = site_kb();
-    let out = env.dir.path().join("out");
-    let out_s = out.to_str().unwrap();
-
-    let (v, code) = site(&env, &["site", "build", "--no-ask", "--out", out_s], &[]);
-    assert_eq!(code, Some(1), "{v}");
-    let m = v["error"]["message"].as_str().unwrap();
-    assert!(m.contains("2 lessons wait") && m.contains("has no site/published.json"), "{m}");
-    assert!(v["error"]["fix"].as_str().unwrap().contains("rkb site build` on your machine"), "{v}");
-    assert!(!out.exists(), "no site is written");
-    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "", "the knowledge base is unchanged");
-    assert!(!env.kb().join("site/published.json").exists());
-
-    let before = commit_count(&env);
-    site_built(&env, out_s);
-    assert_eq!(commit_count(&env), before + 1);
-    assert_eq!(head_subject(&env), "site: publish 2 lessons");
-    let text = std::fs::read_to_string(env.kb().join("site/published.json")).unwrap();
-    assert_eq!(text, "{\n  \"clear\": [\n    \"1a00000003\",\n    \"1a00000005\"\n  ],\n  \"encrypted\": {}\n}\n");
-    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
-
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &[]);
-    assert_eq!(code, Some(0), "{v}");
-    assert_eq!(commit_count(&env), before + 1, "an unchanged record is not committed again");
-
-    std::fs::remove_dir_all(env.dir.path().join("state/rkb")).unwrap();
-    let (v, code) = site(&env, &["site", "build", "--no-ask", "--out", out_s], &[]);
-    assert_eq!((v["status"].as_str(), code), (Some("built"), Some(0)), "another machine does not ask: {v}");
-    assert_eq!(commit_count(&env), before + 1);
-}
-
-#[test]
-fn lint_checks_the_site_image() {
-    let env = kb_with_topics();
-    let toml = env.kb().join("kb.toml");
-    let base = std::fs::read_to_string(&toml).unwrap();
-    std::fs::write(&toml, format!("{base}\n[site]\nimage = \"site/og.gif\"\n")).unwrap();
-    let (v, code) = env.json(&["lint"], "");
-    assert_eq!(code, Some(1), "{v}");
-    assert!(v.to_string().contains("config/site-image") && v.to_string().contains("must be a png or jpg"), "{v}");
-    std::fs::write(&toml, format!("{base}\n[site]\nanalytics = \"plausible\"\n")).unwrap();
-    let (v, code) = env.json(&["lint"], "");
-    assert_eq!(code, Some(1), "{v}");
-    assert!(v.to_string().contains("config/site-analytics"), "{v}");
-    std::fs::write(&toml, format!("{base}\n[site]\nimage = \"site/og.png\"\n")).unwrap();
-    let (v, _) = env.json(&["lint"], "");
-    assert!(!v.to_string().contains("config/site-image"), "{v}");
-}
-
-#[test]
-fn site_no_ask_holds_lessons_that_wait() {
-    let env = site_kb();
-    let out = env.dir.path().join("out");
-    let out_s = out.to_str().unwrap();
-    site_built(&env, out_s);
-    let (v, _) = env.json(&["doctor"], "");
-    let c = v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "site approvals").cloned().unwrap_or_else(|| panic!("{v}"));
-    assert_eq!(c["status"], "ok", "{c}");
-    let new = env.kb().join("general/git/shallow-clones-break-git-describe.md");
-    std::fs::write(&new, std::fs::read_to_string(&new).unwrap().replacen("\n---\n", "\nlabels:\n  sensitivity: public\n---\n", 1)).unwrap();
-    let linker = env.kb().join("general/git/squash-fixups-with-autosquash.md");
-    let text = std::fs::read_to_string(&linker).unwrap();
-    std::fs::write(&linker, text.replacen("\n## ", "\nSee [describe](shallow-clones-break-git-describe.md).\n\n## ", 1)).unwrap();
-    let status = stdout(&env.git(&["status", "--porcelain"]));
-
-    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
-    c.env("RKB_RS_WEB", env.dir.path().join("fake/rs-web"))
-        .env("CLAUDECODE", "1")
-        .env_remove("SITE_PASSWORD")
-        .env("GITHUB_ACTIONS", "true");
-    let o = rkb_with(c, &["site", "build", "--no-ask", "--out", out_s, "--format", "json"], "");
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
-    assert_eq!((v["status"].as_str(), o.status.code()), (Some("built"), Some(0)), "{v}");
-    assert_eq!(v["lessons"], 1, "only the lesson that neither waits nor links to one: {v}");
-    let notes = v["notes"].to_string();
-    assert!(
-        notes.contains("1a00000004 Shallow clones break git describe") && notes.contains("1a00000005") && notes.contains("links to one"),
-        "{v}"
-    );
-    let err = String::from_utf8_lossy(&o.stderr);
-    assert!(err.contains("::warning title=rkb site::2 lessons were left out"), "{err}");
-    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), status, "--no-ask never writes the knowledge base");
-
-    let (v, _) = env.json(&["doctor"], "");
-    let c = v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "site approvals").cloned().unwrap_or_else(|| panic!("{v}"));
-    assert_eq!(c["status"], "warn", "{c}");
-    assert!(c["detail"].as_str().unwrap().contains("1a00000004 Shallow clones break git describe"), "{c}");
-    assert!(c["fix"].as_str().unwrap().contains("rkb site build"), "{c}");
-
-    std::fs::write(env.kb().join("site/published.json"), "{\"clear\": [], \"encrypted\": {}}\n").unwrap();
-    std::fs::remove_file(env.dir.path().join("state/rkb/site-published.json")).ok();
-    let (v, code) = site(&env, &["site", "build", "--no-ask", "--out", out_s], &[]);
-    assert_eq!(code, Some(1), "{v}");
-    assert!(v["error"]["message"].as_str().unwrap().contains("nothing would be published"), "{v}");
-}
-
-#[test]
-fn site_serve_restages_when_the_knowledge_base_changes() {
-    let env = site_kb();
-    site_built(&env, env.dir.path().join("out").to_str().unwrap());
-    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
-    c.env("RKB_RS_WEB", env.dir.path().join("fake/rs-web")).env("CLAUDECODE", "1").env_remove("SITE_PASSWORD");
-    let mut child = c.args(["site", "serve", "--port", "4999"]).stderr(std::process::Stdio::piped()).spawn().unwrap();
-    /// Stops the fake rs-web and rkb however the test ends, so no server outlives it.
-    struct Stop(u32, std::rc::Rc<std::cell::RefCell<Option<PathBuf>>>);
-    impl Drop for Stop {
-        fn drop(&mut self) {
-            if let Some(d) = self.1.borrow().as_ref() {
-                let _ = std::fs::write(d.join("stop"), "");
-            }
-            let _ = std::process::Command::new("kill").arg(self.0.to_string()).status();
-        }
-    }
-    let stage = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let _stop = Stop(child.id(), stage.clone());
-    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let sink = lines.clone();
-    let err = child.stderr.take().unwrap();
-    std::thread::spawn(move || {
-        use std::io::BufRead;
-        for l in std::io::BufReader::new(err).lines().map_while(Result::ok) {
-            sink.lock().unwrap().push(l);
-        }
-    });
-    let wait_for = |what: &dyn Fn() -> bool, why: &str| {
-        for _ in 0..100 {
-            if what() {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        panic!("{why}: {:?}", lines.lock().unwrap());
-    };
-    let dir = std::cell::RefCell::new(PathBuf::new());
-    wait_for(
-        &|| {
-            let found = lines
-                .lock()
-                .unwrap()
-                .iter()
-                .find_map(|l| l.split(" from ").nth(1).and_then(|r| r.split(" on port").next()).map(PathBuf::from));
-            found.map(|d| *dir.borrow_mut() = d).is_some()
-        },
-        "serve starts",
-    );
-    let dir = dir.into_inner();
-    *stage.borrow_mut() = Some(dir.clone());
-    assert!(!dir.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')), "no hidden folder: {}", dir.display());
-    wait_for(&|| dir.join("serve-args").is_file(), "rs-web runs");
-    assert!(std::fs::read_to_string(dir.join("serve-args")).unwrap().contains("--watch"), "rs-web watches");
-
-    let staged = dir.join("lessons/general/git/rebase-with-local-edits-using-autostash.md");
-    let lesson = env.kb().join("general/git/rebase-with-local-edits-using-autostash.md");
-    std::fs::write(&lesson, format!("{}\nLIVE EDIT\n", std::fs::read_to_string(&lesson).unwrap())).unwrap();
-    wait_for(&|| std::fs::read_to_string(&staged).is_ok_and(|t| t.contains("LIVE EDIT")), "the edit is staged");
-
-    let new = env.kb().join("general/git/shallow-clones-break-git-describe.md");
-    std::fs::write(&new, std::fs::read_to_string(&new).unwrap().replacen("\n---\n", "\nlabels:\n  sensitivity: public\n---\n", 1)).unwrap();
-    wait_for(
-        &|| lines.lock().unwrap().iter().any(|l| l.contains("wait for `rkb site build`") && l.contains("1a00000004")),
-        "a new lesson waits",
-    );
-    assert!(!dir.join("lessons/general/git/shallow-clones-break-git-describe.md").exists(), "not staged before the user says yes");
-
-    std::fs::write(dir.join("stop"), "").unwrap();
-    let status = child.wait().unwrap();
-    assert!(status.success(), "{:?}", lines.lock().unwrap());
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn site_ci_writes_the_workflow_once() {
-    let env = site_kb();
-    let toml = env.kb().join("kb.toml");
-    std::fs::write(&toml, std::fs::read_to_string(&toml).unwrap().replacen("[labels]\n", "[labels]\npassword = [\"team-a\"]\n", 1))
-        .unwrap();
-    assert!(env.git(&["-c", "user.name=T", "-c", "user.email=t@example.org", "commit", "-qam", "groups"]).status.success());
-    let branch = stdout(&env.git(&["rev-parse", "--abbrev-ref", "HEAD"])).trim().to_string();
-
-    let (v, code) = site(&env, &["site", "ci"], &[]);
-    assert_eq!((v["status"].as_str(), code), (Some("written"), Some(0)), "{v}");
-    assert_eq!(
-        v["secrets"],
-        serde_json::json!(["SITE_PASSWORD", "SITE_PASSWORD_TEAM_A", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"]),
-        "{v}"
-    );
-    assert_eq!(v["variables"], serde_json::json!(["CLOUDFLARE_PROJECT_NAME"]));
-    assert!(v["notes"].to_string().contains("base_url"), "{v}");
-    assert_eq!(v["links"]["status"], "written", "{v}");
-    assert_eq!(head_subject(&env), "site: add the CI workflows");
-    let links = std::fs::read_to_string(env.kb().join(".github/workflows/links.yml")).unwrap();
-    assert!(!links.contains("--exclude"), "no base_url, nothing to exclude: {links}");
-
-    std::fs::remove_file(env.kb().join(".github/workflows/links.yml")).unwrap();
-    std::fs::write(&toml, format!("{}\n[site]\nbase_url = \"https://kb.example.org/\"\n", std::fs::read_to_string(&toml).unwrap()))
-        .unwrap();
-    assert!(env.git(&["-c", "user.name=T", "-c", "user.email=t@example.org", "commit", "-qam", "site"]).status.success());
-    let (v, _) = site(&env, &["site", "ci"], &[]);
-    assert_eq!((v["status"].as_str(), v["links"]["status"].as_str()), (Some("kept"), Some("written")), "{v}");
-    assert_eq!(head_subject(&env), "site: add the link check workflow");
-    let links = std::fs::read_to_string(env.kb().join(".github/workflows/links.yml")).unwrap();
-    let l: serde_norway::Value = serde_norway::from_str(&links).unwrap();
-    assert!(l["on"]["schedule"][0]["cron"].as_str().is_some() && l["on"].get("workflow_dispatch").is_some(), "{links}");
-    assert_eq!(l["permissions"]["contents"].as_str(), Some("read"));
-    let lsteps = l["jobs"]["links"]["steps"].as_sequence().unwrap();
-    for u in lsteps.iter().filter_map(|s| s["uses"].as_str()) {
-        let sha = u.split_once('@').map(|(_, v)| v).unwrap_or_default();
-        assert!(sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()), "`{u}` is not pinned to a commit");
-    }
-    let check = lsteps.iter().find(|s| s["name"].as_str() == Some("Check links")).unwrap();
-    assert!(check["uses"].as_str().unwrap().starts_with("lycheeverse/lychee-action@"));
-    let args = check["with"]["args"].as_str().unwrap();
-    assert!(args.contains("--exclude '^https://kb\\.example\\.org'") && args.ends_with("'dist/**/*.html'"), "{args}");
-    let build = lsteps.iter().find(|s| s["name"].as_str() == Some("Build")).unwrap();
-    assert!(build["env"].get("SITE_PASSWORD").is_none(), "protected pages are not checked: {links}");
-    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
-
-    let text = std::fs::read_to_string(env.kb().join(".github/workflows/site.yml")).unwrap();
-    let y: serde_norway::Value = serde_norway::from_str(&text).unwrap();
-    assert_eq!(y["on"]["push"]["branches"][0].as_str(), Some(branch.as_str()), "{text}");
-    assert!(y["on"].get("workflow_dispatch").is_some(), "{text}");
-    let job = &y["jobs"]["deploy"];
-    assert_eq!(job["env"]["RKB_VERSION"].as_str(), Some(env!("CARGO_PKG_VERSION")));
-    let steps = job["steps"].as_sequence().unwrap();
-    let step = |name: &str| steps.iter().find(|s| s["name"].as_str() == Some(name)).cloned().unwrap_or_else(|| panic!("{name}: {text}"));
-    let cache = step("Cache rs-web");
-    assert_eq!(cache["with"]["key"].as_str(), Some("rs-web-${{ runner.os }}-${{ env.RKB_VERSION }}"));
-    assert_eq!(cache["with"]["path"].as_str(), Some("~/.local/share/rkb/bin"));
-    let install = step("Install rkb")["run"].as_str().unwrap().to_string();
-    assert!(install.contains("rkb-linux-x86_64-v$RKB_VERSION.tar.gz") && install.contains("sha256sum -c"), "{install}");
-    let build = &step("Build");
-    assert_eq!(build["run"].as_str(), Some("rkb site build --no-ask --out dist"));
-    assert_eq!(build["env"]["USER"].as_str(), Some(""), "the runner's user name is not a leak");
-    assert_eq!(build["env"]["SITE_PASSWORD"].as_str(), Some("${{ secrets.SITE_PASSWORD }}"));
-    assert_eq!(build["env"]["SITE_PASSWORD_TEAM_A"].as_str(), Some("${{ secrets.SITE_PASSWORD_TEAM_A }}"));
-    let create_step = step("Create the Pages project if it does not exist");
-    let create = create_step["run"].as_str().unwrap();
-    assert!(create.contains("pages project create") && create.contains(&format!("--production-branch={branch}")), "{create}");
-    assert!(
-        create.contains("already exists") && create.contains("exit 1") && !create.contains("|| true"),
-        "only exists is ignored: {create}"
-    );
-    assert_eq!(create_step["env"]["PROJECT"].as_str(), Some("${{ vars.CLOUDFLARE_PROJECT_NAME }}"));
-    assert_eq!(y["concurrency"]["cancel-in-progress"].as_bool(), Some(true));
-    assert_eq!(steps[0]["with"]["persist-credentials"].as_bool(), Some(false));
-    for s in steps.iter().filter_map(|s| s["uses"].as_str()) {
-        let sha = s.split_once('@').map(|(_, v)| v).unwrap_or_default();
-        assert!(sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()), "`{s}` is not pinned to a commit");
-    }
-    let deploy = &step("Deploy");
-    assert!(deploy["uses"].as_str().unwrap().starts_with("cloudflare/wrangler-action@"));
-    assert!(deploy["with"]["wranglerVersion"].as_str().unwrap().split('.').count() == 3, "wrangler is pinned exactly");
-    assert_eq!(
-        deploy["with"]["command"].as_str(),
-        Some(
-            format!("pages deploy dist --project-name=${{{{ vars.CLOUDFLARE_PROJECT_NAME }}}} --branch={branch} --commit-dirty=true")
-                .as_str()
-        )
-    );
-    assert_eq!(deploy["with"]["apiToken"].as_str(), Some("${{ secrets.CLOUDFLARE_API_TOKEN }}"));
-
-    let doctor = |env: &Env| {
-        let (v, _) = env.json(&["doctor"], "");
-        v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "site workflow").cloned().unwrap_or_else(|| panic!("{v}"))
-    };
-    assert_eq!(doctor(&env)["status"], "ok");
-    std::fs::write(env.kb().join(".github/workflows/site.yml"), text.replace(env!("CARGO_PKG_VERSION"), "0.0.1-old")).unwrap();
-    let c = doctor(&env);
-    assert_eq!(c["status"], "warn", "{c}");
-    assert!(c["detail"].as_str().unwrap().contains("0.0.1-old") && c["fix"].as_str().unwrap().contains(env!("CARGO_PKG_VERSION")), "{c}");
-
-    std::fs::write(env.kb().join(".github/workflows/site.yml"), "# mine\n").unwrap();
-    let before = commit_count(&env);
-    let (v, code) = site(&env, &["site", "ci"], &[]);
-    assert_eq!((v["status"].as_str(), code), (Some("kept"), Some(0)), "{v}");
-    assert_eq!(std::fs::read_to_string(env.kb().join(".github/workflows/site.yml")).unwrap(), "# mine\n");
-    assert_eq!(commit_count(&env), before);
-}
-
-#[test]
-fn site_refuses_links_to_private_lessons_and_old_rs_web() {
-    let env = site_kb();
-    let (v, code) = site(&env, &["site", "build"], &[("FAKE_RS_WEB_VERSION", "0.3.9")]);
-    assert_eq!(code, Some(3), "the question comes before rs-web is needed: {v}");
-    let (v, code) = site(&env, &["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], &[("FAKE_RS_WEB_VERSION", "0.3.9")]);
-    assert_eq!(code, Some(1), "{v}");
-    assert!(v["error"]["message"].as_str().unwrap().contains("0.3.9") && v["error"]["fix"].as_str().unwrap().contains("0.4.3"), "{v}");
-
+fn publish_refuses_links_to_private_lessons() {
+    let env = publish_kb();
     let p = env.kb().join("general/git/rebase-with-local-edits-using-autostash.md");
     let text = std::fs::read_to_string(&p).unwrap();
     std::fs::write(&p, text.replacen("\n## Steps", "\nSee [describe](shallow-clones-break-git-describe.md).\n\n## Steps", 1)).unwrap();
-    let (v, code) = site(&env, &["site", "build"], &[]);
+    let (v, code) = publish(&env, &["publish", "out"], &[]);
     assert_eq!(code, Some(1), "{v}");
     let m = v["error"]["message"].as_str().unwrap();
     assert!(m.contains("rebase-with-local-edits-using-autostash.md -> general/git/shallow-clones-break-git-describe.md"), "{m}");
-}
-
-#[test]
-fn site_init_keeps_user_edits_and_is_used() {
-    let env = site_kb();
-    let (v, code) = site(&env, &["site", "init"], &[]);
-    assert_eq!(code, Some(0), "{v}");
-    assert_eq!(v["written"].as_array().unwrap().len(), 21, "{v}");
-    let log = stdout(&env.git(&["log", "-1", "--name-only", "--format=%s"]));
-    assert!(log.starts_with("site: add the rs-web template") && log.contains("site/config.lua"), "{log}");
-
-    let cfg = env.kb().join("site/config.lua");
-    std::fs::write(&cfg, "-- mine\n").unwrap();
-    std::fs::remove_file(env.kb().join("site/templates/list.html")).unwrap();
-    let (v, _) = site(&env, &["site", "init"], &[]);
-    assert_eq!(v["written"], serde_json::json!(["site/templates/list.html"]), "{v}");
-    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "-- mine\n");
-
-    let (v, code) = env.json(&["lint"], "");
-    assert_eq!(code, Some(0), "lint ignores site/: {v}");
-    site_built(&env, env.dir.path().join("out").to_str().unwrap());
-    let staged = std::fs::read_to_string(env.dir.path().join("cache/rkb/site/stage/config.lua")).unwrap();
-    assert_eq!(staged, "-- mine\n", "the build uses the knowledge base's template");
 }
 
 /// A 1x1 PNG whose `eXIf` chunk holds a GPS position.
@@ -4315,8 +3826,8 @@ fn png_with_gps() -> Vec<u8> {
 
 /// Links `layout.png` (with GPS EXIF) from the public autostash lesson and `diagram.svg` from the
 /// internal shallow-clones lesson.
-fn site_kb_with_images() -> Env {
-    let env = site_kb();
+fn publish_kb_with_images() -> Env {
+    let env = publish_kb();
     let dir = env.kb().join("general/git");
     let link = |file: &str, img: &str| {
         let p = dir.join(format!("{file}.md"));
@@ -4337,369 +3848,236 @@ fn site_kb_with_images() -> Env {
 }
 
 #[test]
-fn site_stages_images_without_metadata() {
-    let env = site_kb_with_images();
+fn publish_stages_images_without_metadata() {
+    let env = publish_kb_with_images();
     let out = env.dir.path().join("out");
     let out_s = out.to_str().unwrap();
-    let pw = [("SITE_PASSWORD", PASSWORD), ("FAKE_RS_WEB_NO_INDEX", "1")];
-    let (v, _) = site(&env, &["site", "build", "--out", out_s], &pw);
-    let (v, code) = site(&env, &["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], &pw);
+    let pw = [("SITE_PASSWORD", PASSWORD)];
+    let (v, _) = publish(&env, &["publish", out_s], &pw);
+    let (v, code) = publish(&env, &["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], &pw);
     assert_eq!(code, Some(0), "{v}");
-    let stage = env.dir.path().join("cache/rkb/site/stage");
-    let png = std::fs::read(stage.join("lessons/general/git/rebase-with-local-edits-using-autostash.assets/layout.png")).unwrap();
+    let png = std::fs::read(out.join("lessons/general/git/rebase-with-local-edits-using-autostash.assets/layout.png")).unwrap();
     assert!(png.starts_with(b"\x89PNG") && !String::from_utf8_lossy(&png).contains("GPS"), "the staged image holds no EXIF");
-    let svg = stage.join("protected/general/git/shallow-clones-break-git-describe.assets/diagram.svg");
+    let svg = out.join("protected/general/git/shallow-clones-break-git-describe.assets/diagram.svg");
     let b64 = std::fs::read_to_string(svg.with_extension("svg.b64")).unwrap();
     assert!(b64.starts_with("PHN2Zy"), "the protected image is staged as base64 to embed: {b64}");
 
-    let svg_bytes = std::fs::read(&svg).unwrap();
-    let (v, code) = site(
-        &env,
-        &["site", "build", "--out", out_s],
-        &[pw[0], pw[1], ("FAKE_RS_WEB_EXTRA", "img/diagram.svg"), ("FAKE_RS_WEB_TEXT", std::str::from_utf8(&svg_bytes).unwrap())],
-    );
-    assert_eq!(code, Some(1), "{v}");
-    assert!(v["error"]["message"].as_str().unwrap().contains("an image of protected lesson `1a00000004` as a plain file"), "{v}");
-
-    let home = format!("<svg><text>{}/secret</text></svg>", env.dir.path().display());
-    let (v, code) = site(
-        &env,
-        &["site", "build", "--out", out_s],
-        &[pw[0], pw[1], ("FAKE_RS_WEB_EXTRA", "general/x.svg"), ("FAKE_RS_WEB_TEXT", &home)],
-    );
-    assert_eq!(code, Some(1), "{v}");
-    assert!(v["error"]["message"].as_str().unwrap().contains("general/x.svg: "), "an SVG is scanned for leaks: {v}");
-
     std::fs::write(env.kb().join("general/git/rebase-with-local-edits-using-autostash.assets/layout.png"), b"\x89PNG\r\n\x1a\nbroken")
         .unwrap();
-    let (v, code) = site(&env, &["site", "build", "--out", out_s], &pw);
+    let (v, code) = publish(&env, &["publish", out_s], &pw);
     assert_eq!(code, Some(1), "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("layout.png: truncated PNG"), "{v}");
 }
 
-/// Runs only with `RKB_TEST_RS_WEB` set to an rs-web binary.
+/// The output checks read the `dist/` folder in `dir` against the `site.json` publish left there.
 #[test]
-fn site_builds_with_real_rs_web() {
-    let Ok(rs_web) = std::env::var("RKB_TEST_RS_WEB") else { return };
-    let env = site_kb();
+fn publish_check() {
+    let env = publish_kb();
     let out = env.dir.path().join("out");
-    let real = |args: &[&str], password: bool| {
-        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
-        c.env("RKB_RS_WEB", &rs_web).env("CLAUDECODE", "1").env_remove("SITE_PASSWORD");
-        if password {
-            c.env("SITE_PASSWORD", PASSWORD);
-        }
-        let mut all = args.to_vec();
-        all.extend(["--format", "json"]);
-        let o = rkb_with(c, &all, "");
-        (serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o))), o.status.code())
-    };
-    let (v, code) = real(&["site", "build", "--out", out.to_str().unwrap()], false);
-    assert_eq!(code, Some(3), "{v}");
-    let (v, code) = real(&["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], false);
-    assert_eq!(code, Some(0), "{v}");
-    let page = std::fs::read_to_string(out.join("general/git/rebase-with-local-edits-using-autostash/index.html")).unwrap();
-    assert!(page.contains("Rebase with local edits using autostash") && page.contains("autosquash"), "{page}");
-    let redirect = std::fs::read_to_string(out.join("lessons/1a00000003/index.html")).unwrap();
-    assert!(redirect.contains("/general/git/rebase-with-local-edits-using-autostash/"), "{redirect}");
-    for part in [
-        "href=/general/git/>git</a>",
-        "<strong>Recipe.</strong>",
-        "id=when-to-use",
-        "id=steps",
-        "id=evidence",
-        "On this page",
-        "<span>25 Sep 2026</span>",
-        "data-date=2026-09-25",
-        "read it</span>",
-        "href=/tags/rebase/>rebase</a>",
-        "Next in git",
-        "href=/general/git/squash-fixups-with-autosquash/",
-        "aria-current=page",
+    let out_s = out.to_str().unwrap();
+    published_ok(&env, out_s);
+
+    let check = |env: &Env| publish(env, &["publish", "--check", out_s], &[]);
+    let (v, code) = check(&env);
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("not_found"), Some(1)), "{v}");
+    assert!(v["error"]["fix"].as_str().unwrap().contains("rs-web build"), "{v}");
+    assert!(!out.join("dist").exists());
+
+    let dist = out.join("dist");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(dist.join("index.html"), "<html><body>Rebase with local edits using autostash</body></html>\n").unwrap();
+    let (v, code) = check(&env);
+    assert_eq!((v["status"].as_str(), code), (Some("ok"), Some(0)), "{v}");
+    assert_eq!(v["findings"], 0, "{v}");
+
+    let home = format!("{}/secret", env.dir.path().display());
+    std::fs::write(dist.join("index.html"), format!("<html><body>{home}</body></html>\n")).unwrap();
+    let (v, code) = check(&env);
+    assert_eq!(code, Some(1), "{v}");
+    let m = v["error"]["message"].as_str().unwrap();
+    assert!(m.contains("index.html: leak/path"), "{m}");
+
+    std::fs::write(dist.join("index.html"), "x").unwrap();
+    std::fs::create_dir_all(dist.join("lessons/1a00000004")).unwrap();
+    std::fs::write(dist.join("lessons/1a00000004/index.html"), "x").unwrap();
+    std::fs::create_dir_all(dist.join("protected/1a00000099")).unwrap();
+    std::fs::write(dist.join("protected/1a00000099/index.html"), "x").unwrap();
+    let (v, code) = check(&env);
+    assert_eq!(code, Some(1), "{v}");
+    let m = v["error"]["message"].as_str().unwrap();
+    for want in [
+        "a public lesson page for `1a00000004`, which is not published that way",
+        "a protected lesson page for `1a00000099`, which is not published that way",
     ] {
-        assert!(page.contains(part), "the lesson page lacks {part}: {page}");
+        assert!(m.contains(want), "{m}");
     }
-    assert!(out.join("feed.xml").is_file() && out.join("general/git/index.html").is_file());
-    assert!(out.join("static/site.js").is_file() && out.join("static/fonts/Geist-Variable.woff2").is_file());
-    let search: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("search.json")).unwrap()).unwrap();
-    let ids: Vec<&str> = search.as_array().unwrap().iter().map(|e| e["id"].as_str().unwrap()).collect();
-    assert_eq!(ids.len(), 2, "{search}");
-    assert!(ids.contains(&"1a00000003") && ids.contains(&"1a00000005"), "{search}");
-    assert!(search.to_string().contains("git pull --rebase --autostash"), "{search}");
-    assert!(
-        !out.join("lessons/1a00000004").exists()
-            && !out.join("general/git/shallow-clones-break-git-describe").exists()
-            && !out.join("protected").exists()
-            && !out.join("static/protected.json").exists()
-    );
-    assert!(!out.join("sitemap.xml").exists() && !out.join("robots.txt").exists(), "no base_url, no sitemap");
-    assert!(!std::fs::read_to_string(out.join("_headers")).unwrap().contains("pages.dev"), "no custom domain, no pages.dev rule");
-    assert!(!page.contains("og:url") && !page.contains("canonical"), "no base_url, no absolute URLs: {page}");
-    assert!(!std::fs::read_to_string(out.join("feed.xml")).unwrap().contains("localhost"));
+    std::fs::remove_dir_all(dist.join("lessons")).unwrap();
+    std::fs::remove_dir_all(dist.join("protected")).unwrap();
 
-    let toml = env.kb().join("kb.toml");
-    std::fs::write(&toml, format!("{}\n[site]\nbase_url = \"https://kb.example.org/\"\n", std::fs::read_to_string(&toml).unwrap()))
-        .unwrap();
-    let (v, code) = real(&["site", "build", "--out", out.to_str().unwrap()], true);
-    assert_eq!(code, Some(3), "{v}");
-    let (v, code) = real(&["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], true);
+    // The vendored Argon2 build ships as it is, so its minified tokens are not findings.
+    std::fs::create_dir_all(dist.join("static")).unwrap();
+    std::fs::write(dist.join("static/argon2.umd.min.js"), "var a=`function(){var r=1e3}`;").unwrap();
+    let (v, code) = check(&env);
     assert_eq!(code, Some(0), "{v}");
-    let page = std::fs::read_to_string(out.join("protected/1a00000004/index.html")).unwrap();
-    assert!(page.contains("encrypted-content") && page.contains("/site.js") && page.contains("unlock-form"), "{page}");
-    assert!(out.join("protected/index.html").is_file() && out.join("static/argon2.umd.min.js").is_file());
-    assert!(page.contains("noindex") && !page.contains("og:"), "{page}");
-    let url = "https://kb.example.org/general/git/rebase-with-local-edits-using-autostash/";
-    let lesson = std::fs::read_to_string(out.join("general/git/rebase-with-local-edits-using-autostash/index.html")).unwrap();
-    for part in ["og:url", "og:title", "og:description", "twitter:card", "canonical", url] {
-        assert!(lesson.contains(part), "the lesson page lacks {part}: {lesson}");
-    }
-    assert!(!lesson.contains("noindex"), "{lesson}");
-    let desc = lesson.split("og:description").next().unwrap().rsplit("content=").next().unwrap();
-    assert!(desc.starts_with("\"When you want to pull or rebase") && !desc.contains("When to use") && !desc.contains("git pull"), "{desc}");
-    let headers = std::fs::read_to_string(out.join("_headers")).unwrap();
-    assert!(headers.contains("Content-Security-Policy: default-src 'self'") && !headers.contains("unsafe-inline"), "{headers}");
-    assert!(!headers.contains("cloudflareinsights"), "no analytics unless asked: {headers}");
-    assert!(headers.contains("/protected/*\n  X-Robots-Tag: noindex"), "{headers}");
-    assert!(headers.contains("/static/v/*\n  Cache-Control: public, max-age=31536000, immutable"), "{headers}");
-    assert!(lesson.contains("og:image") && lesson.contains("https://kb.example.org/static/og.png"), "{lesson}");
-    assert!(lesson.contains("summary_large_image"), "{lesson}");
-    let og = std::fs::read(out.join("static/og.png")).unwrap();
-    assert!(og.starts_with(b"\x89PNG") && og[16..24] == [0, 0, 4, 176, 0, 0, 2, 118], "og.png is a 1200x630 PNG");
-    let css = lesson.split("/static/v/").nth(1).map(|r| r.split(['"', ' ', '>']).next().unwrap().to_string()).unwrap_or_default();
-    assert!(css.ends_with("/site.css") || lesson.contains("/static/v/"), "pages link hashed files: {lesson}");
-    for f in ["site.css", "site.js", "theme.js", "highlight.css"] {
-        let hashed = lesson.split(&format!("/{f}")).next().unwrap().rsplit("/static/v/").next().unwrap().to_string();
-        assert_eq!(hashed.len(), 12, "{f} is linked under a 12-hex hash: {lesson}");
-        assert!(out.join(format!("static/v/{hashed}/{f}")).is_file(), "{f} is published under its hash");
-    }
-    for h in ["Permissions-Policy: camera=()", "Cross-Origin-Opener-Policy: same-origin", "Cross-Origin-Resource-Policy: same-origin"] {
-        assert!(headers.contains(h), "{h}: {headers}");
-    }
-    assert!(headers.contains("https://:project.pages.dev/*\n  X-Robots-Tag: noindex"), "a custom domain hides pages.dev: {headers}");
-    let mut todo = vec![out.clone()];
-    while let Some(d) = todo.pop() {
-        for e in std::fs::read_dir(&d).unwrap().flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                todo.push(p);
-            } else if p.extension().is_some_and(|x| x == "html") {
-                let html = std::fs::read_to_string(&p).unwrap();
-                assert!(!html.contains("<script>"), "{} has an inline script", p.display());
-            }
-        }
-    }
-    let sitemap = std::fs::read_to_string(out.join("sitemap.xml")).unwrap();
-    assert!(sitemap.contains(&format!("<loc>{url}</loc>")) && sitemap.contains("<loc>https://kb.example.org/</loc>"), "{sitemap}");
-    assert!(!sitemap.contains("/protected/") && !sitemap.contains("/lessons/"), "{sitemap}");
-    assert!(std::fs::read_to_string(out.join("robots.txt")).unwrap().contains("Sitemap: https://kb.example.org/sitemap.xml"));
-    assert!(std::fs::read_to_string(out.join("feed.xml")).unwrap().contains(&format!("<link>{url}</link>")));
-    let feed = std::fs::read_to_string(out.join("feed.xml")).unwrap();
-    assert!(feed.contains("<description>When you want to pull or rebase") && feed.contains("<guid isPermaLink=\"false\">"), "{feed}");
-    assert!(
-        feed.contains("<atom:link href=\"https://kb.example.org/feed.xml\" rel=\"self\"") && feed.contains("<lastBuildDate>"),
-        "{feed}"
-    );
-    let sitemap = std::fs::read_to_string(out.join("sitemap.xml")).unwrap();
-    assert!(sitemap.contains(&format!("<loc>{url}</loc><lastmod>2026-09-25</lastmod>")), "{sitemap}");
-    let title = |rel: &str| {
-        let html = std::fs::read_to_string(out.join(rel).join("index.html")).unwrap_or_else(|e| panic!("{rel}: {e}"));
-        html.split("<title>").nth(1).unwrap().split("</title>").next().unwrap().to_string()
-    };
-    assert_eq!(title("general/git"), "Topic: git | Lessons learned");
-    assert_eq!(title("tags/rebase"), "Tag: rebase | Lessons learned");
-    assert_eq!(title("types/recipe"), "Type: Recipe | Lessons learned");
-    assert_eq!(title("all"), "All lessons | Lessons learned");
-    let recipes = std::fs::read_to_string(out.join("types/recipe/index.html")).unwrap();
-    assert!(recipes.contains("/general/git/rebase-with-local-edits-using-autostash/") && !recipes.contains("shallow-clones"), "{recipes}");
-    let tag = std::fs::read_to_string(out.join("tags/rebase/index.html")).unwrap();
-    assert!(tag.contains("href=/tags/>Tag</a>") || tag.contains("href=\"/tags/\">Tag</a>"), "the kind links up: {tag}");
-    let home = std::fs::read_to_string(out.join("index.html")).unwrap();
-    assert!(home.contains("/types/recipe/") && home.contains("/all/"), "{home}");
-    let all = std::fs::read_to_string(out.join("all/index.html")).unwrap();
-    assert!(all.contains("rebase-with-local-edits-using-autostash/") && all.contains("squash-fixups-with-autosquash/"), "{all}");
-    let list: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("static/protected.json")).unwrap()).unwrap();
-    assert_eq!(list.as_array().map(Vec::len), Some(1), "one password, one list: {list}");
-    assert!(list[0]["ciphertext"].is_string() && list[0]["salt"].is_string() && list[0]["nonce"].is_string(), "{list}");
-    let search = std::fs::read_to_string(out.join("search.json")).unwrap();
-    assert!(!search.contains("1a00000004"), "the public search index names a protected lesson: {search}");
-    let mut all = String::new();
-    let mut todo = vec![out.clone()];
-    while let Some(d) = todo.pop() {
-        for e in std::fs::read_dir(&d).unwrap().flatten() {
-            if e.path().is_dir() {
-                todo.push(e.path());
-            } else if let Ok(t) = std::fs::read_to_string(e.path()) {
-                all.push_str(&t);
-            }
-        }
-    }
-    assert!(!all.contains("Shallow clones break git describe"), "a protected title is in plain text");
+
+    // Text inside ciphertext is not plain text; a protected lesson's own title is.
+    let pw = [("SITE_PASSWORD", PASSWORD)];
+    let (v, _) = publish(&env, &["publish", out_s], &pw);
+    let (v, code) = publish(&env, &["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], &pw);
+    assert_eq!(code, Some(0), "{v}");
+    assert!(out.join("protected/general/git/shallow-clones-break-git-describe.md").is_file());
+    let prot = out.join("protected/general/git");
+    std::fs::create_dir_all(prot.join("shallow-clones-break-git-describe.assets")).unwrap();
+    std::fs::write(prot.join("shallow-clones-break-git-describe.assets/diagram.svg"), b"SVGDATA").unwrap();
+    std::fs::create_dir_all(dist.join("protected/1a00000004")).unwrap();
+    std::fs::write(dist.join("protected/1a00000004/index.html"), r#"<div data-encrypted="Shallow clones break git describe"></div>"#)
+        .unwrap();
+    let (v, code) = check(&env);
+    assert_eq!(code, Some(0), "text inside ciphertext is not plain text: {v}");
+
+    std::fs::write(dist.join("protected/1a00000004/index.html"), "Shallow clones break git describe").unwrap();
+    let (v, code) = check(&env);
+    assert_eq!(code, Some(1), "{v}");
+    let m = v["error"]["message"].as_str().unwrap();
+    assert!(m.contains("protected/1a00000004/index.html: shows protected lesson `1a00000004` in plain text"), "{m}");
+    assert!(!m.contains("Shallow clones"), "the finding names the lesson by id only: {m}");
+
+    std::fs::write(dist.join("protected/1a00000004/index.html"), "x").unwrap();
+    std::fs::create_dir_all(dist.join("general/git/shallow-clones-break-git-describe")).unwrap();
+    std::fs::write(dist.join("general/git/shallow-clones-break-git-describe/index.html"), "x").unwrap();
+    std::fs::write(dist.join("plain.svg"), b"SVGDATA").unwrap();
+    let (v, code) = check(&env);
+    assert_eq!(code, Some(1), "{v}");
+    let m = v["error"]["message"].as_str().unwrap();
+    assert!(m.contains("a page at the path of protected lesson `1a00000004`"), "{m}");
+    assert!(m.contains("plain.svg: an image of protected lesson `1a00000004` as a plain file"), "{m}");
 }
 
-/// Runs only with `RKB_TEST_RS_WEB` set to an rs-web binary.
+/// The first-publication question, the `--no-ask` fallback for CI, and the doctor's pending approvals.
 #[test]
-fn site_images_tree_code_and_404_with_real_rs_web() {
-    let Ok(rs_web) = std::env::var("RKB_TEST_RS_WEB") else { return };
-    let env = site_kb_with_images();
-    let p = env.kb().join("general/git/squash-fixups-with-autosquash.md");
-    std::fs::write(
-        &p,
-        std::fs::read_to_string(&p).unwrap().replace("status: active", "status: stale\nstale_reason: newer git changed this"),
-    )
-    .unwrap();
+fn publish_ask() {
+    let env = publish_kb();
     let out = env.dir.path().join("out");
-    let real = |args: &[&str]| {
-        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
-        c.env("RKB_RS_WEB", &rs_web).env("CLAUDECODE", "1").env("SITE_PASSWORD", PASSWORD);
-        let mut all = args.to_vec();
-        all.extend(["--format", "json"]);
-        let o = rkb_with(c, &all, "");
-        (serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o))), o.status.code())
-    };
-    let (v, code) = real(&["site", "build", "--out", out.to_str().unwrap()]);
-    assert_eq!(code, Some(3), "{v}");
-    let (v, code) = real(&["confirm", v["request"].as_str().unwrap(), "--choice", "publish"]);
-    assert_eq!(code, Some(0), "{v}");
+    let out_s = out.to_str().unwrap();
 
-    let dir = out.join("general/git/rebase-with-local-edits-using-autostash");
-    let page = std::fs::read_to_string(dir.join("index.html")).unwrap();
-    let png = std::fs::read(dir.join("layout.png")).unwrap();
-    assert!(png.starts_with(b"\x89PNG") && !String::from_utf8_lossy(&png).contains("GPS"), "the image is published without EXIF");
-    assert!(page.contains("/general/git/rebase-with-local-edits-using-autostash/layout.png"), "the page shows the image: {page}");
-    assert!(page.contains("hl") && page.contains("/highlight.css") && out.join("static/highlight.css").is_file(), "{page}");
-    assert!(page.contains("class=\"source shell") || page.contains("class=\"source"), "the code block is colored: {page}");
-    assert!(page.contains("Skip to content"), "{page}");
+    let (v, code) = publish(&env, &["publish", "--no-ask", out_s], &[]);
+    assert_eq!(code, Some(1), "{v}");
+    let m = v["error"]["message"].as_str().unwrap();
+    assert!(m.contains("2 lessons wait") && m.contains("has no site/published.json"), "{m}");
+    assert!(v["error"]["fix"].as_str().unwrap().contains("rkb publish` on your machine"), "{v}");
+    assert!(!out.exists(), "CI without a record publishes nothing");
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "", "the knowledge base is unchanged");
 
-    let mut files = vec![];
-    let mut todo = vec![out.clone()];
-    while let Some(d) = todo.pop() {
-        for e in std::fs::read_dir(&d).unwrap().flatten() {
-            if e.path().is_dir() { todo.push(e.path()) } else { files.push(e.path()) }
-        }
-    }
-    assert!(!files.iter().any(|f| f.extension().is_some_and(|x| x == "svg" || x == "b64")), "a protected image is a file: {files:?}");
-    let prot = std::fs::read_to_string(out.join("protected/1a00000004/index.html")).unwrap();
-    assert!(!prot.contains("data:image"), "the embedded image is inside the ciphertext");
+    let (v, code) = publish(&env, &["publish", out_s], &[]);
+    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{v}");
+    let q = v["question"].as_str().unwrap();
+    assert!(q.contains("Publish 2 lessons") && q.contains("In the clear:"), "{q}");
+    assert!(q.contains("1a00000003 Rebase with local edits using autostash") && q.contains("1a00000005 Squash fixups"), "{q}");
+    assert!(!out.exists(), "nothing is written before the answer");
+    let (v, code) = publish(&env, &["confirm", v["request"].as_str().unwrap(), "--choice", "cancel"], &[]);
+    assert_eq!((v["status"].as_str(), code), (Some("cancelled"), Some(0)), "{v}");
+    assert!(!out.exists(), "cancel writes nothing");
 
-    let tree: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("tree.json")).unwrap()).unwrap();
-    let git: Vec<&str> = tree["general/git"].as_array().unwrap().iter().map(|e| e["url"].as_str().unwrap()).collect();
-    assert_eq!(git, ["/general/git/rebase-with-local-edits-using-autostash/", "/general/git/squash-fixups-with-autosquash/"]);
-    assert!(!tree.to_string().contains("1a00000004") && !tree.to_string().contains("protected"), "{tree}");
+    let before = commit_count(&env);
+    published_ok(&env, out_s);
+    assert_eq!(commit_count(&env), before + 1, "the record is one commit");
+    assert_eq!(head_subject(&env), "site: publish 2 lessons");
+    let text = std::fs::read_to_string(env.kb().join("site/published.json")).unwrap();
+    assert_eq!(text, "{\n  \"clear\": [\n    \"1a00000003\",\n    \"1a00000005\"\n  ],\n  \"encrypted\": {}\n}\n");
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "");
 
-    let home = std::fs::read_to_string(out.join("index.html")).unwrap();
-    assert!(!home.contains("leaf") && home.contains("data-key=general/git"), "the home page holds groups, not lessons: {home}");
-    assert_eq!(page.matches("class=leaf").count(), 2, "a lesson page holds its own group's lessons: {page}");
-    let stale = std::fs::read_to_string(out.join("general/git/squash-fixups-with-autosquash/index.html")).unwrap();
-    assert!(stale.contains("Stale") && stale.contains("newer git changed this"), "{stale}");
-    assert!(stale.contains("content=\"Stale: newer git changed this."), "the preview says it is stale: {stale}");
-    let feed = std::fs::read_to_string(out.join("feed.xml")).unwrap();
-    assert!(feed.contains("<title>[Stale] Squash fixups with autosquash</title>"), "{feed}");
-    assert!(!feed.contains("atom:link href"), "no base_url, no self link: {feed}");
-    let hashed_css = |html: &str| html.split("/site.css").next().unwrap().rsplit("/static/v/").next().unwrap().to_string();
-    let first = hashed_css(&page);
-    let (v, code) = real(&["site", "init"]);
-    assert_eq!(code, Some(0), "{v}");
-    let css = env.kb().join("site/static/site.css");
-    std::fs::write(&css, format!("{}\n/* changed */\n", std::fs::read_to_string(&css).unwrap())).unwrap();
-    std::fs::write(env.kb().join("site/og.png"), png_with_gps()).unwrap();
-    let toml = env.kb().join("kb.toml");
-    std::fs::write(
-        &toml,
-        format!(
-            "{}\n[site]\nbase_url = \"https://kb.example.org\"\nimage = \"site/og.png\"\nanalytics = \"cloudflare\"\n",
-            std::fs::read_to_string(&toml).unwrap()
-        ),
-    )
-    .unwrap();
-    let (v, code) = real(&["site", "build", "--out", out.to_str().unwrap()]);
-    assert_eq!(code, Some(0), "{v}");
-    let page = std::fs::read_to_string(dir.join("index.html")).unwrap();
-    assert_ne!(hashed_css(&page), first, "a changed stylesheet gets a new address");
-    assert!(page.contains("https://kb.example.org/static/og-site.png") && !page.contains("og:image:width"), "{page}");
-    let headers = std::fs::read_to_string(out.join("_headers")).unwrap();
+    // A second publish on the same machine asks nothing and commits nothing.
+    let (v, code) = publish(&env, &["publish", out_s], &[]);
+    assert_eq!((v["status"].as_str(), code), (Some("published"), Some(0)), "{v}");
+    assert_eq!(commit_count(&env), before + 1);
+
+    // Another machine that pulled the record does not ask either.
+    std::fs::remove_dir_all(env.dir.path().join("state/rkb")).unwrap();
+    let (v, code) = publish(&env, &["publish", "--no-ask", out_s], &[]);
+    assert_eq!((v["status"].as_str(), code), (Some("published"), Some(0)), "{v}");
+    assert_eq!(v["lessons"], 2, "{v}");
+    assert_eq!(commit_count(&env), before + 1, "--no-ask never writes the knowledge base");
+
+    // A new public lesson that a recorded lesson links to: CI leaves both out.
+    let new = env.kb().join("general/git/shallow-clones-break-git-describe.md");
+    std::fs::write(&new, std::fs::read_to_string(&new).unwrap().replacen("\n---\n", "\nlabels:\n  sensitivity: public\n---\n", 1)).unwrap();
+    let linker = env.kb().join("general/git/squash-fixups-with-autosquash.md");
+    let text = std::fs::read_to_string(&linker).unwrap();
+    std::fs::write(&linker, text.replacen("\n## ", "\nSee [describe](shallow-clones-break-git-describe.md).\n\n## ", 1)).unwrap();
+
+    let (v, _) = env.json(&["doctor"], "");
+    let c = v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "site approvals").cloned().unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(c["status"], "warn", "{c}");
+    assert!(c["detail"].as_str().unwrap().contains("1a00000004 Shallow clones break git describe"), "{c}");
+    assert!(c["fix"].as_str().unwrap().contains("rkb publish <dir>"), "{c}");
+
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("CLAUDECODE", "1").env_remove("SITE_PASSWORD").env("GITHUB_ACTIONS", "true");
+    let o = rkb_with(c, &["publish", "--no-ask", out_s, "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!((v["status"].as_str(), o.status.code()), (Some("published"), Some(0)), "{v}");
+    assert_eq!(v["lessons"], 1, "the waiting lesson and its referrer are left out: {v}");
+    let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("site.json")).unwrap()).unwrap();
+    assert_eq!(index["lessons"].as_array().unwrap().len(), 1, "{index}");
+    assert_eq!(index["lessons"][0]["id"], "1a00000003", "{index}");
+    let notes = v["notes"].to_string();
     assert!(
-        headers.contains("script-src 'self' 'wasm-unsafe-eval' https://static.cloudflareinsights.com;")
-            && headers.contains("connect-src 'self' https://cloudflareinsights.com;"),
-        "{headers}"
+        notes.contains("1a00000004 Shallow clones break git describe") && notes.contains("1a00000005") && notes.contains("links to one"),
+        "{v}"
     );
-    let custom = std::fs::read(out.join("static/og-site.png")).unwrap();
-    assert!(!String::from_utf8_lossy(&custom).contains("GPS"), "the custom preview image loses its metadata");
-    let missing = std::fs::read_to_string(out.join("404.html")).unwrap();
-    assert!(missing.contains("Page not found") && missing.contains("noindex") && missing.contains("/site.js"), "{missing}");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("::warning title=rkb publish::"), "{}", stdout(&o));
+
+    // With a record but nothing left to publish, CI fails instead of writing an empty folder.
+    std::fs::write(env.kb().join("site/published.json"), "{\"clear\": [], \"encrypted\": {}}\n").unwrap();
+    std::fs::remove_file(env.dir.path().join("state/rkb/site-published.json")).ok();
+    let (v, code) = publish(&env, &["publish", "--no-ask", out_s], &[]);
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("nothing would be published"), "{v}");
 }
 
-/// Runs only with `RKB_TEST_RS_WEB` set to an rs-web binary.
+/// A lesson encrypted before and public now asks again, and the record follows the answer.
 #[test]
-fn site_group_password_with_real_rs_web() {
-    let Ok(rs_web) = std::env::var("RKB_TEST_RS_WEB") else { return };
-    let env = site_kb();
-    let toml = env.kb().join("kb.toml");
-    std::fs::write(&toml, std::fs::read_to_string(&toml).unwrap().replacen("[labels]\n", "[labels]\npassword = [\"team-a\"]\n", 1))
-        .unwrap();
-    let p = env.kb().join("general/git/squash-fixups-with-autosquash.md");
-    std::fs::write(
-        &p,
-        std::fs::read_to_string(&p).unwrap().replace("  sensitivity: public\n", "  sensitivity: public\n  password: team-a\n"),
-    )
-    .unwrap();
-    const TEAM: &str = "team-a-battery-staple-horse";
+fn publish_ask_again_when_the_password_changes() {
+    let env = publish_kb();
     let out = env.dir.path().join("out");
-    let real = |args: &[&str]| {
-        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
-        c.env("RKB_RS_WEB", &rs_web).env("CLAUDECODE", "1").env("SITE_PASSWORD", PASSWORD).env("SITE_PASSWORD_TEAM_A", TEAM);
-        let mut all = args.to_vec();
-        all.extend(["--format", "json"]);
-        let o = rkb_with(c, &all, "");
-        (serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o))), o.status.code())
-    };
-    let (v, code) = real(&["site", "build", "--out", out.to_str().unwrap()]);
-    assert_eq!(code, Some(3), "{v}");
-    let (v, code) = real(&["confirm", v["request"].as_str().unwrap(), "--choice", "publish"]);
+    let out_s = out.to_str().unwrap();
+    let pw = [("SITE_PASSWORD", PASSWORD)];
+
+    let (v, _) = publish(&env, &["publish", out_s], &pw);
+    let q = v["question"].as_str().unwrap();
+    let (clear, enc) = q.split_once("Encrypted with SITE_PASSWORD:").unwrap_or_else(|| panic!("{q}"));
+    assert!(clear.contains("1a00000003") && !clear.contains("1a00000004"), "{q}");
+    assert!(enc.contains("1a00000004 Shallow clones break git describe"), "{q}");
+    let (v, code) = publish(&env, &["confirm", v["request"].as_str().unwrap(), "--choice", "publish"], &pw);
     assert_eq!(code, Some(0), "{v}");
+    let published = std::fs::read_to_string(env.kb().join("site/published.json")).unwrap();
+    assert!(published.contains("\"encrypted\"") && published.contains("1a00000004"), "{published}");
+    assert!(out.join("protected/general/git/shallow-clones-break-git-describe.md").is_file());
 
-    let boxes: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("static/protected.json")).unwrap()).unwrap();
-    assert_eq!(boxes.as_array().map(Vec::len), Some(2), "one list per password: {boxes}");
-    assert!(out.join("protected/1a00000005/index.html").is_file() && !out.join("general/git/squash-fixups-with-autosquash").exists());
-    let mut all = String::new();
-    let mut todo = vec![out.clone()];
-    while let Some(d) = todo.pop() {
-        for e in std::fs::read_dir(&d).unwrap().flatten() {
-            if e.path().is_dir() {
-                todo.push(e.path());
-            } else if let Ok(t) = std::fs::read_to_string(e.path()) {
-                all.push_str(&t);
-            }
-        }
-    }
-    for word in ["team-a", "TEAM_A", "Squash fixups with autosquash", "Shallow clones break git describe"] {
-        assert!(!all.contains(word), "`{word}` is in plain text in the built site");
-    }
+    let p = env.kb().join("general/git/shallow-clones-break-git-describe.md");
+    std::fs::write(&p, std::fs::read_to_string(&p).unwrap().replacen("\n---\n", "\nlabels:\n  sensitivity: public\n---\n", 1)).unwrap();
+    let (v, code) = publish(&env, &["publish", out_s], &pw);
+    assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "encrypted before, public now: {v}");
+    let q = v["question"].as_str().unwrap();
+    assert!(q.contains("In the clear:\n  1a00000004"), "{q}");
+}
 
-    // Decrypt the group page with rs-web itself: the team password opens it, the site password does not.
-    let probe = env.dir.path().join("probe");
-    std::fs::create_dir_all(probe.join("templates")).unwrap();
-    std::fs::write(probe.join("templates/p.html"), "x").unwrap();
-    let page = out.join("protected/1a00000005/index.html");
-    std::fs::write(
-        probe.join("config.lua"),
-        format!(
-            r#"local rs = require("rs-web")
-local html = rs.fs.read("{}")
-local function attr(n) return html:match(n .. '="([^"]+)"') or html:match(n .. "=([^%s>]+)") end
-local box = {{ ciphertext = attr("data%-encrypted"), salt = attr("data%-salt"), nonce = attr("data%-nonce") }}
-print("TEAM", pcall(rs.crypt.decrypt, box, "{TEAM}"))
-print("SITE", pcall(rs.crypt.decrypt, box, "{PASSWORD}"))
-return {{ site = {{ title = "p", description = "", base_url = "http://x", author = "" }}, build = {{ output_dir = "dist" }},
-  pages = function() return {{ {{ path = "/", template = "p.html", title = "p" }} }} end }}
-"#,
-            page.display()
-        ),
-    )
-    .unwrap();
-    let o = std::process::Command::new(&rs_web).arg("build").current_dir(&probe).env_remove("SITE_PASSWORD").output().unwrap();
-    let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-    assert!(text.contains("TEAM\ttrue") && text.contains("Squash fixups with autosquash"), "{text}");
-    assert!(text.contains("SITE\tfalse"), "the site password opens a team page: {text}");
+#[test]
+fn lint_checks_the_site_image() {
+    let env = kb_with_topics();
+    let toml = env.kb().join("kb.toml");
+    let base = std::fs::read_to_string(&toml).unwrap();
+    std::fs::write(&toml, format!("{base}\n[site]\nimage = \"site/og.gif\"\n")).unwrap();
+    let (v, code) = env.json(&["lint"], "");
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v.to_string().contains("config/site-image") && v.to_string().contains("must be a png or jpg"), "{v}");
+    std::fs::write(&toml, format!("{base}\n[site]\nanalytics = \"plausible\"\n")).unwrap();
+    let (v, code) = env.json(&["lint"], "");
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v.to_string().contains("config/site-analytics"), "{v}");
+    std::fs::write(&toml, format!("{base}\n[site]\nimage = \"site/og.png\"\n")).unwrap();
+    let (v, _) = env.json(&["lint"], "");
+    assert!(!v.to_string().contains("config/site-image"), "{v}");
 }
 
 /// One request the fake Jev API got: its `Authorization` header and its JSON body.

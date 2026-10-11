@@ -456,11 +456,18 @@ enum Cmd {
         #[command(subcommand)]
         action: ModelsCmd,
     },
-    /// Build or preview a static site of the lessons the `web` sink allows, with rs-web.
-    #[command(after_help = "Example:\n  rkb site build --out ~/site\n  rkb site serve\n  rkb site init\n  rkb site ci")]
-    Site {
-        #[command(subcommand)]
-        action: SiteCmd,
+    /// Write the lessons the `web` sink allows and the knowledge base's rs-web template to a folder for rs-web to build.
+    #[command(after_help = "Example:\n  rkb publish ~/site\n  rkb publish out --no-ask\n  rkb publish --check out")]
+    Publish {
+        /// The folder rs-web builds in: it holds the template, site.json, lessons/ and protected/.
+        #[arg(value_name = "DIR")]
+        dir: String,
+        /// Check the rs-web output in `<dir>/dist` instead of writing `<dir>`. For CI.
+        #[arg(long)]
+        check: bool,
+        /// Leave out lessons that wait for a first-publication answer instead of asking. For CI.
+        #[arg(long)]
+        no_ask: bool,
     },
     /// Pull lessons from a git remote, check them, and push when every check passes.
     #[command(after_help = "Example:\n  rkb sync\n  rkb sync --remote cluster\n  rkb sync --bundle /mnt/usb/kb.bundle")]
@@ -547,32 +554,6 @@ enum PrepareCmd {
         #[arg(long)]
         model: Option<String>,
     },
-}
-
-#[derive(Subcommand)]
-enum SiteCmd {
-    /// Build the site with rs-web (downloaded when missing), check it, and write it to --out.
-    #[command(after_help = "Example:\n  rkb site build\n  rkb site build --out ~/site\n  rkb site build --no-ask --out dist")]
-    Build {
-        /// Where the built site goes. Default: $XDG_CACHE_HOME/rkb/site/dist.
-        #[arg(long, value_name = "DIR")]
-        out: Option<String>,
-        /// Fail instead of asking about a first publication, and never write the knowledge base. For CI.
-        #[arg(long)]
-        no_ask: bool,
-    },
-    /// Stage the site and run `rs-web serve` on it for a live preview. Writes no output folder.
-    #[command(after_help = "Example:\n  rkb site serve --port 8080")]
-    Serve {
-        #[arg(long, default_value_t = 3000)]
-        port: u16,
-    },
-    /// Copy the built-in rs-web template to $RKB_HOME/site/ to customize it. Never overwrites a file.
-    #[command(after_help = "Example:\n  rkb site init")]
-    Init,
-    /// Write .github/workflows/site.yml, which builds the site on push and deploys it to Cloudflare Pages. Never overwrites it.
-    #[command(after_help = "Example:\n  rkb site ci")]
-    Ci,
 }
 
 #[derive(Subcommand)]
@@ -906,10 +887,13 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             kb::open(&root)?;
             models_warm(&root)
         }
-        Cmd::Site { action: SiteCmd::Build { out, no_ask } } => site::run(&env, out, None, &site::Approved::default(), no_ask),
-        Cmd::Site { action: SiteCmd::Serve { port } } => site::run(&env, None, Some(port), &site::Approved::default(), false),
-        Cmd::Site { action: SiteCmd::Init } => site::init(&env),
-        Cmd::Site { action: SiteCmd::Ci } => site::ci(&env),
+        Cmd::Publish { dir, check, no_ask } => {
+            if check {
+                site::check(&env, &dir)
+            } else {
+                site::run(&env, dir, &site::Approved::default(), no_ask)
+            }
+        }
         Cmd::Sync { remote, bundle } => {
             kb::open(&root)?;
             let other = match &bundle {

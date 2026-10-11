@@ -91,15 +91,14 @@ pub enum Action {
     Import {
         items: Vec<ImportItem>,
     },
-    /// Build the site, publishing `ids` for the first time. The CLI runs it, because it runs rs-web.
+    /// Publish `ids` for the first time: in the clear, and encrypted, into `out`.
     Publish {
         /// Lessons published in the clear for the first time.
         ids: Vec<String>,
         /// Lessons published encrypted for the first time.
         #[serde(default)]
         encrypted: Vec<String>,
-        out: Option<String>,
-        serve: Option<u16>,
+        out: String,
     },
 }
 
