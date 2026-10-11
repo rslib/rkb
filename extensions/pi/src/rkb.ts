@@ -11,7 +11,8 @@ import { Type } from "typebox";
 const HARNESS: string = "__HARNESS__";
 // The rkb binary that installed this file; rkb install fills it in.
 const RKB: string = "__RKB__";
-const TIMEOUT_MS = 5000;
+// RKB_TIMEOUT_MS raises the 5 s limits for a loaded machine, such as the parallel test suite.
+const TIMEOUT_MS = Number(process.env.RKB_TIMEOUT_MS) || 5000;
 // Kept here as well so a command that runs `rkb confirm` is gated even when `rkb` cannot run.
 const CONFIRM = /(^|[\s;&|('"/])rkb\s+confirm\b/;
 const NO_UI = "rkb confirm needs the user: ask them to run this command in their own terminal.";
@@ -164,7 +165,7 @@ function safe(fn: (event: any, ctx: any) => Promise<any>) {
 
 // The UI below only calls `rkb ... --format json` and draws what it prints; pi and omp share this file, so
 // every UI call goes through `ui`, which is empty without a UI or when the harness lacks the method.
-const UI_TIMEOUT_MS = 5000;
+const UI_TIMEOUT_MS = TIMEOUT_MS;
 // A job step parses notes and writes the inbox item, and a prepare reads the transcript.
 const JOB_TIMEOUT_MS = 30000;
 const NOTES_MAX_TOKENS = 4096;

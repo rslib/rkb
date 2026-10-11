@@ -121,7 +121,8 @@ fn rkb_with(mut c: Command, args: &[&str], input: &str) -> Output {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    // A command that exits without reading stdin closes the pipe; its output still decides the test.
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
     child.wait_with_output().unwrap()
 }
 
@@ -2627,6 +2628,7 @@ fn extension_drives_rkb_hook() {
             .arg(&file)
             .arg(harness)
             .env("RKB_KB", env.kb())
+            .env("RKB_TIMEOUT_MS", "30000")
             .env("RKB_REQUEST", req["request"].as_str().unwrap())
             .env("RKB_QUESTION", req["question"].as_str().unwrap())
             .env("RKB_TRANSCRIPT", PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/pi.jsonl"))
