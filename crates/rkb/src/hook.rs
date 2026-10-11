@@ -109,7 +109,7 @@ fn reply(event: &str, key: &str, value: Value) -> String {
     json!({ "hookSpecificOutput": out }).to_string()
 }
 
-/// The session context, with no work nudge: the inbox and curate counts stay in `rkb status`.
+/// The session context, with no work nudge: the inbox count stays in `rkb status`.
 fn session_start(p: &Value, state: &Path) -> Result<Option<String>> {
     hooks::cleanup(state);
     let root = kb::home();
@@ -398,7 +398,7 @@ fn stop(p: &Value, state: &Path, session: &str, harness: &str) -> Result<Option<
     let threshold = cfg.get("record_score").and_then(toml::Value::as_integer).map_or(DEFAULT_RECORD_SCORE, |v| v.max(1) as u32);
     let asked = records.iter().any(|r| r["kind"] == "asked");
     let nudged = records.iter().filter(|r| r["kind"] == "nudged").count();
-    // Only the user's own words reach the stop. In the agent A/B (scripts/agent-ab, 2026-09-29) even a
+    // Only the user's own words reach the stop. In an agent A/B on 2026-09-29 even a
     // non-blocking note on task signals cost turns and added no passes; transcript capture and the
     // observer still take those sessions to the inbox.
     if !new.iter().any(|r| r["kind"] == "remember" || r["kind"] == "correction") {

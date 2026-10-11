@@ -65,7 +65,8 @@ pub fn note(env: &Env, words: Vec<String>, priority: Option<u8>) -> Result<Outpu
         candidates: vec![],
     };
     let item = distill::add(&env.state, meta, &text)?;
-    let human = format!("noted {} in the inbox; `/rkb-distill` turns inbox items into lessons", item.id);
+    let human =
+        format!("noted {} in the inbox; `rkb promote` turns an item into a lesson once its signature repeats in 2 sessions", item.id);
     Ok(Output { data: json!({ "id": item.id, "help": ["Run `rkb inbox` to list the inbox"] }), human, exit: 0, raw: false })
 }
 
@@ -81,7 +82,7 @@ pub fn import_claude(env: &Env, memory: Option<&str>, files: &[std::path::PathBu
     let (saved, skipped) = distill::import_notes(&env.state, &notes)?;
     let human = format!("saved {saved} notes to the inbox; skipped {skipped} imported before. Distill turns them into lessons.");
     Ok(Output {
-        data: json!({ "saved": saved, "skipped": skipped, "help": ["Run the distill command to turn the notes into lessons"] }),
+        data: json!({ "saved": saved, "skipped": skipped, "help": ["Write lessons from the notes with `rkb add`; `rkb promote` turns repeated items into lessons"] }),
         human,
         exit: 0,
         raw: false,
@@ -113,7 +114,7 @@ pub fn list(env: &Env) -> Result<Output, CliError> {
     let help = if items.is_empty() {
         "The inbox is empty"
     } else {
-        "Run `/rkb-distill`, or `rkb inbox show <id>`, write lessons with `rkb add`, then `rkb inbox done <id>`"
+        "Run `rkb promote`, or `rkb inbox show <id>`, write lessons with `rkb add`, then `rkb inbox done <id>`"
     };
     let rows: Vec<Value> = items.iter().map(|i| row(i, now)).collect();
     Ok(Output { data: json!({ "items": rows, "expired": expired, "help": [help] }), human, exit: 0, raw: false })
@@ -177,7 +178,7 @@ pub fn triage(env: &Env, ask: Option<&str>) -> Result<Output, CliError> {
     } else {
         format!("triaged {} items: {} keep, {} known, {} unsure, {} drop", done.len(), total.keep, total.known, total.unsure, total.drop)
     };
-    let help = "Run `/rkb-distill` for the kept candidates, or `rkb inbox show <id>` for the verdicts of one item";
+    let help = "Run `rkb promote` for repeated items, or `rkb inbox show <id>` for the verdicts of one item";
     let mut data = json!({ "items": rows, "total": counts_json(total), "help": [help] });
     let mut human = human;
     if let Some(harness) = ask

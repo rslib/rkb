@@ -90,7 +90,6 @@ pub fn dupes(env: &Env, min: Option<f64>, check: bool, all: bool) -> Result<Outp
                     }
                 }
                 dupes::save(&env.state, &cache).map_err(|source| rkb_core::Error::Io { path: env.state.join("dupes.json"), source })?;
-                let _ = std::fs::remove_file(env.state.join("curate.json"));
                 format!("checked {asked} pairs, {} unchecked", why.len())
             }
         });

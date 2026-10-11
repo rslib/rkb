@@ -475,7 +475,7 @@ fn lint_lesson(out: &mut Out, kb: Option<&KbConfig>, l: &Lesson, b: &Body) {
 }
 
 /// Warnings, never errors, for a lesson too weak to act on: evidence with nothing concrete, a title too
-/// short to find, a fix too short to follow. A curate pass picks these up.
+/// short to find, a fix too short to follow.
 fn quality(out: &mut Out, p: &str, l: &Lesson, b: &Body) {
     let section = |h: &str| crate::body::section_text(&l.body, h).map(|t| t.trim().to_string());
     if let Some(evidence) = section("Evidence")

@@ -202,7 +202,7 @@ enum Cmd {
     /// Print the current project, system and lesson counts in at most 5 lines, for a session hook.
     #[command(after_help = "Example:\n  rkb context")]
     Context,
-    /// Print what waits for the user (inbox, curate candidates, open requests) and the lessons a session
+    /// Print what waits for the user (inbox, open requests) and the lessons a session
     /// injected, in one call, for a harness UI. Changes no lesson, inbox item or request.
     #[command(after_help = "Example:\n  rkb status\n  rkb status --session 3f2a --format json")]
     Status {
@@ -285,7 +285,7 @@ enum Cmd {
         #[arg(long, default_value = "7 days ago")]
         since: String,
     },
-    /// Mark a wrong lesson as replaced by another. Asks the user, because search then hides it.
+    /// Mark a wrong lesson as replaced by another. Search then hides it, so give a concrete reason.
     #[command(after_help = "Example:\n  rkb supersede 7f3a9c2b41 --by 0a1b2c3d4e --reason \"the flag is wrong on 1.14\"")]
     Supersede {
         id: String,
@@ -295,7 +295,7 @@ enum Cmd {
         #[arg(long)]
         reason: String,
     },
-    /// Hide a lesson, or every lesson under a folder, that is still true but no longer relevant. Asks the user.
+    /// Hide a lesson, or every lesson under a folder, that is still true but no longer relevant. A folder asks the user.
     #[command(
         after_help = "Example:\n  rkb archive 7f3a9c2b41 --reason \"quartz retired 2027-01\"\n  rkb archive systems/quartz --reason \"quartz retired 2027-01\""
     )]
@@ -392,7 +392,7 @@ enum Cmd {
         /// The folder with the lesson files.
         #[arg(required_unless_present_any = ["claude_memory", "files"])]
         dir: Option<std::path::PathBuf>,
-        /// Instead, save Claude Code auto memory files as inbox notes for distill: this folder, or every
+        /// Instead, save Claude Code auto memory files as inbox notes: this folder, or every
         /// ~/.claude/projects/*/memory/ when no folder is given.
         #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "DIR")]
         claude_memory: Option<String>,
@@ -415,12 +415,12 @@ enum Cmd {
         #[arg(long)]
         both: bool,
     },
-    /// Save a short finding to the inbox, to turn into a lesson later with /rkb-distill. Changes no lesson.
+    /// Save a short finding to the inbox, to turn into a lesson later with `rkb promote`. Changes no lesson.
     #[command(after_help = "Example:\n  rkb note \"the linker wants -lz after -lhdf5 on tuolumne\"\n  echo \"...\" | rkb note")]
     Note {
         /// The note. Default: stdin.
         words: Vec<String>,
-        /// 1 (default) to 3; distill takes the highest first.
+        /// 1 (default) to 3; the inbox lists the highest first.
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=3))]
         priority: Option<u8>,
     },
