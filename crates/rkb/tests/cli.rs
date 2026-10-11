@@ -3904,6 +3904,16 @@ fn publish_check() {
     let (v, code) = check(&env);
     assert_eq!(code, Some(0), "text inside ciphertext is not plain text: {v}");
 
+    // The site index shows protected lessons' tags and queries, so they are public, not findings.
+    let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out.join("site.json")).unwrap()).unwrap();
+    let row = index["protected"].as_array().unwrap().iter().find(|l| l["id"] == "1a00000004").unwrap();
+    let words: Vec<&str> = ["tags", "queries"].iter().flat_map(|k| row[*k].as_array().unwrap().iter().filter_map(|w| w.as_str())).collect();
+    assert!(!words.is_empty(), "{row}");
+    std::fs::write(dist.join("index.html"), format!("<html><body>{}</body></html>\n", words.join(" | "))).unwrap();
+    let (v, code) = check(&env);
+    assert_eq!(code, Some(0), "public metadata of a protected lesson is not a finding: {v}");
+    std::fs::write(dist.join("index.html"), "x").unwrap();
+
     std::fs::write(dist.join("protected/1a00000004/index.html"), "Shallow clones break git describe").unwrap();
     let (v, code) = check(&env);
     assert_eq!(code, Some(1), "{v}");

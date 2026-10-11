@@ -211,6 +211,7 @@ fn check_output(env: &Env, dir: &Path, dist: &Path, index: &Value) -> Vec<String
             let mut words: Vec<&str> = vec![l["title"].as_str().unwrap_or_default(), path];
             words.extend(l["tags"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).filter(|t| t.chars().count() >= 4));
             words.extend(l["queries"].as_array().into_iter().flatten().filter_map(|q| q.as_str()).filter(|q| q.chars().count() >= 4));
+            words.retain(|w| !public.iter().any(|text| text.contains(w)));
             Protected { id: l["id"].as_str().unwrap_or_default(), path, slug: path.strip_suffix(".md").unwrap_or(path), words }
         })
         .collect();
