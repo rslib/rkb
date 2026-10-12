@@ -414,6 +414,89 @@ pub fn draft_reviewed(env: &Env, path: &str) -> Result<Output, CliError> {
     Ok(Output { data: serde_json::json!({ "file": path, "events": events, "replays": replays.len() }), human, exit: 0, raw: false })
 }
 
+/// `rkb eval --reviewed <file> --first-stage`: for each path, how many answerable events
+/// (at least one expected lesson) have none of those lessons in the BM25 candidate set the
+/// reranker receives. It makes no model call, loads no reranker and writes nothing.
+pub fn first_stage(env: &Env, path: &str) -> Result<Output, CliError> {
+    use rkb_core::eval::EventPath;
+    use rkb_core::hooks;
+    use rkb_core::matching::{Matched, Place, Rule};
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| CliError::new(ErrorCode::NotFound, format!("cannot read {path}: {e}"), "pass a readable reviewed manifest"))?;
+    let set = eval::parse_reviewed(&text, &env.root)
+        .map_err(|e| CliError::new(ErrorCode::Usage, e.to_string(), "fix the reviewed manifest and retry"))?;
+    let current_revision = kb_revision(&env.root)?;
+    if current_revision != set.kb_revision {
+        return Err(CliError::new(
+            ErrorCode::Refused,
+            format!("reviewed manifest drift: expected KB revision {}, found {current_revision}", set.kb_revision),
+            "refresh or select a manifest pinned to this KB revision",
+        ));
+    }
+    let settings = Settings::load(&env.root);
+    // The candidate set is the exact BM25 list `reviewed` passes to the reranker: the same
+    // query, place, facts and limit, without the rerank step.
+    let mut failure_rows = Vec::with_capacity(set.events.len());
+    let mut prompt_rows = Vec::with_capacity(set.events.len());
+    let mut paraphrase_rows = Vec::with_capacity(set.events.len());
+    for event in &set.events {
+        let query = match event.path {
+            EventPath::Failure => event
+                .error
+                .as_deref()
+                .zip(event.command.as_deref())
+                .map_or_else(|| event.text.clone(), |(error, command)| hooks::error_query(command, error)),
+            EventPath::Prompt => hooks::typed_text(&event.text),
+        };
+        let matched = |name: &Option<String>| name.as_ref().map(|n| Matched { name: n.clone(), rule: Rule::Flag });
+        let place = Place { project: matched(&event.project), system: matched(&event.system), repo: None, dir: None };
+        let facts = Facts::gather(&env.root, &place, &[]);
+        let found = search::search(
+            &env.root,
+            &place,
+            &facts,
+            &Mode::Ranked(query),
+            &Options {
+                all: false,
+                every_status: false,
+                limit: settings.top.max(eval::DEPTH),
+                probes: search::ProbeMode::Cached,
+                tier: None,
+            },
+        )?;
+        let answerable = !event.expect.is_empty();
+        let hit = answerable && found.hits.iter().any(|h| event.expect.contains(&h.id));
+        match event.path {
+            EventPath::Failure => failure_rows.push((answerable, hit)),
+            EventPath::Prompt => prompt_rows.push((answerable, hit)),
+        }
+        if event.paraphrase {
+            paraphrase_rows.push((answerable, hit));
+        }
+    }
+    let failure = eval::first_stage(failure_rows);
+    let prompt = eval::first_stage(prompt_rows);
+    let paraphrase = eval::first_stage(paraphrase_rows);
+    let round = |v: Option<f64>| v.map(|x| (x * 1000.0).round() / 1000.0);
+    let line = |name: &str, s: eval::FirstStage| match s.rate() {
+        Some(r) => format!("\n{name} {} of {} ({r:.2})", s.misses, s.answerable),
+        None => format!("\n{name} {} of {}", s.misses, s.answerable),
+    };
+    let human = format!(
+        "first-stage misses (BM25 candidates):{}{}{}",
+        line("failure", failure),
+        line("prompt", prompt),
+        line("paraphrase", paraphrase)
+    );
+    let group = |s: eval::FirstStage| json!({ "answerable": s.answerable, "misses": s.misses, "rate": round(s.rate()) });
+    let data = json!({
+        "paths": { "failure": group(failure), "prompt": group(prompt) },
+        "paraphrase": group(paraphrase),
+        "help": ["a miss has no expected lesson in the BM25 candidates; 5% or more says hybrid search is worth it"],
+    });
+    Ok(Output { data, human, exit: 0, raw: false })
+}
+
 pub fn reviewed(env: &Env, path: &str, backend: Option<&str>, sweep: bool, pick: Option<f64>) -> Result<Output, CliError> {
     use rkb_core::eval::{EventPath, ReviewedDecision, ReviewedObservation};
     use rkb_core::hooks;

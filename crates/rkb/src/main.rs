@@ -195,6 +195,9 @@ enum Cmd {
         /// With --reviewed: print the threshold and margin with the most coverage at this precision.
         #[arg(long, requires = "reviewed")]
         pick: Option<f64>,
+        /// With --reviewed: report first-stage BM25 misses per path. No model call, no writes.
+        #[arg(long, requires = "reviewed", conflicts_with_all = ["rerank", "recall_sweep", "pick"])]
+        first_stage: bool,
     },
     /// Put the rkb skill, hooks and confirm gate into Claude Code, pi and omp.
     #[command(after_help = "Example:\n  rkb install\n  rkb install --list\n  rkb install claude --uninstall")]
@@ -770,12 +773,15 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             kb::open(&root)?;
             searching::find(&env, &words.join(" "), limit)
         }
-        Cmd::Eval { queries, reviewed, self_check, min_recall, rerank, recall_sweep, replay, days, draft_reviewed, pick } => {
+        Cmd::Eval { queries, reviewed, self_check, min_recall, rerank, recall_sweep, replay, days, draft_reviewed, pick, first_stage } => {
             kb::open(&root)?;
             if let Some(path) = draft_reviewed {
                 searching::draft_reviewed(&env, &path)
             } else if replay {
                 searching::replay(&env, days, min_recall, rerank.as_deref())
+            } else if first_stage {
+                let path = reviewed.expect("clap requires --reviewed with --first-stage");
+                searching::first_stage(&env, &path)
             } else if let Some(path) = reviewed {
                 searching::reviewed(&env, &path, rerank.as_deref(), recall_sweep, pick)
             } else {

@@ -152,6 +152,36 @@ pub struct ReviewedEvent {
     pub source: String,
     pub rationale: String,
     pub worked: Option<String>,
+    /// A paraphrase of a lesson symptom in the asker's own words; counted also in its path.
+    #[serde(default)]
+    pub paraphrase: bool,
+}
+
+/// First-stage misses over one group: answerable events and those with no expected lesson
+/// in the BM25 candidate set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirstStage {
+    pub answerable: usize,
+    pub misses: usize,
+}
+
+impl FirstStage {
+    pub fn rate(self) -> Option<f64> {
+        if self.answerable == 0 { None } else { Some(self.misses as f64 / self.answerable as f64) }
+    }
+}
+
+/// Counts first-stage misses in `rows`: `(answerable, hit)` per event. Only answerable events
+/// count; a miss has no expected lesson in the candidate set.
+pub fn first_stage(rows: impl IntoIterator<Item = (bool, bool)>) -> FirstStage {
+    let mut out = FirstStage { answerable: 0, misses: 0 };
+    for (answerable, hit) in rows {
+        if answerable {
+            out.answerable += 1;
+            out.misses += usize::from(!hit);
+        }
+    }
+    out
 }
 
 #[derive(Debug, Deserialize)]

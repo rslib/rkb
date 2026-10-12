@@ -1,0 +1,83 @@
+# 20 agent-style paraphrases of lesson symptoms with no shared rare words.
+# `slot` picks the lesson the test builds (0-3). Synthetic content only,
+# written for this test; it points at lessons the test creates, not at any real KB.
+
+[[paraphrase]]
+slot = 0
+text = "my kitchen water connection keeps leaking when I open the valve"
+
+[[paraphrase]]
+slot = 0
+text = "I turned the tap on and water started escaping at the plumbing fitting"
+
+[[paraphrase]]
+slot = 0
+text = "every time I run the faucet the pipe link weeps fluid"
+
+[[paraphrase]]
+slot = 0
+text = "tried tightening the nut but the coupling still lets water out when flowing"
+
+[[paraphrase]]
+slot = 0
+text = "the fix I did yesterday fails as soon as I restore the water supply"
+
+[[paraphrase]]
+slot = 1
+text = "my young garden greens flop over the same afternoon I move them at noon"
+
+[[paraphrase]]
+slot = 1
+text = "I shifted the starter bed at lunchtime and now the leaves hang limp"
+
+[[paraphrase]]
+slot = 1
+text = "I checked the new soil batch this morning and it has gone soft and saggy"
+
+[[paraphrase]]
+slot = 1
+text = "tried giving them a drink and some cover but they still collapse by evening"
+
+[[paraphrase]]
+slot = 1
+text = "my noon garden job failed: the moved starts never stood back up"
+
+[[paraphrase]]
+slot = 2
+text = "my bike drive keeps slipping when I push hard on the cranks climbing"
+
+[[paraphrase]]
+slot = 2
+text = "I tried to sprint up the rise and the cog kept hopping"
+
+[[paraphrase]]
+slot = 2
+text = "every hard push on my two-wheeler makes the drive slip a notch"
+
+[[paraphrase]]
+slot = 2
+text = "the commuter I ride daily started dropping the loop on hard days"
+
+[[paraphrase]]
+slot = 2
+text = "tried oiling and wiping it down but hard efforts still make it stutter"
+
+[[paraphrase]]
+slot = 3
+text = "my bread dough went pancake, never puffing up by morning"
+
+[[paraphrase]]
+slot = 3
+text = "I refreshed the mix and it still sank back down after the long rest"
+
+[[paraphrase]]
+slot = 3
+text = "the batch I left to ferment went slack and never domed"
+
+[[paraphrase]]
+slot = 3
+text = "tried a shorter counter stay but the mass flowed out like a pancake"
+
+[[paraphrase]]
+slot = 3
+text = "my weekend batch failed: the formed lump lost its lift before dawn"

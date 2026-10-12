@@ -5458,6 +5458,125 @@ fn eval_pick_prints_hooks_lines() {
     assert!(human.contains("prompt jev"), "it says so: {human}");
 }
 
+fn pitfall_with(title: &str, symptom: &str, cause: &str, fix: &str) -> String {
+    format!(
+        "---\ntype: pitfall\nverified_how: ran\ntags:\n  - demo\n---\n\n# {title}\n\n## Symptom\n{symptom}\n\n## Cause\n{cause}\n\n## Fix\n{fix}\n\n## Evidence\nSaw it.\n"
+    )
+}
+
+#[test]
+fn eval_first_stage_misses() {
+    let env = kb_with_topics();
+    let id = add_ok(
+        &env,
+        "cmake",
+        &pitfall_with(
+            "Copper solder joint seeps under mains pressure",
+            "Soldered copper joint drips when the line is pressurized.",
+            "Heat was uneven.",
+            "Clean and reheat evenly, then test again.",
+        ),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let head = stdout(&env.git(&["rev-parse", "HEAD"])).trim().to_string();
+    let event = |key: &str, error: &str| {
+        format!(
+            "\n[[event]]\nkey = '{key}'\npath = 'failure'\ntext = '{error}'\nerror = '{error}'\ncommand = 'zzprog run'\nexpect = [\"{id}\"]\nworked = 'hand review'\nsource = 'hand'\nrationale = 'hand review'\n"
+        )
+    };
+    let reviewed = format!(
+        "version = 1\nkb_revision = '{head}'\nsource_fingerprint = 'test'\n{}\n",
+        event("e1", "error: copper solder joint seeps under pressure")
+            + &event("e2", "error: soldered copper joint drips")
+            + &event("e3", "error: mains pressure seeps at the joint")
+            + &event("e4", "error: zebra quantum banana xylophone")
+    );
+    let path = env.dir.path().join("reviewed.toml");
+    std::fs::write(&path, &reviewed).unwrap();
+    let (v, code) = env.json(&["eval", "--reviewed", path.to_str().unwrap(), "--first-stage"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(v["paths"]["failure"]["answerable"], 4, "{v}");
+    assert_eq!(v["paths"]["failure"]["misses"], 1, "{v}");
+    assert_eq!(v["paths"]["failure"]["rate"], serde_json::json!(0.25), "{v}");
+    assert_eq!(v["paths"]["prompt"]["answerable"], 0, "an empty path counts: {v}");
+    assert_eq!(v["paths"]["prompt"]["misses"], 0, "{v}");
+    assert!(v["paths"]["prompt"]["rate"].is_null(), "no divide by zero: {v}");
+    let human = stdout(&env.rkb(&["eval", "--reviewed", path.to_str().unwrap(), "--first-stage"]));
+    assert!(human.contains("failure 1 of 4"), "{human}");
+    assert!(human.contains("0.25"), "{human}");
+    assert!(human.contains("prompt 0 of 0"), "{human}");
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "", "first-stage writes nothing");
+    let o = env.rkb(&["eval", "--first-stage"]);
+    assert_eq!(o.status.code(), Some(2), "--first-stage needs --reviewed: {}", stdout(&o));
+}
+
+#[test]
+fn eval_first_stage_paraphrases() {
+    let env = kb_with_topics();
+    let lessons = [
+        (
+            "Copper solder joint seeps under mains pressure",
+            "Soldered copper joint drips when the line is pressurized.",
+            "Heat was uneven.",
+            "Clean and reheat evenly, then test again.",
+        ),
+        (
+            "Tomato seedlings wilt after midday transplant",
+            "Fresh tomato transplants droop within hours of midday planting.",
+            "Roots dried out.",
+            "Water deeply and shade them for a day.",
+        ),
+        (
+            "Bicycle chain skips under heavy pedal load",
+            "The chain jumps teeth when I stand on the pedals uphill.",
+            "The links are worn.",
+            "Fit a new link set and check the gears.",
+        ),
+        (
+            "Sourdough loaf collapses during overnight proof",
+            "The shaped loaf flattens and spreads instead of rising overnight.",
+            "The culture was weak.",
+            "Feed the culture twice, then bake early.",
+        ),
+    ];
+    let ids: Vec<String> = lessons
+        .iter()
+        .map(|(title, symptom, cause, fix)| {
+            add_ok(&env, "cmake", &pitfall_with(title, symptom, cause, fix))["id"].as_str().unwrap().to_string()
+        })
+        .collect();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/eval/paraphrase.toml");
+    let text = std::fs::read_to_string(&fixture).unwrap();
+    let doc: toml::Value = toml::from_str(&text).unwrap();
+    let entries = doc["paraphrase"].as_array().unwrap();
+    assert_eq!(entries.len(), 20, "the fixture holds 20 paraphrases");
+    let head = stdout(&env.git(&["rev-parse", "HEAD"])).trim().to_string();
+    let mut reviewed = format!("version = 1\nkb_revision = '{head}'\nsource_fingerprint = 'test'\n");
+    for (i, e) in entries.iter().enumerate() {
+        let slot = e["slot"].as_integer().unwrap() as usize;
+        let q = e["text"].as_str().unwrap().replace('\'', "’");
+        reviewed.push_str(&format!(
+            "\n[[event]]\nkey = 'p{}'\npath = 'prompt'\ntext = '{}'\nexpect = [\"{}\"]\nworked = 'hand review'\nsource = 'hand'\nrationale = 'hand review'\nparaphrase = true\n",
+            i + 1,
+            q,
+            ids[slot]
+        ));
+    }
+    let path = env.dir.path().join("reviewed.toml");
+    std::fs::write(&path, &reviewed).unwrap();
+    let (v, code) = env.json(&["eval", "--reviewed", path.to_str().unwrap(), "--first-stage"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(v["paraphrase"]["answerable"], 20, "{v}");
+    assert_eq!(v["paths"]["prompt"]["answerable"], 20, "paraphrases count also in their path: {v}");
+    assert_eq!(v["paraphrase"]["misses"], v["paths"]["prompt"]["misses"], "same events: {v}");
+    assert!(v["paraphrase"]["rate"].is_number(), "its own rate: {v}");
+    let human = stdout(&env.rkb(&["eval", "--reviewed", path.to_str().unwrap(), "--first-stage"]));
+    assert!(human.contains("paraphrase") && human.contains("of 20"), "the 20-entry line exists: {human}");
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "", "first-stage writes nothing");
+}
+
 #[test]
 fn hook_thresholds_from_kb_toml() {
     let env = kb_with_topics();
