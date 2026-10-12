@@ -402,6 +402,15 @@ pub fn may_push(hit: &Hit, explore_used: bool) -> Option<bool> {
     }
 }
 
+/// Misses after which a hook stops pushing a lesson until its next `worked` report.
+pub const MAX_MISSES: u32 = 3;
+
+/// Whether this many `irrelevant` reports since the last `worked` report mutes a lesson.
+/// Search still finds a muted lesson; the hooks only stop adding it to the context.
+pub fn keeps_missing(misses: u32) -> bool {
+    misses >= MAX_MISSES
+}
+
 /// Whether this session already used its one explore push, from the session records.
 pub fn explore_used(state: &Path, session: &str) -> bool {
     read(state, session).iter().any(|r| r["kind"] == "injected" && r["explore"] == true)

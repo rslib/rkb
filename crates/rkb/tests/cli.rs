@@ -5092,3 +5092,117 @@ fn session_start_leaves_the_inbox_to_status() {
     let (v, _) = env.json(&["status"], "");
     assert_eq!(v["inbox"]["total"], 5, "status still shows the inbox: {v}");
 }
+
+#[test]
+fn hook_skips_a_lesson_that_keeps_missing() {
+    let env = search_kb();
+    let id = "1a00000012";
+    let cwd = env.kb();
+    let linker = "Exit code 1\n/usr/bin/ld: main.o: in function `main':\nmain.cpp:(.text+0x1f): undefined reference to `vtable for Widget'\ncollect2: error: ld returned 1 exit status\n";
+    let failed = |session: &str| {
+        let mut p = bash(session, &cwd, "g++ main.o -o app");
+        p["error"] = linker.into();
+        p
+    };
+    for _ in 0..3 {
+        let (v, _) = env.json(&["used", id, "--worked"], "");
+        assert_eq!(v["status"], "recorded");
+    }
+    let out = hook(&env, "tool-failed", &failed("s-proven"));
+    assert!(out.contains(id), "proven lesson still pushes: {out}");
+    for i in 0..3 {
+        let (v, _) = env.json(&["used", id, "--irrelevant", "--reason", &format!("miss {i}")], "");
+        assert_eq!(v["status"], "recorded", "{v}");
+        assert!(v.get("demote").is_none(), "stays active for the mute rule: {v}");
+    }
+    let out = hook(&env, "tool-failed", &failed("s-muted"));
+    assert!(!out.contains(id) && !out.contains("<rkb-lesson"), "3 misses stop the push: {out}");
+    let (v, _) = env.json(&["search", "undefined reference to vtable"], "");
+    assert!(v["results"].as_array().unwrap().iter().any(|r| r["id"] == id), "search still lists it: {v}");
+    let (v, _) = env.json(&["used", id, "--worked"], "");
+    assert_eq!(v["status"], "recorded");
+    let out = hook(&env, "tool-failed", &failed("s-worked-again"));
+    assert!(out.contains(id), "a new worked report pushes again: {out}");
+}
+
+#[test]
+fn worked_adds_the_failure_query() {
+    let env = search_kb();
+    let id = "1a00000012";
+    let cwd = env.kb();
+    let linker = "Exit code 1\n/usr/bin/ld: main.o: in function `main':\nmain.cpp:(.text+0x1f): undefined reference to `vtable for Widget'\ncollect2: error: ld returned 1 exit status\n";
+    let failed = |session: &str| {
+        let mut p = bash(session, &cwd, "g++ main.o -o app");
+        p["error"] = linker.into();
+        p
+    };
+    let queries_of = |env: &Env| -> Vec<String> {
+        show(env, id)["frontmatter"]["queries"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+            .unwrap_or_default()
+    };
+    let set_queries = |env: &Env, qs: &[&str]| {
+        let (text, hash) = current(env, id);
+        let block = if qs.is_empty() {
+            String::new()
+        } else {
+            format!("queries:\n{}", qs.iter().map(|q| format!("  - {q}\n")).collect::<String>())
+        };
+        let edited = if let Some(start) = text.find("\nqueries:\n") {
+            let after = &text[start + "\nqueries:\n".len()..];
+            let mut end = start + "\nqueries:\n".len();
+            for line in after.split_inclusive('\n') {
+                if line.starts_with("  - ") {
+                    end += line.len();
+                } else {
+                    break;
+                }
+            }
+            format!("{}{}{}", &text[..start + 1], block, &text[end..])
+        } else {
+            text.replacen("tags:\n  - linker\n", &format!("tags:\n  - linker\n{block}"), 1)
+        };
+        let (v, _) = env.json(&["edit", id, "--base", &hash], &edited);
+        assert_eq!(v["status"], "written", "{v}");
+    };
+    let replay_query = |env: &Env, session: &str| -> String {
+        std::fs::read_to_string(env.dir.path().join("state/rkb/replays.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .rev()
+            .find(|r| r["session"] == session && r["injected"] == id)
+            .unwrap_or_else(|| panic!("no replay for {session}"))["query"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let commits = || stdout(&env.git(&["rev-list", "--count", "HEAD"])).trim().parse::<u32>().unwrap();
+    set_queries(&env, &["undefined reference to vtable", "linker cannot find vtable"]);
+    assert_eq!(queries_of(&env).len(), 2);
+    let out = hook(&env, "tool-failed", &failed("s-worked"));
+    assert!(out.contains(id), "hook pushes for the failure: {out}");
+    let query = replay_query(&env, "s-worked");
+    assert!(query.starts_with("g++ ") && query.contains("vtable"), "{query}");
+    let before = commits();
+    let (v, _) = env.json(&["used", id, "--worked", "--session", "s-worked"], "");
+    assert_eq!(v["status"], "recorded", "{v}");
+    let qs = queries_of(&env);
+    assert_eq!(qs.len(), 3, "{qs:?}");
+    assert!(qs.contains(&query), "the pushed failure query is added: {qs:?} vs {query}");
+    assert_eq!(commits(), before + 1, "one commit says so");
+    let before = commits();
+    let (v, _) = env.json(&["used", id, "--worked", "--session", "s-worked"], "");
+    assert_eq!(v["status"], "recorded");
+    assert_eq!(queries_of(&env).len(), 3, "already there adds nothing");
+    assert_eq!(commits(), before, "no new commit");
+    set_queries(&env, &["q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8"]);
+    let out = hook(&env, "tool-failed", &failed("s-full"));
+    assert!(out.contains(id), "full lesson still pushes: {out}");
+    let before = commits();
+    let (v, _) = env.json(&["used", id, "--worked", "--session", "s-full"], "");
+    assert_eq!(v["status"], "recorded");
+    assert_eq!(queries_of(&env).len(), 8, "full stays full");
+    assert_eq!(commits(), before, "full adds no commit");
+}

@@ -232,7 +232,10 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
         &hooks::Strength::from_config(&cfg, &ranked.backend),
     );
     let seen = chosen.is_some_and(|h| hooks::read(state, session).iter().any(|r| r["kind"] == "injected" && r["id"] == h.id.as_str()));
-    let push = chosen.filter(|_| !seen).and_then(|h| hooks::may_push(h, hooks::explore_used(state, session)).map(|explore| (h, explore)));
+    let push = chosen
+        .filter(|_| !seen)
+        .filter(|h| !hooks::keeps_missing(usage::irrelevant_since_worked(&root, &h.id)))
+        .and_then(|h| hooks::may_push(h, hooks::explore_used(state, session)).map(|explore| (h, explore)));
     if cfg.get("replay_log").and_then(toml::Value::as_bool) != Some(false) {
         let name = |m: &Option<rkb_core::matching::Matched>| m.as_ref().map(|m| m.name.clone());
         hooks::log_replay(
@@ -360,6 +363,7 @@ fn recall(p: &Value, state: &Path, session: &str, text: &str) -> Result<Option<S
         .take(1)
         .filter(|h| hooks::clear_winner(top, next, min, margin) && h.applies != Verdict::No && h.status == rkb_core::lesson::Status::Active)
         .filter(|h| !seen.iter().any(|r| r["kind"] == "injected" && r["id"] == h.id.as_str()))
+        .filter(|h| !hooks::keeps_missing(usage::irrelevant_since_worked(&root, &h.id)))
         .filter_map(|h| hooks::may_push(&h, explore).map(|e| (h, e)))
         .collect();
     if strong.is_empty() {

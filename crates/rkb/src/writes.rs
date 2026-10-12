@@ -325,6 +325,13 @@ pub fn used(env: &Env, id: String, result: &str, reason: Option<String>, session
     usage::record(&env.root, &config, &env.state, &usage::now(&id, result, session.clone(), reason.clone()))?;
     let mut data = json!({ "status": "recorded", "id": id, "result": result, "session": session });
     let mut human = format!("Recorded: {id} {result}");
+    // The report is already recorded, so a failed query edit only adds a note.
+    if result == "worked"
+        && let Err(e) = learn_query(env, &id, session.as_deref(), &mut data, &mut human)
+    {
+        human.push_str(&format!("\nnote: the failure query was not added: {}", e.message));
+        data["query"] = json!({ "status": "skipped", "reason": e.message });
+    }
     if failed {
         let reason = reason.clone().unwrap_or_default();
         let flagged = outcome(env, write::apply(&env.ctx(), &Action::Flag { id: id.clone(), reason }, &[])?)?;
@@ -355,6 +362,23 @@ fn demote_reason(env: &Env, id: &str) -> Result<Option<String>, CliError> {
     let Some(why) = rkb_core::tier::demote(&counts) else { return Ok(None) };
     let (lesson, _) = kb::find(&env.root, id)?;
     Ok(lesson.frontmatter.status.is_current().then(|| format!("demoted: {why}")))
+}
+
+/// Adds the session's pushed failure query to a lesson reported `worked`, through the normal edit
+/// path. The query comes from the replay log the hook wrote; a repeat or a full list learns nothing.
+fn learn_query(env: &Env, id: &str, session: Option<&str>, data: &mut Value, human: &mut String) -> Result<(), CliError> {
+    let Some(s) = session else { return Ok(()) };
+    let Some(query) = usage::replay_query(&env.state, s, id) else { return Ok(()) };
+    let (lesson, text) = kb::find(&env.root, id)?;
+    let Some(next) = write::with_query(&lesson.frontmatter.queries, &query) else { return Ok(()) };
+    let mut fm = lesson.frontmatter.clone();
+    fm.queries = next;
+    let new = rkb_core::lesson::write(&fm, &lesson.body);
+    let base = write::content_hash(text.as_bytes());
+    let edited = outcome(env, write::apply(&env.ctx(), &Action::Edit { id: id.to_string(), text: new, base, assets: vec![] }, &[])?)?;
+    human.push_str(&format!("\n{}", edited.human));
+    data["query"] = edited.data;
+    Ok(())
 }
 
 pub fn log(env: &Env, id: String) -> Result<Output, CliError> {

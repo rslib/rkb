@@ -206,6 +206,35 @@ pub fn counts_since_restore(root: &Path, id: &str) -> Counts {
     out
 }
 
+/// How many `irrelevant` reports a lesson has since its last `worked` report, after its last
+/// restoration. A restoration restarts the count like it restarts the tier counts.
+pub fn irrelevant_since_worked(root: &Path, id: &str) -> u32 {
+    let all = records(root);
+    let mut mine: Vec<&Record> = all.iter().filter(|r| r.id == id).collect();
+    mine.sort_by(|a, b| a.time.as_str().cmp(b.time.as_str()));
+    let mut out = 0;
+    for r in mine {
+        match r.event.as_str() {
+            "worked" | "restored" => out = 0,
+            "irrelevant" => out += 1,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The cleaned failure query of the last replay in `session` that pushed `id`, if any.
+/// The hook writes the replay log; `rkb used --worked` reads it back to learn the query.
+pub fn replay_query(state: &Path, session: &str, id: &str) -> Option<String> {
+    std::fs::read_to_string(state.join("replays.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["session"] == session && v["injected"] == id)
+        .filter_map(|v| v["query"].as_str().map(String::from))
+        .next_back()
+}
+
 fn max(a: Option<String>, b: &str) -> Option<String> {
     Some(a.filter(|a| a.as_str() >= b).unwrap_or_else(|| b.to_string()))
 }

@@ -184,6 +184,25 @@ pub fn scope_of(when: &Mapping) -> String {
     }
 }
 
+/// The queries after adding `query`, or `None` when they stay: the query is blank, too long for
+/// lint, already there or there are already 8. Matching ignores surrounding whitespace and case, so the same failure
+/// in other words still counts as new but an exact repeat does not.
+pub fn with_query(existing: &[String], query: &str) -> Option<Vec<String>> {
+    let q = query.trim();
+    if q.is_empty() || q.chars().count() > crate::lint::MAX_QUERY_CHARS {
+        return None;
+    }
+    if existing.iter().any(|e| e.trim().eq_ignore_ascii_case(q)) {
+        return None;
+    }
+    if existing.len() >= crate::lint::MAX_QUERIES {
+        return None;
+    }
+    let mut out = existing.to_vec();
+    out.push(q.to_string());
+    Some(out)
+}
+
 /// A lesson skeleton with the headings its type requires.
 pub fn template(kind: LessonType) -> String {
     let name = serde_norway::to_string(&kind).unwrap_or_default();
@@ -1515,6 +1534,15 @@ mod tests {
         assert!(holds_commands_or_urls("see http://example.com/fix for the patch"));
         assert!(!holds_commands_or_urls("# T\n\n## Fix\n\nSet `HDF5_ROOT` and rerun.\n"));
         assert!(!holds_commands_or_urls("# T\n\n## Evidence\n\nIt worked.\n"));
+    }
+
+    #[test]
+    fn with_query_skips_what_lint_refuses() {
+        let have = vec!["cmake could not find hdf5".to_string()];
+        assert_eq!(with_query(&have, "  CMake could not find HDF5 "), None);
+        assert_eq!(with_query(&have, &"word ".repeat(60)), None);
+        assert_eq!(with_query(&vec!["q".to_string(); 8], "new query"), None);
+        assert_eq!(with_query(&have, "ninja failed").unwrap().len(), 2);
     }
 
     #[test]
