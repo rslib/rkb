@@ -990,6 +990,10 @@ fn template_prints_skeleton() {
 #[test]
 fn parallel_writers_and_appends() {
     let env = kb_with_topics();
+    // A loaded machine has held the lock past the 10 s default while the other writer waits.
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write("kb.toml", &format!("{toml}\n[lock]\nwait_s = 60\n"));
+    env.git(&["commit", "-qam", "lock wait"]);
     let children: Vec<_> = ["Parallel lesson one about builds", "Another lesson on linking order"]
         .iter()
         .map(|t| {
@@ -1007,7 +1011,7 @@ fn parallel_writers_and_appends() {
         let o = c.wait_with_output().unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
     }
-    assert_eq!(stdout(&env.git(&["rev-list", "--count", "HEAD"])).trim(), "4");
+    assert_eq!(stdout(&env.git(&["rev-list", "--count", "HEAD"])).trim(), "5", "two adds on top of the setup commits");
 
     let id = show_first_id(&env);
     let used: Vec<_> = (0..20)
