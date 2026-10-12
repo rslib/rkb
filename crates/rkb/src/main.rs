@@ -425,8 +425,12 @@ enum Cmd {
         files: Vec<std::path::PathBuf>,
     },
     /// Serve the agent tools over MCP on stdin and stdout; Claude Code starts this through the rkb plugin.
-    #[command(after_help = "Example:\n  rkb mcp")]
-    Mcp,
+    #[command(after_help = "Example:\n  rkb mcp\n  rkb mcp --tools read")]
+    Mcp {
+        /// The tools to serve: read (search, show), propose (read and note) or all.
+        #[arg(long, default_value = "all", value_parser = clap::builder::PossibleValuesParser::new(rkb_core::tools::SETS.map(|(n, _)| n)))]
+        tools: String,
+    },
     /// Print the agent tools every harness offers: names, descriptions and argument schemas.
     #[command(after_help = "Example:\n  rkb tools --toon")]
     Tools,
@@ -657,8 +661,8 @@ fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => return parse_error(&args, e),
     };
-    if let Some(Cmd::Mcp) = &cli.cmd {
-        mcp::serve();
+    if let Some(Cmd::Mcp { tools }) = &cli.cmd {
+        mcp::serve(tools);
         return ExitCode::SUCCESS;
     }
     if let Some(Cmd::Tool { name, both }) = &cli.cmd {
@@ -922,7 +926,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Import { claude_memory, files, .. } => inbox::import_claude(&env, claude_memory.as_deref(), &files),
         Cmd::Note { words, priority } => inbox::note(&env, words, priority),
         Cmd::Tools => Ok(agent::list()),
-        Cmd::Tool { .. } | Cmd::Mcp => unreachable!("main runs tools and the MCP server first"),
+        Cmd::Tool { .. } | Cmd::Mcp { .. } => unreachable!("main runs tools and the MCP server first"),
         Cmd::Promote { max, harness } => promote::run(&env, max, &harness),
         Cmd::Job { action: JobCmd::Prepare { kind: PrepareCmd::Triage { harness, model } } } => {
             inbox::prepare_triage(&env, &harness, model.as_deref())

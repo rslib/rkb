@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 /// Protocol revisions rkb speaks, newest first. A client asking for one of them gets it back.
 const VERSIONS: [&str; 4] = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"];
 
-pub fn serve() {
+pub fn serve(tools: &str) {
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -16,7 +16,7 @@ pub fn serve() {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(reply) = handle(&line) {
+        if let Some(reply) = handle(&line, tools) {
             // A client that went away ends the server.
             if writeln!(out, "{reply}").and_then(|()| out.flush()).is_err() {
                 break;
@@ -30,7 +30,7 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 }
 
 /// The reply to one message, or `None` for a notification.
-pub fn handle(line: &str) -> Option<Value> {
+pub fn handle(line: &str, tools: &str) -> Option<Value> {
     let Ok(msg) = serde_json::from_str::<Value>(line) else {
         return Some(error(Value::Null, -32700, "parse error"));
     };
@@ -49,10 +49,20 @@ pub fn handle(line: &str) -> Option<Value> {
         }
         "ping" => json!({}),
         // An MCP server that declares an output schema must return structured results; this one returns text.
-        "tools/list" => json!({ "tools": rkb_core::tools::definitions().into_iter().map(without_output_schema).collect::<Vec<_>>() }),
+        "tools/list" => {
+            let allowed = rkb_core::tools::set(tools).unwrap_or(&[]);
+            let defs = rkb_core::tools::definitions().into_iter().filter(|d| d["name"].as_str().is_some_and(|n| allowed.contains(&n)));
+            json!({ "tools": defs.map(without_output_schema).collect::<Vec<_>>() })
+        }
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
-            let (text, exit) = crate::agent::call(name, &params["arguments"]);
+            let allowed = rkb_core::tools::set(tools).unwrap_or(&[]);
+            // Refused before the arguments are read, so a call outside the set writes nothing.
+            let (text, exit) = if rkb_core::tools::NAMES.contains(&name) && !allowed.contains(&name) {
+                (format!("{name} is not in the {tools} tool set (rkb mcp --tools {tools})"), 1)
+            } else {
+                crate::agent::call(name, &params["arguments"])
+            };
             // Exit 3 is a question for the user, which the agent passes on; only 1 and 2 are failures.
             json!({ "content": [{ "type": "text", "text": text }], "isError": exit == 1 || exit == 2 })
         }

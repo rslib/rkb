@@ -7,6 +7,16 @@ use crate::lesson::LessonType;
 
 pub const NAMES: [&str; 7] = ["rkb_search", "rkb_show", "rkb_add", "rkb_note", "rkb_used", "rkb_flag", "rkb_edit"];
 
+/// The tool sets `rkb mcp --tools` serves: `read` cannot change anything, and `propose` can only
+/// add to the inbox, which the owner promotes.
+pub const SETS: [(&str, &[&str]); 3] =
+    [("read", &["rkb_search", "rkb_show"]), ("propose", &["rkb_search", "rkb_show", "rkb_note"]), ("all", &NAMES)];
+
+/// The tool names of the set `name`, or `None` for an unknown set.
+pub fn set(name: &str) -> Option<&'static [&'static str]> {
+    SETS.iter().find(|(n, _)| *n == name).map(|(_, tools)| *tools)
+}
+
 const TYPES: [&str; 5] = ["pitfall", "recipe", "fact", "decision", "preference"];
 
 /// The field name of a section heading: `When to use` is `when_to_use`.
@@ -107,74 +117,75 @@ fn output_schema(name: &str) -> Value {
 
 fn inputs() -> Vec<Value> {
     let mut add_props = json!({
-        "type": { "type": "string", "enum": TYPES, "description": "pitfall: an error and its fix; recipe: steps that work; fact: something true here; decision: a choice and why; preference: how the user wants things done" },
-        "title": { "type": "string", "description": "What the lesson says, as a short sentence, such as `CMake cannot find HDF5 unless HDF5_ROOT is set`" },
-        "topic": { "type": "string", "description": "Topic folder, such as `cmake` or `git`; rkb picks the scope from `when`" },
+        "type": { "type": "string", "enum": TYPES, "description": "pitfall: an error and its fix; recipe: steps that work; fact: true here; decision: a choice and why; preference: how the user wants it" },
+        "title": { "type": "string", "description": "What the lesson says, one short sentence" },
+        "topic": { "type": "string", "description": "Topic folder, such as `cmake`" },
         "tags": { "type": "array", "items": { "type": "string" }, "description": "A few words to find it by" },
-        "queries": { "type": "array", "items": { "type": "string" }, "description": "3 to 4 example queries someone would type before they know this lesson exists, never the title: raw error text, the symptom in plain words, a how-do-I question, the same problem in other words" },
-        "when": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Conditions under which it holds, such as {\"hdf5\": \"1.12:1.14.2\"}. Set {\"project\": \"<name>\"} when the claim holds only for one project (its code, decisions or conventions); leave it out for a general rule, and name the project only in evidence" },
-        "verified_how": { "type": "string", "enum": ["ran", "read", "told"], "description": "ran: you ran it and saw it work; read: from docs or code; told: the user said so. Default: ran" },
-        "assets": { "type": "array", "items": { "type": "string" }, "description": "Image files (png, jpg, webp, svg) to store with the lesson, metadata removed; link each in a section by its file name, such as ![trace](trace.png)" },
+        "queries": { "type": "array", "items": { "type": "string" }, "description": "3 to 4 queries someone types before they know the lesson, never the title: raw error text, the symptom in plain words, a how-do-I question" },
+        "when": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Where it holds, such as {\"hdf5\": \"1.12:1.14.2\"}. {\"project\": \"<name>\"} only for a claim about one project; a general rule names the project only in evidence" },
+        "verified_how": { "type": "string", "enum": ["ran", "read", "told"], "description": "ran (default): you saw it work; read: docs or code; told: the user said so" },
+        "assets": { "type": "array", "items": { "type": "string" }, "description": "Image files to store; link each by file name, such as ![t](t.png)" },
     });
-    for (f, types) in section_fields() {
-        add_props[&f] = json!({ "type": "string", "description": format!("Section for {}", types.join(", ")) });
+    // The rkb_add description names the sections of each type, so the fields carry no text.
+    for (f, _) in section_fields() {
+        add_props[&f] = json!({ "type": "string" });
     }
     vec![
         json!({
             "name": "rkb_search",
-            "description": "Search the user's own knowledge base of lessons learned. Use it BEFORE a web search or a guess whenever you hit an error or a problem that may have been seen before. Returns ranked lessons (TOON) with id, title, whether each applies here, and a summary; read one with rkb_show.",
+            "description": "Search the user's knowledge base of lessons learned. Use it BEFORE a web search or a guess about an error or problem. Read a result with rkb_show.",
             "inputSchema": { "type": "object", "properties": {
-                "query": { "type": "string", "description": "Words from the problem or the error message" },
-                "limit": { "type": "integer", "minimum": 1, "description": "Most results to return. Default: 10" },
-                "all": { "type": "boolean", "description": "Also show lessons that do not apply here and other projects' lessons" },
-                "tier": { "type": "string", "enum": ["candidate", "proven", "archive"], "description": "Show only lessons of this tier. `archive` shows tombstones" },
+                "query": { "type": "string", "description": "Words from the problem or the error" },
+                "limit": { "type": "integer", "minimum": 1, "description": "Default: 10" },
+                "all": { "type": "boolean", "description": "Also show lessons that do not apply here" },
+                "tier": { "type": "string", "enum": ["candidate", "proven", "archive"], "description": "Only this tier; archive shows tombstones" },
             }, "required": ["query"], "additionalProperties": false },
         }),
         json!({
             "name": "rkb_show",
-            "description": "Read one lesson in full by its id (from rkb_search). Check its `applies` result and its Check section before you act on it. Its `hash` is the `base` for rkb_edit. After you apply a lesson, report the outcome with rkb_used.",
+            "description": "Read one lesson by id. Check `applies` and its Check section before you act on it. Its `hash` is the `base` for rkb_edit. Report the outcome with rkb_used.",
             "inputSchema": { "type": "object", "properties": {
-                "id": { "type": "string", "description": "The lesson id, such as 7f3a9c2b41" },
+                "id": { "type": "string", "description": "The lesson id" },
             }, "required": ["id"], "additionalProperties": false },
         }),
         json!({
             "name": "rkb_add",
-            "description": "Record a durable lesson in the user's knowledge base: a fix for an error that can come back, a rule, a decision with its reason, or a recipe that took several tries. Run rkb_search first and do not add a close copy. Fill the sections of the chosen type (pitfall: symptom, cause, fix, evidence; recipe: when_to_use, steps, evidence; fact: statement, evidence; decision: context, decision, why, rejected_options; preference: rule, why, how_to_apply). Keep the real error text and the command that fixed it; never invent a fix. rkb checks, files and commits it, and may return needs_user with a question for the user.",
+            "description": "Record a durable lesson: a fix for an error that can come back, a rule, a decision and its reason, or a recipe that took several tries. Run rkb_search first; do not add a close copy. Fill the sections of the type (pitfall: symptom, cause, fix, evidence; recipe: when_to_use, steps, evidence; fact: statement, evidence; decision: context, decision, why, rejected_options; preference: rule, why, how_to_apply). Keep the real error text and the fix command; never invent a fix. May return needs_user with a question for the user.",
             "inputSchema": { "type": "object", "properties": add_props, "required": ["type", "title", "topic"], "additionalProperties": false },
         }),
         json!({
             "name": "rkb_note",
-            "description": "Save a finding to the rkb inbox when you cannot write the full lesson now. Write it as dense dated notes, one event per line: `- YYYY-MM-DD [high|med|low] what happened, the exact error, what fixed it`. Inbox items become lessons later with the distill command, highest priority first.",
+            "description": "Save a finding to the inbox when you cannot write the full lesson now, one event per line: `- YYYY-MM-DD [high|med|low] what happened, the exact error, what fixed it`. Inbox items become lessons later.",
             "inputSchema": { "type": "object", "properties": {
                 "text": { "type": "string", "description": "What you found, one event per line" },
-                "priority": { "type": "integer", "minimum": 1, "description": "1 (default) to 3: 3 for a fix that cost real time or a mistake that repeats" },
+                "priority": { "type": "integer", "minimum": 1, "description": "1 (default) to 3: 3 for a costly fix or a repeated mistake" },
             }, "required": ["text"], "additionalProperties": false },
         }),
         json!({
             "name": "rkb_used",
-            "description": "Report whether a lesson you applied worked. Call it every time you act on a lesson from rkb_search, rkb_show or an rkb hook: `worked` when the task then succeeded, `failed` with the reason when it did not (that also flags the lesson). Use `irrelevant` when a lesson from a search or a hook does not fit the problem; it does not flag the lesson. This is how the knowledge base learns which lessons help.",
+            "description": "Report each lesson you act on (from a search, rkb_show or a hook): `worked` when the task then succeeded, `failed` with the reason when not (this flags it), `irrelevant` when it does not fit the problem (no flag).",
             "inputSchema": { "type": "object", "properties": {
                 "id": { "type": "string", "description": "The lesson id" },
-                "result": { "type": "string", "enum": ["worked", "failed", "irrelevant"], "description": "worked, failed, or irrelevant when the lesson does not fit the problem" },
-                "reason": { "type": "string", "description": "Why it failed or did not fit, or what it helped with" },
+                "result": { "type": "string", "enum": ["worked", "failed", "irrelevant"], "description": "The outcome" },
+                "reason": { "type": "string", "description": "Why it failed or did not fit, or what it helped" },
             }, "required": ["id", "result"], "additionalProperties": false },
         }),
         json!({
             "name": "rkb_flag",
-            "description": "Mark a lesson stale because it looks wrong or out of date and you cannot fix it now. Give the concrete reason (the version, the error, what changed). Prefer rkb_edit when you know the right content.",
+            "description": "Mark a lesson stale when it looks wrong or out of date and you cannot fix it now. Prefer rkb_edit when you know the right content.",
             "inputSchema": { "type": "object", "properties": {
                 "id": { "type": "string", "description": "The lesson id" },
-                "reason": { "type": "string", "description": "What is wrong, concretely" },
+                "reason": { "type": "string", "description": "What is wrong: the version, the error, what changed" },
             }, "required": ["id", "reason"], "additionalProperties": false },
         }),
         json!({
             "name": "rkb_edit",
-            "description": "Fix or extend a lesson: pass the full new lesson file (frontmatter and body, from rkb_show) and the `hash` rkb_show gave as `base`; the edit fails if the lesson changed since. Keep the id, and keep the real error text and evidence. Use it to correct a wrong lesson, add a case, or merge a near-duplicate instead of adding a new lesson. rkb checks and commits it.",
+            "description": "Fix or extend a lesson: pass the full new file (from rkb_show) and its `hash` as `base`; it fails if the lesson changed since. Keep the id, the real error text and the evidence. Use it to correct a lesson, add a case or merge a near-duplicate instead of adding one.",
             "inputSchema": { "type": "object", "properties": {
                 "id": { "type": "string", "description": "The lesson id" },
                 "base": { "type": "string", "description": "The hash rkb_show printed" },
                 "text": { "type": "string", "description": "The full new lesson file" },
-                "assets": { "type": "array", "items": { "type": "string" }, "description": "Image files to add or replace in the lesson's folder; link each by its file name" },
+                "assets": { "type": "array", "items": { "type": "string" }, "description": "Image files to add or replace; link each by file name" },
             }, "required": ["id", "base", "text"], "additionalProperties": false },
         }),
     ]

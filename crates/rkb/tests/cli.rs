@@ -2182,6 +2182,57 @@ fn mcp_server_offers_the_tools() {
     assert_eq!(replies[5]["result"], serde_json::json!({}));
 }
 
+/// The replies of an `rkb mcp` server started with `args`, one per request line.
+fn mcp_replies(env: &Env, args: &[&str], requests: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let input: String = requests.iter().map(|r| format!("{r}\n")).collect();
+    let o = env.rkb_in(&[&["mcp"], args].concat(), &input);
+    String::from_utf8_lossy(&o.stdout).lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+fn listed(reply: &serde_json::Value) -> Vec<String> {
+    reply["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn mcp_tool_sets() {
+    let env = search_kb();
+    let list = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} });
+    assert_eq!(listed(&mcp_replies(&env, &["--tools", "read"], std::slice::from_ref(&list))[0]), ["rkb_search", "rkb_show"]);
+    assert_eq!(listed(&mcp_replies(&env, &["--tools", "propose"], std::slice::from_ref(&list))[0]), ["rkb_search", "rkb_show", "rkb_note"]);
+    assert_eq!(listed(&mcp_replies(&env, &[], std::slice::from_ref(&list))[0]).len(), 7, "the default serves every tool");
+
+    // A valid rkb_add outside the set is refused and writes nothing.
+    let add = serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "rkb_add", "arguments": {
+        "type": "pitfall", "title": "Ninja ignores CFLAGS changes until a reconfigure", "topic": "cmake",
+        "symptom": "A changed CFLAGS has no effect.", "cause": "CMake caches the flags at configure time.",
+        "fix": "Run `cmake --fresh -B build`.", "evidence": "The next build used the new flags.",
+    } } });
+    let (commits, status) = (commit_count(&env), stdout(&env.git(&["status", "--porcelain"])));
+    let replies = mcp_replies(&env, &["--tools", "propose"], std::slice::from_ref(&add));
+    assert_eq!(replies[0]["result"]["isError"], true, "{}", replies[0]);
+    let text = replies[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("rkb_add") && text.contains("rkb mcp --tools propose"), "the error names the set: {text}");
+    assert_eq!((commit_count(&env), stdout(&env.git(&["status", "--porcelain"]))), (commits, status), "nothing written");
+    assert!(inbox_items(&env).is_empty(), "no inbox item");
+    // An unknown tool keeps its own error, and the full set still writes.
+    let unknown =
+        serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "rkb_nope", "arguments": {} } });
+    let replies = mcp_replies(&env, &["--tools", "propose"], &[unknown]);
+    assert!(replies[0]["result"]["content"][0]["text"].as_str().unwrap().contains("unknown tool"), "{}", replies[0]);
+    let replies = mcp_replies(&env, &[], &[add]);
+    assert_eq!(replies[0]["result"]["isError"], false, "{}", replies[0]);
+    assert_eq!(commit_count(&env), commits + 1);
+}
+
+#[test]
+fn mcp_tool_list_fits() {
+    let env = search_kb();
+    let list = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} });
+    let count = mcp_replies(&env, &[], &[list])[0]["result"].to_string().chars().count();
+    println!("tools/list result: {count} characters");
+    assert!(count <= 6000, "tools/list result is {count} characters");
+}
+
 #[test]
 fn install_claude_needs_the_claude_command() {
     let env = Env::new();
