@@ -153,6 +153,12 @@ pub fn slug(title: &str) -> String {
     if out.is_empty() { "lesson".into() } else { out.chars().take(60).collect() }
 }
 
+/// Whether a lesson body holds a fenced code block or a URL, so promotion can hold it for the user.
+/// Single backticks never count: `HDF5_ROOT` names a thing, it runs nothing.
+pub fn holds_commands_or_urls(body: &str) -> bool {
+    body.contains("```") || body.contains("https://") || body.contains("http://")
+}
+
 pub fn jaccard(a: &str, b: &str) -> f64 {
     let a: BTreeSet<String> = words(a).collect();
     let b: BTreeSet<String> = words(b).collect();
@@ -1500,6 +1506,15 @@ mod tests {
         assert_eq!(id.len(), 10);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_eq!(content_hash(b"abc"), "ba7816bf8f01");
+    }
+
+    #[test]
+    fn finds_commands_and_urls() {
+        assert!(holds_commands_or_urls("# T\n\n## Fix\n\n```sh\nrm -rf build\n```\n"));
+        assert!(holds_commands_or_urls("see https://example.com/fix for the patch"));
+        assert!(holds_commands_or_urls("see http://example.com/fix for the patch"));
+        assert!(!holds_commands_or_urls("# T\n\n## Fix\n\nSet `HDF5_ROOT` and rerun.\n"));
+        assert!(!holds_commands_or_urls("# T\n\n## Evidence\n\nIt worked.\n"));
     }
 
     #[test]

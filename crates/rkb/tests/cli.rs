@@ -4837,6 +4837,69 @@ fn inbox_done_records_outcomes_for_triage() {
 }
 
 #[test]
+fn promote_holds_a_lesson_with_a_url() {
+    let env = Env::new();
+    env.init();
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[observer]\npi = \"session\"\n");
+    approve_as_claude(&env);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let write_item = |id: &str, sig: &str, body: &str| {
+        let dir = env.dir.path().join("state/rkb/inbox");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{id}.md")), format!("---\nkind: note\ntime: {now}\nsignatures:\n  - {sig}\n---\n\n{body}\n"))
+            .unwrap();
+        let p = env.dir.path().join("state/rkb/signatures.jsonl");
+        let old = std::fs::read_to_string(&p).unwrap_or_default();
+        std::fs::write(
+            &p,
+            format!(
+                "{old}{{\"time\":{now},\"sig\":\"{sig}\",\"session\":\"s1\"}}\n{{\"time\":{now},\"sig\":\"{sig}\",\"session\":\"s2\"}}\n"
+            ),
+        )
+        .unwrap();
+    };
+    let answer = |text: &str| {
+        let fake = env.dir.path().join("fake/pi");
+        env.write_abs(&fake, &format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{text}'\n"));
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    };
+    // A lesson with a URL waits for the user.
+    write_item("0a1b2c3d4e", "aaabbbcccddd", "cmake could not find HDF5 on this machine");
+    answer(
+        r#"{"action":"add","topic":"cmake","type":"pitfall","title":"Cmake needs the prefix","queries":["cmake could not find HDF5","HDF5 prefix fix"],"sections":{"Symptom":"cmake could not find HDF5 on this machine","Cause":"Not known yet.","Fix":"See https://example.com/fix for the patch","Evidence":"Not known yet."},"quotes":["cmake could not find HDF5"]}"#,
+    );
+    let o = rkb_with(with_pi(&env), &["promote", "--harness", "pi", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!((v["promoted"].as_u64(), v["left"].as_u64()), (Some(0), Some(1)), "{v}");
+    assert_eq!(v["results"][0]["needs_user"], true, "{v}");
+    let (found, _) = env.json(&["search", "cmake could not find HDF5"], "");
+    assert!(found["results"].as_array().unwrap().is_empty(), "nothing written yet: {found}");
+    let (status, _) = env.json(&["status"], "");
+    assert_eq!(status["requests"].as_array().unwrap().len(), 1, "{status}");
+    // The user confirms it, and the lesson lands.
+    let id = status["requests"][0]["id"].as_str().unwrap().to_string();
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_AUTO_CONFIRM", "write lesson");
+    let o = rkb_with(c, &["confirm", &id, "--choice", "write lesson", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(v["status"], "written", "{v}");
+    let (found, _) = env.json(&["search", "cmake could not find HDF5"], "");
+    assert_eq!(found["results"].as_array().unwrap().len(), 1, "{found}");
+    // A lesson with neither writes at once.
+    write_item("0a1b2c3d4f", "eeefff000111", "ninja is faster here");
+    answer(
+        r#"{"action":"add","topic":"cmake","type":"fact","title":"Ninja is faster here","queries":["ninja faster","ninja build speed"],"sections":{"Statement":"ninja is faster here","Evidence":"saw it"},"quotes":["ninja is faster here"]}"#,
+    );
+    let o = rkb_with(with_pi(&env), &["promote", "--harness", "pi", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!((v["promoted"].as_u64(), v["left"].as_u64()), (Some(1), Some(0)), "{v}");
+    let (status, _) = env.json(&["status"], "");
+    assert!(status["requests"].as_array().unwrap().is_empty(), "{status}");
+    let (found, _) = env.json(&["search", "ninja is faster here"], "");
+    assert_eq!(found["results"].as_array().unwrap().len(), 1, "{found}");
+}
+
+#[test]
 fn session_start_leaves_the_inbox_to_status() {
     let env = search_kb();
     for i in 0..5 {

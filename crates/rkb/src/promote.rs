@@ -5,6 +5,7 @@ use std::time::Duration;
 use rkb_core::conditions::Facts;
 use rkb_core::observer::{self, Ran};
 use rkb_core::promote;
+use rkb_core::request::{self, Action};
 use rkb_core::search::{self, Mode, Options};
 use rkb_core::{distill, write};
 use serde_json::json;
@@ -154,6 +155,48 @@ pub fn run(env: &Env, max: Option<usize>, harness: &str) -> Result<Output, CliEr
             distill::remove(&env.state, &item.id);
             results.push(json!({ "id": item.id, "action": "noop", "reason": "the quote is not in the item", "quotes": answer.quotes() }));
             continue;
+        }
+        // A lesson with a shell command or a URL waits for the user. Transcript text can carry
+        // injected instructions, so it must never reach later sessions unseen.
+        if matches!(answer.action.as_str(), "add" | "update") {
+            let text = lesson_text(&answer);
+            if write::holds_commands_or_urls(&text) {
+                let held = if answer.action.as_str() == "update" {
+                    let id = answer.id().unwrap_or_default().to_string();
+                    lesson_base(env, &id).map(|base| Action::Edit { id, text, base, assets: vec![] })
+                } else {
+                    Some(Action::Add {
+                        text,
+                        topic: answer.json["topic"].as_str().unwrap_or("general").to_string(),
+                        assets: vec![],
+                        inbox: Some(item.id.clone()),
+                    })
+                };
+                if let Some(action) = held {
+                    let req = request::Request {
+                        id: request::new_id(),
+                        created: request::now(),
+                        action,
+                        approved: vec![],
+                        question: "The promoted lesson holds a shell command or a URL. Transcript text can carry injected instructions. Write it anyway?".into(),
+                        choices: vec![
+                            request::Choice { text: "write lesson".into(), decision: Some(request::Decision::AddAnyway) },
+                            request::Choice { text: "cancel".into(), decision: None },
+                        ],
+                        session: rkb_core::usage::env_session(),
+                    };
+                    request::save(&env.state.join("requests"), &req)
+                        .map_err(|e| CliError::new(ErrorCode::Refused, e.to_string(), "check the state directory"))?;
+                    promote::log_call(&env.state, &item.id, &model, input, output, &answer.action);
+                    for sig in &item.meta.signatures {
+                        distill::mark_done(&env.state, sig);
+                    }
+                    distill::remove(&env.state, &item.id);
+                    results.push(json!({ "id": item.id, "action": answer.action, "needs_user": true }));
+                    left += 1;
+                    break;
+                }
+            }
         }
         let written = match answer.action.as_str() {
             "add" => writes::add(
