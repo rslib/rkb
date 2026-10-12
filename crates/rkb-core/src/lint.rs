@@ -151,6 +151,39 @@ pub fn lint(snap: &Snapshot, env: &LintEnv, focus: Option<&BTreeSet<String>>) ->
         };
         out.error("kb.toml", None, "config/jev", message);
     }
+    if let Some(thresholds) = kb.as_ref().and_then(|k| k.hooks.as_ref()).and_then(|h| h.get("thresholds")) {
+        let mut bad = |message: String| out.error("kb.toml", None, "config/thresholds", message);
+        match thresholds.as_table() {
+            None => bad("[hooks.thresholds] must be a table of backend names".into()),
+            Some(backends) => {
+                for (backend, paths) in backends {
+                    if !["jev", "bm25-bert", "bm25"].contains(&backend.as_str()) {
+                        bad(format!("[hooks.thresholds] has an unknown backend `{backend}`; the backends are jev, bm25-bert and bm25"));
+                        continue;
+                    }
+                    let Some(paths) = paths.as_table() else {
+                        bad(format!("[hooks.thresholds.{backend}] must be a table of failure and prompt"));
+                        continue;
+                    };
+                    for (path, table) in paths {
+                        if path != "failure" && path != "prompt" {
+                            bad(format!("[hooks.thresholds.{backend}] has an unknown path `{path}`; the paths are failure and prompt"));
+                            continue;
+                        }
+                        let Some(table) = table.as_table() else {
+                            bad(format!("[hooks.thresholds.{backend}] {path} must be a table with min and margin"));
+                            continue;
+                        };
+                        let num = |key: &str| table.get(key).and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)));
+                        match (num("min"), num("margin")) {
+                            (Some(min), Some(margin)) if (0.0..=1.0).contains(&min) && (0.0..=1.0).contains(&margin) => {}
+                            _ => bad(format!("[hooks.thresholds.{backend}] {path} needs min and margin within 0 and 1")),
+                        }
+                    }
+                }
+            }
+        }
+    }
     // The file itself usually sits in site/, which lint does not read; `rkb publish` reports it missing.
     if let Some(img) = kb.as_ref().and_then(|k| k.site.image.as_deref()) {
         let ext = img.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();

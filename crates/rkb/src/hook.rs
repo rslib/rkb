@@ -343,8 +343,10 @@ fn recall(p: &Value, state: &Path, session: &str, text: &str) -> Result<Option<S
     }
     let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, text, "recall")?;
     let (min_default, margin_default) = hooks::recall_defaults(&ranked.backend);
-    let min = cfg.get("recall_min_relevance").and_then(toml::Value::as_float).unwrap_or(min_default);
-    let margin = cfg.get("recall_min_margin").and_then(toml::Value::as_float).unwrap_or(margin_default);
+    let table = hooks::path_threshold(&cfg, &ranked.backend, "prompt");
+    let flat = |k: &str| cfg.get(k).and_then(toml::Value::as_float);
+    let min = table.map(|t| t.0).or_else(|| flat("recall_min_relevance")).unwrap_or(min_default);
+    let margin = table.map(|t| t.1).or_else(|| flat("recall_min_margin")).unwrap_or(margin_default);
     // A BM25 score means different things for different queries, so without a model there is no threshold.
     if ranked.scores.is_none() {
         return Ok(None);

@@ -4900,6 +4900,184 @@ fn promote_holds_a_lesson_with_a_url() {
 }
 
 #[test]
+fn eval_drafts_a_reviewed_set() {
+    let env = kb_with_topics();
+    let lesson = add_ok(&env, "cmake", &lesson_with("Cmake prefix lesson"));
+    let id = lesson["id"].as_str().unwrap().to_string();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let replay = |session: &str, query: &str, injected: &str| {
+        format!(
+            "{{\"time\":{now},\"session\":\"{session}\",\"project\":null,\"system\":null,\"query\":\"{query}\",\"injected\":\"{injected}\"}}\n"
+        )
+    };
+    std::fs::create_dir_all(env.dir.path().join("state/rkb")).unwrap();
+    std::fs::write(
+        env.dir.path().join("state/rkb/replays.jsonl"),
+        replay("s1", "cmake could not find HDF5", &id)
+            + &replay("s2", "linker error vtable", "00aa00aa00")
+            + &replay("s3", "a failure nobody reported", "00bb00bb00"),
+    )
+    .unwrap();
+    let usage = env.kb().join(".rkb/usage/test.jsonl");
+    std::fs::create_dir_all(usage.parent().unwrap()).unwrap();
+    std::fs::write(
+        &usage,
+        format!(
+            "{{\"time\":\"2030-01-01T00:00:00Z\",\"id\":\"{id}\",\"event\":\"worked\",\"session\":\"s1\"}}\n{{\"time\":\"2030-01-01T00:00:00Z\",\"id\":\"00aa00aa00\",\"event\":\"irrelevant\",\"session\":\"s2\"}}\n"
+        ),
+    )
+    .unwrap();
+    let draft = env.dir.path().join("reviewed.toml");
+    let (v, code) = env.json(&["eval", "--draft-reviewed", draft.to_str().unwrap()], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(v["events"], 2, "{v}");
+    let text = std::fs::read_to_string(&draft).unwrap();
+    assert!(text.contains(&format!("expect = [\"{id}\"]")) && text.contains("rationale = \"auto\""), "{text}");
+    assert!(text.contains("expect = []"), "{text}");
+    let (v, code) = env.json(&["eval", "--reviewed", draft.to_str().unwrap()], "");
+    assert_eq!(code, Some(0), "the draft parses: {v}");
+    assert_eq!(v["metrics"]["samples"], 2, "{v}");
+    assert_eq!(v["metrics"]["unavailable"], 0, "a drafted failure can feed --pick: {v}");
+    let before = std::fs::read(&draft).unwrap();
+    let (v, code) = env.json(&["eval", "--draft-reviewed", draft.to_str().unwrap()], "");
+    assert_eq!(code, Some(1), "{v}");
+    assert_eq!(std::fs::read(&draft).unwrap(), before, "the file is unchanged");
+}
+
+#[test]
+fn eval_pick_prints_hooks_lines() {
+    let env = kb_with_topics();
+    let cmake = add_ok(&env, "cmake", &lesson_with("Cmake prefix lesson"))["id"].as_str().unwrap().to_string();
+    let vtable = add_ok(
+        &env,
+        "cpp",
+        "---\ntype: pitfall\nverified_how: ran\n---\n\n# Vtable linker lesson\n\n## Symptom\nUndefined reference to vtable for Widget.\n\n## Cause\nA missing virtual definition.\n\n## Fix\nDefine the virtual.\n\n## Evidence\nIt linked.\n",
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ninja = add_ok(
+        &env,
+        "cmake",
+        "---\ntype: fact\nverified_how: ran\n---\n\n# Ninja lesson\n\n## Statement\nNinja is faster here.\n\n## Evidence\nSaw it.\n",
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    set_chain(&env, "chain = [\"jev\", \"bm25\"]");
+    jev_config(&env, "[jev]\napi_key = \"k\"\n", 0o600);
+    let kb_toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write(
+        "kb.toml",
+        &kb_toml.replace("allow = { sensitivity = [\"public\"] }", "allow = { sensitivity = [\"public\", \"internal\"] }"),
+    );
+    let (url, _log) = fake_jev(|body| {
+        let state = body["state"].as_str().unwrap_or_default();
+        let top = if state.contains("alpha") {
+            0.9
+        } else if state.contains("beta") {
+            0.82
+        } else if state.contains("gamma") {
+            0.78
+        } else {
+            0.72
+        };
+        let answers: serde_json::Map<String, serde_json::Value> = body["questions"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| {
+                let v = if k == "lesson_0" { top } else { 0.0 };
+                (k.clone(), serde_json::json!({ "type": "noul", "noul": v }))
+            })
+            .collect();
+        (200, serde_json::json!({ "answers": answers }).to_string())
+    });
+    let head = stdout(&env.git(&["rev-parse", "HEAD"])).trim().to_string();
+    let event = |key: &str, error: &str, expect: &str| {
+        format!(
+            "\n[[event]]\nkey = '{key}'\npath = 'failure'\ntext = '{error}'\nerror = '{error}'\ncommand = 'cmake -B build'\nexpect = {expect}\nworked = 'hand review'\nsource = 'hand'\nrationale = 'hand'\n"
+        )
+    };
+    let reviewed = format!(
+        "version = 1\nkb_revision = '{head}'\nsource_fingerprint = 'test'\n{}\n",
+        event("e1", "cmake error: no CMake config file, set HDF5_ROOT alpha", &format!("[\"{cmake}\"]"))
+            + &event("e2", "cmake error: no CMake config file, set HDF5_ROOT beta", &format!("[\"{cmake}\"]"))
+            + &event("e3", "cmake error: no CMake config file, set HDF5_ROOT gamma", &format!("[\"{ninja}\"]"))
+            + &event("e4", "cmake error: no CMake config file, set HDF5_ROOT delta", &format!("[\"{vtable}\"]"))
+    );
+    let path = env.dir.path().join("reviewed.toml");
+    std::fs::write(&path, &reviewed).unwrap();
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_JEV_URL", &url);
+    let o = rkb_with(c, &["eval", "--reviewed", path.to_str().unwrap(), "--pick", "0.95", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(v["picks"]["jev"]["failure"], serde_json::json!({ "min": 0.8, "margin": 0.0 }), "{v}");
+    assert_eq!(v["picks"]["jev"]["prompt"], serde_json::Value::Null, "{v}");
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_JEV_URL", &url);
+    let o = rkb_with(c, &["eval", "--reviewed", path.to_str().unwrap(), "--pick", "0.95"], "");
+    let human = stdout(&o);
+    assert!(human.contains("[hooks.thresholds.jev]") && human.contains("failure = { min = 0.8, margin = 0.0 }"), "{human}");
+    assert!(!human.contains("prompt = "), "no prompt line: {human}");
+    assert!(human.contains("prompt jev"), "it says so: {human}");
+}
+
+#[test]
+fn hook_thresholds_from_kb_toml() {
+    let env = kb_with_topics();
+    let id = add_ok(&env, "cmake", &lesson_with("Cmake prefix lesson"))["id"].as_str().unwrap().to_string();
+    set_chain(&env, "chain = [\"jev\", \"bm25\"]");
+    jev_config(&env, "[jev]\napi_key = \"k\"\n", 0o600);
+    let kb_toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    let base = kb_toml.replace("allow = { sensitivity = [\"public\"] }", "allow = { sensitivity = [\"public\", \"internal\"] }");
+    env.write("kb.toml", &base);
+    let (url, _log) = fake_jev(|body| {
+        let answers: serde_json::Map<String, serde_json::Value> = body["questions"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| {
+                let v = if k == "lesson_0" { 0.9 } else { 0.0 };
+                (k.clone(), serde_json::json!({ "type": "noul", "noul": v }))
+            })
+            .collect();
+        (200, serde_json::json!({ "answers": answers }).to_string())
+    });
+    let run_hook = |event: &str, payload: &serde_json::Value| {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.env("RKB_JEV_URL", &url);
+        let o = rkb_with(c, &["hook", event], &payload.to_string());
+        assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+        stdout(&o)
+    };
+    let failed = |session: &str| {
+        serde_json::json!({
+            "session_id": session, "cwd": env.kb(), "tool_name": "Bash",
+            "tool_input": { "command": "cmake -B build" },
+            "error": "cmake error: no CMake config file, set HDF5_ROOT",
+        })
+    };
+    let prompt =
+        |session: &str| serde_json::json!({ "session_id": session, "cwd": env.kb(), "prompt": "cmake cannot find the HDF5 prefix here" });
+    assert!(run_hook("tool-failed", &failed("s1")).contains(&id), "no table, the hook uses its defaults");
+    assert!(run_hook("prompt", &prompt("s2")).contains(&id), "no table on the prompt path either");
+    env.write("kb.toml", &format!("{base}\n[hooks.thresholds.jev]\nfailure = {{ min = 0.99, margin = 0.1 }}\n"));
+    assert_eq!(run_hook("tool-failed", &failed("s3")), "", "a 0.9 top is below the 0.99 failure threshold");
+    assert!(run_hook("prompt", &prompt("s4")).contains(&id), "no prompt table, the prompt path keeps its defaults");
+    env.write(
+        "kb.toml",
+        &format!("{base}\n[hooks.thresholds.jev]\nfailure = {{ min = 0.99, margin = 0.1 }}\nprompt = {{ min = 0.99, margin = 0.1 }}\n"),
+    );
+    assert_eq!(run_hook("prompt", &prompt("s5")), "", "the prompt table holds the prompt path back");
+    let out = stdout(&env.rkb(&["lint", "--format", "json"]));
+    assert!(!out.contains("thresholds"), "a valid table lints clean: {out}");
+    env.write("kb.toml", &format!("{base}\n[hooks.thresholds.jev]\nbogus = {{ min = 0.9, margin = 0.1 }}\n"));
+    let out = stdout(&env.rkb(&["lint", "--format", "json"]));
+    assert!(out.contains("config/thresholds"), "an unknown path is reported: {out}");
+}
+
+#[test]
 fn session_start_leaves_the_inbox_to_status() {
     let env = search_kb();
     for i in 0..5 {

@@ -373,18 +373,61 @@ pub fn eval(
     Ok(Output { data, human, exit: u8::from(!pass), raw: false })
 }
 
-pub fn reviewed(env: &Env, path: &str, backend: Option<&str>, sweep: bool) -> Result<Output, CliError> {
+/// The knowledge base's committed revision, so a reviewed set pins what it was read against.
+fn kb_revision(root: &std::path::Path) -> Result<String, CliError> {
+    let out = rkb_core::git::run(root, &["rev-parse", "HEAD"]).map_err(|e| {
+        CliError::new(ErrorCode::Refused, format!("cannot verify KB revision: {e}"), "run against a committed knowledge base")
+    })?;
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+/// `rkb eval --draft-reviewed <file>`: one reviewed-set entry for each logged injection with a
+/// later use report. The file must not exist; the user reviews the draft before `--reviewed` reads it.
+pub fn draft_reviewed(env: &Env, path: &str) -> Result<Output, CliError> {
+    use rkb_core::{hooks, usage};
+    if std::path::Path::new(path).exists() {
+        return Err(CliError::new(ErrorCode::Refused, format!("{path} exists; nothing was written"), "pass a new file"));
+    }
+    let replays: Vec<eval::DraftReplay> = hooks::replays(&env.state, 90)
+        .into_iter()
+        .map(|r| eval::DraftReplay {
+            session: r.session,
+            query: r.query,
+            injected: r.injected,
+            project: r.project,
+            system: r.system,
+            time: r.time,
+        })
+        .collect();
+    let reports: Vec<eval::DraftReport> = usage::records(&env.root)
+        .into_iter()
+        .map(|r| eval::DraftReport { id: r.id, event: r.event, session: r.session, time: r.time })
+        .collect();
+    let text = eval::draft_reviewed(&replays, &reports, &kb_revision(&env.root)?)
+        .map_err(|e| CliError::new(ErrorCode::Refused, e.to_string(), "check the replay log and the use records"))?;
+    let events = text.matches("[[event]]").count();
+    std::fs::write(path, &text).map_err(|e| CliError::new(ErrorCode::Io, format!("cannot write {path}: {e}"), "check the path"))?;
+    let human = format!(
+        "drafted {events} reviewed events from {} replays into {path}; review it, then run `rkb eval --reviewed {path}`",
+        replays.len()
+    );
+    Ok(Output { data: serde_json::json!({ "file": path, "events": events, "replays": replays.len() }), human, exit: 0, raw: false })
+}
+
+pub fn reviewed(env: &Env, path: &str, backend: Option<&str>, sweep: bool, pick: Option<f64>) -> Result<Output, CliError> {
     use rkb_core::eval::{EventPath, ReviewedDecision, ReviewedObservation};
     use rkb_core::hooks;
     use rkb_core::matching::{Matched, Place, Rule};
+    if let Some(p) = pick
+        && !(0.0 < p && p <= 1.0)
+    {
+        return Err(CliError::new(ErrorCode::Usage, format!("--pick {p} is not within (0, 1]"), "pass a precision such as --pick 0.95"));
+    }
     let text = std::fs::read_to_string(path)
         .map_err(|e| CliError::new(ErrorCode::NotFound, format!("cannot read {path}: {e}"), "pass a readable reviewed manifest"))?;
     let set = eval::parse_reviewed(&text, &env.root)
         .map_err(|e| CliError::new(ErrorCode::Usage, e.to_string(), "fix the reviewed manifest and retry"))?;
-    let current_revision = rkb_core::git::run(&env.root, &["rev-parse", "HEAD"]).map_err(|e| {
-        CliError::new(ErrorCode::Refused, format!("cannot verify KB revision: {e}"), "run against a committed knowledge base")
-    })?;
-    let current_revision = String::from_utf8_lossy(&current_revision).trim().to_string();
+    let current_revision = kb_revision(&env.root)?;
     if current_revision != set.kb_revision {
         return Err(CliError::new(
             ErrorCode::Refused,
@@ -492,7 +535,7 @@ pub fn reviewed(env: &Env, path: &str, backend: Option<&str>, sweep: bool) -> Re
         };
         let decision = decision_at(min, margin);
         let mut curve = vec![(min, margin, decision)];
-        if sweep && ranked.scores.is_some() {
+        if (sweep || pick.is_some()) && ranked.scores.is_some() {
             curve.extend(
                 eval::SWEEP_MIN
                     .into_iter()
@@ -597,7 +640,7 @@ pub fn reviewed(env: &Env, path: &str, backend: Option<&str>, sweep: bool) -> Re
         .into_iter()
         .map(|((backend_name, reason), count)| json!({ "backend": backend_name, "reason": reason, "count": count }))
         .collect();
-    let data = json!({
+    let mut data = json!({
         "manifest": { "kb_revision": set.kb_revision, "source_fingerprint": set.source_fingerprint },
         "backend": { "requested": requested, "actual": actual_backends, "fallback": backend.is_none() && !skipped_report.is_empty(), "skipped": skipped_report },
         "paths": { "failure": path_metrics(EventPath::Failure), "prompt": path_metrics(EventPath::Prompt) },
@@ -609,6 +652,46 @@ pub fn reviewed(env: &Env, path: &str, backend: Option<&str>, sweep: bool) -> Re
         "model_risk_coverage": curves,
         "help": ["reviewed evaluation reads the manifest and cached probes only"],
     });
+    let mut pick_note = String::new();
+    if let Some(p) = pick {
+        let mut picks_data = serde_json::Map::new();
+        let mut pick_human = String::new();
+        for backend_name in &actual_backends {
+            let mut tables = vec![];
+            let mut paths_data = serde_json::Map::new();
+            for path_kind in [EventPath::Failure, EventPath::Prompt] {
+                let name = match path_kind {
+                    EventPath::Failure => "failure",
+                    EventPath::Prompt => "prompt",
+                };
+                let rows: Vec<_> = observations
+                    .iter()
+                    .filter(|r| r.backend.as_deref() == Some(backend_name.as_str()) && r.path == path_kind)
+                    .cloned()
+                    .collect();
+                match eval::pick(&rows, p) {
+                    Some((min, margin)) => {
+                        tables.push(format!("{name} = {{ min = {min:?}, margin = {margin:?} }}"));
+                        paths_data.insert(name.to_string(), json!({ "min": min, "margin": margin }));
+                    }
+                    None if rows.is_empty() => {
+                        pick_human.push_str(&format!("\n{name} {backend_name}: no eligible events"));
+                        paths_data.insert(name.to_string(), Value::Null);
+                    }
+                    None => {
+                        pick_human.push_str(&format!("\n{name} {backend_name}: no point reaches precision {p}"));
+                        paths_data.insert(name.to_string(), Value::Null);
+                    }
+                }
+            }
+            if !tables.is_empty() {
+                pick_human.push_str(&format!("\n[hooks.thresholds.{backend_name}]\n{}", tables.join("\n")));
+            }
+            picks_data.insert(backend_name.clone(), Value::Object(paths_data));
+        }
+        data["picks"] = Value::Object(picks_data);
+        pick_note = format!("\npick {p}:{pick_human}");
+    }
     let ratio = |m: &eval::Metric| {
         m.value.map_or_else(|| format!("{}/{} (-)", m.numerator, m.denominator), |v| format!("{}/{} ({v:.2})", m.numerator, m.denominator))
     };
@@ -675,6 +758,7 @@ pub fn reviewed(env: &Env, path: &str, backend: Option<&str>, sweep: bool) -> Re
         ratio(&all.coverage),
         data["model_risk_coverage"].as_array().map_or(0, Vec::len)
     ));
+    human.push_str(&pick_note);
     Ok(Output { data, human, exit: 0, raw: false })
 }
 

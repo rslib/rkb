@@ -210,6 +210,82 @@ pub fn parse_reviewed(text: &str, root: &Path) -> Result<ReviewedSet> {
     Ok(ReviewedSet { kb_revision: file.kb_revision, source_fingerprint: file.source_fingerprint, events: file.event })
 }
 
+/// One logged injection for a reviewed-set draft: the failure hook's replay row.
+#[derive(Debug, Clone)]
+pub struct DraftReplay {
+    pub session: String,
+    pub query: String,
+    pub injected: Option<String>,
+    pub project: Option<String>,
+    pub system: Option<String>,
+    pub time: u64,
+}
+
+/// One use report for a draft: the knowledge base's usage record.
+#[derive(Debug, Clone)]
+pub struct DraftReport {
+    pub id: String,
+    pub event: String,
+    pub session: Option<String>,
+    pub time: String,
+}
+
+/// Whether a usage record's report came after the replay it answers.
+fn later(report: &str, replay: u64) -> bool {
+    use std::str::FromStr;
+    jiff::Timestamp::from_str(report).map(|t| t.as_second() > replay as i64).unwrap_or(false)
+}
+
+/// A reviewed-set draft from the replay log and the use reports: one entry for each logged
+/// injection with a later `worked` or `irrelevant` report, labelled from that report and marked
+/// `auto`. A `worked` report names the lesson; `irrelevant` means no answer.
+pub fn draft_reviewed(replays: &[DraftReplay], reports: &[DraftReport], kb_revision: &str) -> Result<String> {
+    use sha2::Digest;
+    let mut events = Vec::new();
+    for r in replays {
+        let Some(id) = r.injected.as_deref() else { continue };
+        let Some(rep) = reports.iter().find(|p| {
+            p.id == id
+                && p.session.as_deref() == Some(r.session.as_str())
+                && matches!(p.event.as_str(), "worked" | "irrelevant")
+                && later(&p.time, r.time)
+        }) else {
+            continue;
+        };
+        let mut e = toml::map::Map::new();
+        e.insert("key".into(), toml::Value::String(format!("replay-{}", events.len() + 1)));
+        e.insert("path".into(), toml::Value::String("failure".into()));
+        e.insert("text".into(), toml::Value::String(r.query.clone()));
+        // The logged query starts with the program, so `--reviewed` rebuilds the same failure query.
+        let (command, error) = r.query.split_once(' ').unwrap_or((&r.query, ""));
+        e.insert("command".into(), toml::Value::String(command.to_string()));
+        e.insert("error".into(), toml::Value::String(error.to_string()));
+        if let Some(p) = &r.project {
+            e.insert("project".into(), toml::Value::String(p.clone()));
+        }
+        if let Some(s) = &r.system {
+            e.insert("system".into(), toml::Value::String(s.clone()));
+        }
+        if rep.event == "worked" {
+            e.insert("expect".into(), toml::Value::Array(vec![toml::Value::String(id.to_string())]));
+            e.insert("worked".into(), toml::Value::String(format!("{} in session {}", rep.event, r.session)));
+        } else {
+            e.insert("expect".into(), toml::Value::Array(vec![]));
+        }
+        e.insert("source".into(), toml::Value::String(format!("replay {}", r.session)));
+        e.insert("rationale".into(), toml::Value::String("auto".into()));
+        events.push(toml::Value::Table(e));
+    }
+    let mut doc = toml::map::Map::new();
+    doc.insert("version".into(), toml::Value::Integer(1));
+    doc.insert("kb_revision".into(), toml::Value::String(kb_revision.to_string()));
+    let input: String = replays.iter().map(|r| format!("{} {}\n", r.session, r.query)).collect();
+    let print: String = sha2::Sha256::digest(input.as_bytes()).iter().take(6).map(|b| format!("{b:02x}")).collect();
+    doc.insert("source_fingerprint".into(), toml::Value::String(print));
+    doc.insert("event".into(), toml::Value::Array(events));
+    toml::to_string(&toml::Value::Table(doc)).map_err(|e| Error::Refused(format!("cannot write a reviewed set: {e}")))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Query {
@@ -306,6 +382,34 @@ pub fn tally(rows: &[Row], min: f64, margin: f64) -> Option<[usize; 3]> {
 /// The grid of `--recall-sweep`: minimum relevance and margin.
 pub const SWEEP_MIN: [f64; 6] = [0.70, 0.75, 0.80, 0.85, 0.90, 0.95];
 pub const SWEEP_MARGIN: [f64; 4] = [0.0, 0.05, 0.10, 0.15];
+
+/// The sweep point with the most coverage at `precision`, if any. A row without that point in its
+/// curve does not decide there. Ties keep the lowest threshold, then the lowest margin.
+pub fn pick(rows: &[ReviewedObservation], precision: f64) -> Option<(f64, f64)> {
+    let mut best: Option<(f64, f64, f64)> = None;
+    for min in SWEEP_MIN {
+        for margin in SWEEP_MARGIN {
+            let decided: Vec<ReviewedObservation> = rows
+                .iter()
+                .map(|r| {
+                    let mut r = r.clone();
+                    r.decision = r
+                        .curve
+                        .iter()
+                        .find(|(a, b, _)| a.to_bits() == min.to_bits() && b.to_bits() == margin.to_bits())
+                        .map_or(ReviewedDecision::Unavailable, |(_, _, decision)| *decision);
+                    r
+                })
+                .collect();
+            let m = reviewed_metrics(&decided);
+            let (Some(p), Some(c)) = (m.precision.value, m.coverage.value) else { continue };
+            if p >= precision && best.is_none_or(|(_, _, b)| c > b) {
+                best = Some((min, margin, c));
+            }
+        }
+    }
+    best.map(|(min, margin, _)| (min, margin))
+}
 
 pub fn parse(text: &str) -> std::result::Result<Vec<Query>, String> {
     toml::from_str::<File>(text).map(|f| f.query).map_err(|e| e.message().to_string())
@@ -405,6 +509,42 @@ mod tests {
         let (recall, mrr) = score(&rows);
         assert!((recall - 2.0 / 3.0).abs() < 1e-9, "a query with no answer does not count");
         assert!((mrr - (1.0 + 1.0 / 3.0) / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pick_meets_the_precision() {
+        fn judged(top: &str, expect: &[&str], f: impl Fn(f64, f64) -> ReviewedDecision + Copy) -> ReviewedObservation {
+            ReviewedObservation {
+                path: EventPath::Failure,
+                expect: expect.iter().map(|s| s.to_string()).collect(),
+                top: vec![top.to_string()],
+                scores: vec![],
+                decision: ReviewedDecision::Silent,
+                backend: Some("jev".into()),
+                ranked_available: true,
+                curve: SWEEP_MIN
+                    .into_iter()
+                    .flat_map(|min| SWEEP_MARGIN.into_iter().map(move |margin| (min, margin, f(min, margin))))
+                    .collect(),
+            }
+        }
+        let rows = vec![
+            judged("a", &["a"], |min, _| if min <= 0.9 { ReviewedDecision::Injected } else { ReviewedDecision::Silent }),
+            judged("a", &["a"], |min, _| if min <= 0.8 { ReviewedDecision::Injected } else { ReviewedDecision::Silent }),
+            judged(
+                "a",
+                &["b"],
+                |min, margin| {
+                    if min <= 0.85 && margin <= 0.0 { ReviewedDecision::Injected } else { ReviewedDecision::Silent }
+                },
+            ),
+            judged("a", &["b"], |min, _| if min <= 0.75 { ReviewedDecision::Injected } else { ReviewedDecision::Silent }),
+        ];
+        assert_eq!(pick(&rows, 0.95), Some((0.8, 0.05)));
+        assert_eq!(pick(&rows, 0.5), Some((0.7, 0.0)), "lower precision keeps the widest net");
+        let wrong = vec![judged("a", &["b"], |_, _| ReviewedDecision::Injected)];
+        assert_eq!(pick(&wrong, 0.95), None, "a wrong injection never reaches the precision");
+        assert_eq!(pick(&[], 0.95), None);
     }
 
     #[test]

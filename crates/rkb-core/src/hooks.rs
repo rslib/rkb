@@ -350,20 +350,30 @@ pub struct Strength {
 
 impl Strength {
     /// From `[hooks]` in `kb.toml` for the backend that ranked; a missing key keeps that backend's default.
+    /// `[hooks.thresholds.<backend>] failure` wins over the flat keys.
     pub fn from_config(cfg: &toml::Table, backend: &str) -> Self {
-        let get = |k: &str, default: f64| cfg.get(k).and_then(toml::Value::as_float).unwrap_or(default);
+        let table = path_threshold(cfg, backend, "failure");
+        let flat = |k: &str| cfg.get(k).and_then(toml::Value::as_float);
         let (min, margin) = match backend {
             "jev" => (JEV_MIN_RELEVANCE, JEV_MIN_MARGIN),
             "bm25-bert" => (BERT_MIN_RELEVANCE, BERT_MIN_MARGIN),
             _ => (DEFAULT_MIN_RELEVANCE, DEFAULT_MIN_MARGIN),
         };
         Strength {
-            min_relevance: get("min_relevance", min),
-            min_margin: get("min_margin", margin),
-            min_coverage: get("min_coverage", DEFAULT_MIN_COVERAGE),
+            min_relevance: table.map(|t| t.0).or_else(|| flat("min_relevance")).unwrap_or(min),
+            min_margin: table.map(|t| t.1).or_else(|| flat("min_margin")).unwrap_or(margin),
+            min_coverage: flat("min_coverage").unwrap_or(DEFAULT_MIN_COVERAGE),
             literal_gate: cfg.get("literal_gate").and_then(toml::Value::as_bool).unwrap_or(backend == "bm25-bert"),
         }
     }
+}
+
+/// The `(min, margin)` of `[hooks.thresholds.<backend>] <path>`, when both are numbers.
+/// Integers count, so `margin = 0` works. A partial table counts as absent; `rkb lint` reports it.
+pub fn path_threshold(cfg: &toml::Table, backend: &str, path: &str) -> Option<(f64, f64)> {
+    let num = |v: &toml::Value| v.as_float().or_else(|| v.as_integer().map(|i| i as f64));
+    let table = cfg.get("thresholds")?.as_table()?.get(backend)?.as_table()?.get(path)?.as_table()?;
+    Some((num(table.get("min")?)?, num(table.get("margin")?)?))
 }
 
 /// The lesson the failed-command hook adds for these ranked hits, if any: the top hit, unless it does

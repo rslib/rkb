@@ -186,6 +186,12 @@ enum Cmd {
         /// With --replay: only failures from the last N days.
         #[arg(long, requires = "replay", default_value_t = 90)]
         days: u64,
+        /// Draft a reviewed eval set from the replay log and the use reports. The file must not exist.
+        #[arg(long, conflicts_with_all = ["queries", "self_check", "reviewed", "replay"])]
+        draft_reviewed: Option<String>,
+        /// With --reviewed: print the threshold and margin with the most coverage at this precision.
+        #[arg(long, requires = "reviewed")]
+        pick: Option<f64>,
     },
     /// Put the rkb skill, hooks and confirm gate into Claude Code, pi and omp.
     #[command(after_help = "Example:\n  rkb install\n  rkb install --list\n  rkb install claude --uninstall")]
@@ -749,12 +755,14 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             kb::open(&root)?;
             searching::find(&env, &words.join(" "), limit)
         }
-        Cmd::Eval { queries, reviewed, self_check, min_recall, rerank, recall_sweep, replay, days } => {
+        Cmd::Eval { queries, reviewed, self_check, min_recall, rerank, recall_sweep, replay, days, draft_reviewed, pick } => {
             kb::open(&root)?;
-            if replay {
+            if let Some(path) = draft_reviewed {
+                searching::draft_reviewed(&env, &path)
+            } else if replay {
                 searching::replay(&env, days, min_recall, rerank.as_deref())
             } else if let Some(path) = reviewed {
-                searching::reviewed(&env, &path, rerank.as_deref(), recall_sweep)
+                searching::reviewed(&env, &path, rerank.as_deref(), recall_sweep, pick)
             } else {
                 searching::eval(&env, queries, self_check, min_recall, rerank.as_deref().unwrap_or(rkb_core::rerank::BM25), recall_sweep)
             }
