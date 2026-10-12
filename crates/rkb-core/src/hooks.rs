@@ -142,12 +142,30 @@ pub fn key_lines(error: &str) -> Vec<&str> {
     key
 }
 
+static HEX_RUN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)[0-9a-f]{7,}").unwrap());
+static TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}|\d{2}:\d{2}").unwrap());
+
+fn drop_word(word: &str) -> bool {
+    if word.contains('/') {
+        return true;
+    }
+    if HEX_RUN.is_match(word) || TIMESTAMP.is_match(word) {
+        return true;
+    }
+    let t = word.trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ':' | ';' | ',' | '"' | '\'' | '.'));
+    !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+}
+
 /// A short search query from a failed command: its program and the key lines of the error text.
+/// Paths, standalone numbers, hex runs and timestamps go: they never name the problem.
 pub fn error_query(command: &str, error: &str) -> String {
     let mut out = program(command).unwrap_or_default();
     let mut count = tokens(&out).len();
     for l in key_lines(error) {
         for word in l.split_whitespace() {
+            if drop_word(word) {
+                continue;
+            }
             let n = tokens(word).len();
             if count + n > MAX_QUERY_TERMS {
                 return out;
@@ -731,6 +749,36 @@ mod tests {
         assert_eq!(q, "make line two line three line four");
         let long = format!("Exit code 1\nerror: {}", "word ".repeat(100));
         assert!(tokens(&error_query("x", &long)).len() <= MAX_QUERY_TERMS);
+    }
+
+    #[test]
+    fn error_query_drops_noise() {
+        let q = error_query(
+            "cmake -B build",
+            "CMake Error at /home/u/p/CMakeLists.txt:12 (find_package): Could NOT find HDF5 2026-10-11T10:00:00",
+        );
+        assert!(q.starts_with("cmake "), "{q}");
+        for w in ["Could", "NOT", "find", "HDF5"] {
+            assert!(q.split_whitespace().any(|t| t == w), "{q}");
+        }
+        assert!(!q.contains("/home/u/p/CMakeLists.txt"), "{q}");
+        assert!(!q.split_whitespace().any(|t| t.trim_matches(|c| c == '(' || c == ')' || c == ':' || c == ',') == "12"), "{q}");
+        assert!(!q.contains("2026-10-11T10:00:00") && !q.contains("2026"), "{q}");
+        let q = error_query("git push", "fatal: bad object 3f2a9c1d0e7b");
+        for w in ["fatal", "bad", "object"] {
+            assert!(q.split_whitespace().any(|t| t.trim_matches(':') == w), "{q}");
+        }
+        assert!(!q.contains("3f2a9c1d0e7b"), "{q}");
+        assert_eq!(error_query("sh", "/tmp/x/y.sh"), "sh");
+        let q = error_query("make", "error: need HDF5 x86_64 12");
+        assert!(q.contains("HDF5") && q.contains("x86_64"), "{q}");
+        assert!(!q.split_whitespace().any(|t| t == "12"), "{q}");
+        let big = format!("error: {}", "/tmp/x/y 3f2a9c1d0e7b 12345 ".repeat(4096));
+        assert!(big.len() >= 64 * 1024, "{}", big.len());
+        let start = std::time::Instant::now();
+        let q = error_query("make", &big);
+        assert!(start.elapsed().as_millis() <= 50, "too slow");
+        assert!(q.starts_with("make"), "{q}");
     }
 
     #[test]
