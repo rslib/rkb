@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -442,6 +442,130 @@ pub fn digest(root: &Path) -> Result<Vec<DigestLine>> {
     Ok(out)
 }
 
+/// Sessions a lesson's `worked` reports come from. A report with no session counts by its date.
+fn worked_sessions(records: &[usage::Record], id: &str) -> usize {
+    records
+        .iter()
+        .filter(|r| r.id == id && r.event == "worked")
+        .map(|r| r.session.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| r.time.get(..10).unwrap_or(&r.time).to_string()))
+        .collect::<BTreeSet<String>>()
+        .len()
+}
+
+/// Sessions a recipe needs before rkb drafts a skill from it.
+pub const SKILL_MIN_SESSIONS: usize = 3;
+
+/// A recipe that worked in enough sessions to become a skill.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkillCandidate {
+    pub id: String,
+    pub title: String,
+    pub sessions: usize,
+}
+
+/// A draft skill file, written outside the knowledge base for the user to review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillDraft {
+    pub id: String,
+    pub slug: String,
+    pub path: PathBuf,
+}
+
+/// The active recipe lessons whose `worked` reports come from 3 or more sessions, most sessions
+/// first and by id for a tie. Reads only.
+pub fn skill_candidates(root: &Path) -> Result<Vec<SkillCandidate>> {
+    let snap = Snapshot::from_dir(root)?;
+    let records = usage::records(root);
+    let (lessons, _) = snap.lessons();
+    let mut out: Vec<SkillCandidate> = lessons
+        .iter()
+        .filter(|l| l.frontmatter.kind == crate::lesson::LessonType::Recipe && l.frontmatter.status == Status::Active)
+        .filter_map(|l| {
+            let sessions = worked_sessions(&records, &l.frontmatter.id);
+            (sessions >= SKILL_MIN_SESSIONS).then(|| SkillCandidate {
+                id: l.frontmatter.id.clone(),
+                title: crate::body::scan(&l.body).h1.into_iter().next().map(|(_, t)| t).unwrap_or_default(),
+                sessions,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.sessions.cmp(&a.sessions).then(a.id.cmp(&b.id)));
+    Ok(out)
+}
+
+/// The folder drafts live in: this machine's state, never the knowledge base.
+pub fn skill_draft_dir(state: &Path) -> PathBuf {
+    state.join("skill-drafts")
+}
+
+/// Characters a skill description holds at most: Claude Code does not load a skill past this.
+const SKILL_DESCRIPTION_CHARS: usize = 1024;
+
+/// `Load before you ` and the `When to use` text, its first letter lowercased so the sentence reads
+/// on, cut at a whole word to fit `SKILL_DESCRIPTION_CHARS`.
+fn skill_description(when: &str) -> String {
+    let mut chars = when.chars();
+    let when: String = chars.next().map(|c| c.to_lowercase().chain(chars).collect()).unwrap_or_default();
+    let mut out = String::from("Load before you");
+    for word in when.split_whitespace() {
+        if out.chars().count() + 1 + word.chars().count() > SKILL_DESCRIPTION_CHARS {
+            break;
+        }
+        out.push(' ');
+        out.push_str(word);
+    }
+    out
+}
+
+/// Writes the draft skill of a listed recipe to `<state>/skill-drafts/<slug>/SKILL.md`, over an
+/// earlier draft of the same recipe, and returns where it went. The knowledge base is untouched:
+/// no commit and no use record.
+pub fn skill_draft(root: &Path, state: &Path, id: &str) -> Result<SkillDraft> {
+    let candidates = skill_candidates(root)?;
+    let (lesson, _) = crate::kb::find(root, id)?;
+    let Some(candidate) = candidates.iter().find(|c| c.id == id) else {
+        // A lesson that is not ready is a different problem from one that cannot become a skill.
+        let kind = format!("{:?}", lesson.frontmatter.kind).to_lowercase();
+        if lesson.frontmatter.kind != crate::lesson::LessonType::Recipe {
+            return Err(Error::NotReady {
+                reason: format!("lesson {id} is a {kind}, not a recipe"),
+                fix: "run `rkb skill-draft` to see the recipes with enough sessions".into(),
+            });
+        }
+        if lesson.frontmatter.status != Status::Active {
+            return Err(Error::NotReady {
+                reason: format!("lesson {id} is {}, and only an active recipe becomes a skill", lesson.frontmatter.status.as_str()),
+                fix: "run `rkb skill-draft` to see the recipes with enough sessions".into(),
+            });
+        }
+        let sessions = worked_sessions(&usage::records(root), id);
+        let plural = if sessions == 1 { "session" } else { "sessions" };
+        return Err(Error::NotReady {
+            reason: format!("lesson {id} has `worked` reports in {sessions} {plural}, fewer than {SKILL_MIN_SESSIONS}"),
+            fix: format!("report it in more sessions with `rkb used {id} --worked`, or run `rkb skill-draft` to see the candidates"),
+        });
+    };
+    let section = |heading: &str| {
+        crate::body::section_text(&lesson.body, heading).ok_or_else(|| Error::NotReady {
+            reason: format!("lesson {id} has no {heading} section"),
+            fix: format!("add a `## {heading}` section to the lesson, then run this again"),
+        })
+    };
+    let when: String = section("When to use")?.split_whitespace().collect::<Vec<_>>().join(" ");
+    let steps = section("Steps")?;
+    let slug = crate::write::slug(&candidate.title);
+    let mut front = serde_norway::Mapping::new();
+    front.insert(Value::String("name".into()), Value::String(slug.clone()));
+    front.insert(Value::String("description".into()), Value::String(skill_description(&when)));
+    let body = format!("{}\nSource: rkb show {id}\n", steps.trim_end());
+    let text = format!("---\n{}---\n{body}", crate::yaml::block(&Value::Mapping(front)));
+    let path = skill_draft_dir(state).join(&slug).join("SKILL.md");
+    let dir = path.parent().expect("a draft path has a folder").to_path_buf();
+    std::fs::create_dir_all(&dir).map_err(crate::error::io(&dir))?;
+    std::fs::write(&path, text).map_err(crate::error::io(&path))?;
+    Ok(SkillDraft { id: id.to_string(), slug, path })
+}
+
 /// One rkb commit in the knowledge base, for `rkb changes`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Change {
@@ -528,6 +652,13 @@ pub fn changes(root: &Path, since: &str) -> Result<Vec<Change>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn skill_description_reads_on_and_fits() {
+        assert_eq!(super::skill_description("When the build fails."), "Load before you when the build fails.");
+        let long = super::skill_description(&"word ".repeat(400));
+        assert!(long.chars().count() <= 1024 && long.ends_with("word"), "{long}");
+    }
+
     use super::*;
 
     #[test]

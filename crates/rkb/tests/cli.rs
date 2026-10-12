@@ -5727,3 +5727,114 @@ fn session_start_adds_the_digest_when_on() {
     assert!(on.contains(rule), "session start prints the real digest line: {on}");
     assert!(on.chars().count() <= before + 1200 + 200, "{} chars on, {} off", on.chars().count(), before);
 }
+
+#[test]
+fn skill_draft_lists_and_writes() {
+    let env = kb_with_topics();
+    let recipe = |title: &str, when: &str, step: &str| {
+        format!(
+            "---\ntype: recipe\nverified_how: ran\ntags:\n  - demo\n---\n\n# {title}\n\n## When to use\n{when}\n\n## Steps\n{step}\n\n## Evidence\nIt worked twice.\n"
+        )
+    };
+    let a = add_ok(
+        &env,
+        "cmake",
+        &recipe("Draft a skill from a repeated recipe", "A recipe repeats in three sessions.", "1. Run the tool.\n2. Check the output."),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b = add_ok(&env, "cmake", &recipe("A recipe with only two sessions", "It repeated only twice.", "1. Do the thing."))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A pitfall and a stale recipe never become skills, however often they worked.
+    let pitfall = add_ok(&env, "cmake", PITFALL)["id"].as_str().unwrap().to_string();
+    let stale = add_ok(&env, "cmake", &recipe("A recipe that stopped working", "It worked until now.", "1. Try it."))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(env.json(&["flag", &stale, "--reason", "the tool changed"], "").0["status"], "written");
+
+    // Real reports, each under its own session of the harness.
+    let worked_in = |session: &str, id: &str| {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.env("RKB_SESSION", session);
+        let o = rkb_with(c, &["used", id, "--worked", "--format", "json"], "");
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+        assert_eq!(v["status"].as_str(), Some("recorded"), "{v}");
+    };
+    for s in ["s1", "s2", "s3"] {
+        worked_in(s, &a);
+        worked_in(s, &pitfall);
+        worked_in(s, &stale);
+    }
+    for s in ["s1", "s2"] {
+        worked_in(s, &b);
+    }
+
+    // Scenario: one candidate. Only the recipe with three sessions is listed, with 3.
+    let (v, code) = env.json(&["skill-draft"], "");
+    assert_eq!(code, Some(0), "{v}");
+    let rows = v["candidates"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "one candidate: {v}");
+    assert_eq!((rows[0]["id"].as_str(), rows[0]["sessions"].as_u64()), (Some(a.as_str()), Some(3)), "{v}");
+    assert!(rows[0]["title"].as_str().unwrap().contains("repeated recipe"), "{v}");
+    let human = stdout(&env.rkb(&["skill-draft"]));
+    assert!(human.contains(&format!("{a}  3  ")), "{human}");
+    assert!(!human.contains(&b) && !human.contains(&pitfall) && !human.contains(&stale), "{human}");
+
+    // Scenario: not a candidate. Each refusal exits 1 with a fix and writes nothing.
+    let drafts = env.dir.path().join("state/rkb/skill-drafts");
+    let (v, code) = env.json(&["skill-draft", &b], "");
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v["error"]["code"].as_str().is_some_and(|c| !c.is_empty() && c != "usage"), "{v}");
+    assert!(v["error"]["fix"].as_str().is_some_and(|f| !f.trim().is_empty()), "{v}");
+    let (v, code) = env.json(&["skill-draft", &pitfall], "");
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("refused"), Some(1)), "not a recipe: {v}");
+    let (v, code) = env.json(&["skill-draft", &stale], "");
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("refused"), Some(1)), "not active: {v}");
+    let (v, code) = env.json(&["skill-draft", "0000000000"], "");
+    assert_eq!((v["error"]["code"].as_str(), code), (Some("not_found"), Some(1)), "{v}");
+    assert!(!drafts.exists(), "a refused draft writes nothing: {}", drafts.display());
+
+    let commits = commit_count(&env);
+    let status = stdout(&env.git(&["status", "--porcelain"]));
+
+    // Scenario: a draft. The file holds the description and the steps; the knowledge base does not move.
+    let (v, code) = env.json(&["skill-draft", &a], "");
+    assert_eq!(code, Some(0), "{v}");
+    let path = PathBuf::from(v["path"].as_str().unwrap());
+    assert!(path.starts_with(&drafts) && path.file_name().unwrap() == "SKILL.md", "{}", path.display());
+    let text = std::fs::read_to_string(&path).unwrap();
+    let (fm, body, _) = rkb_core::lesson::split(&text).unwrap();
+    let fm: serde_norway::Value = serde_norway::from_str(fm).unwrap();
+    assert_eq!(fm["name"].as_str(), path.parent().unwrap().file_name().unwrap().to_str(), "{text}");
+    let description = fm["description"].as_str().unwrap();
+    assert!(description.starts_with("Load before you "), "{text}");
+    assert_eq!(description, "Load before you a recipe repeats in three sessions.", "{text}");
+    assert!(!description.contains('\n'), "the description is one line: {text}");
+    assert!(body.trim_start().starts_with("1. Run the tool."), "{text}");
+    assert!(body.trim_end().ends_with(&format!("Source: rkb show {a}")), "{text}");
+    assert!(!body.contains("## When to use") && !body.contains("## Evidence"), "only the steps: {text}");
+
+    // Scenario: a second run writes the same file again.
+    let human = stdout(&env.rkb(&["skill-draft", &a]));
+    assert!(human.contains(v["path"].as_str().unwrap()), "{human}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "the same file, written again");
+    let folders: Vec<_> = std::fs::read_dir(&drafts).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(folders.len(), 1, "one draft folder, overwritten: {folders:?}");
+
+    assert_eq!(commit_count(&env), commits, "no commit");
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), status, "no file changed");
+
+    // A `worked` report with no session counts by its own date, so `b` reaches three sessions.
+    let (v, code) = env.json(&["used", &b, "--worked"], "");
+    assert_eq!((v["status"].as_str(), code), (Some("recorded"), Some(0)), "{v}");
+    let (v, _) = env.json(&["skill-draft"], "");
+    let mut ids: Vec<&str> = v["candidates"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    ids.sort_unstable();
+    let mut want = vec![a.as_str(), b.as_str()];
+    want.sort_unstable();
+    assert_eq!(ids, want, "the dated report counted as a session: {v}");
+}

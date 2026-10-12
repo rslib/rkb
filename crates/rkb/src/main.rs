@@ -257,6 +257,12 @@ enum Cmd {
     /// Print the standing preference lessons, one line each, ranked by `worked` reports. Changes nothing.
     #[command(after_help = "Example:\n  rkb digest")]
     Digest,
+    /// List the recipe lessons proven in 3 or more sessions, or write one as a draft skill file.
+    #[command(after_help = "Example:\n  rkb skill-draft\n  rkb skill-draft 7f3a9c2b41")]
+    SkillDraft {
+        /// The recipe to draft. Without it, list the candidates.
+        id: Option<String>,
+    },
     /// Replace a lesson with the file read from stdin, or edit it in $EDITOR.
     #[command(after_help = "Example:\n  rkb edit 7f3a9c2b41 --base 3f9a1c0d2e4b < lesson.md")]
     Edit {
@@ -839,6 +845,13 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             kb::open(&root)?;
             Ok(session::digest(&rkb_core::review::digest(&root)?))
         }
+        Cmd::SkillDraft { id } => {
+            kb::open(&root)?;
+            match id {
+                Some(id) => Ok(skill_draft_output(&rkb_core::review::skill_draft(&root, &env.state, &id)?)),
+                None => Ok(skill_draft_list(&rkb_core::review::skill_candidates(&root)?)),
+            }
+        }
         Cmd::Changes { since } => {
             kb::open(&root)?;
             Ok(session::changes(&rkb_core::review::changes(&root, &since)?, &since, colored))
@@ -1149,6 +1162,24 @@ fn sync_output(s: &rkb_core::sync::Synced, colored: bool) -> Output {
         "help": ["Run `rkb` to see where you are"],
     });
     Output { data, human, exit: 0, raw: false }
+}
+
+fn skill_draft_list(candidates: &[rkb_core::review::SkillCandidate]) -> Output {
+    let rows: Vec<Value> = candidates.iter().map(|c| json!({ "id": c.id, "title": c.title, "sessions": c.sessions })).collect();
+    let human = candidates.iter().map(|c| format!("{}  {}  {}", c.id, c.sessions, c.title)).collect::<Vec<_>>().join("\n");
+    let mut data = json!({ "candidates": rows });
+    let human = if candidates.is_empty() {
+        data["help"] = json!(["Run `rkb used <id> --worked` in more sessions, or `rkb list` to see the recipes"]);
+        "no recipe has `worked` reports in 3 or more sessions yet".to_string()
+    } else {
+        human
+    };
+    Output { data, human, exit: 0, raw: false }
+}
+
+fn skill_draft_output(draft: &rkb_core::review::SkillDraft) -> Output {
+    let path = draft.path.display().to_string();
+    Output { data: json!({ "path": path }), human: path, exit: 0, raw: false }
 }
 
 fn lint_output(findings: &[lint::Finding], full: bool, colored: bool) -> Output {
