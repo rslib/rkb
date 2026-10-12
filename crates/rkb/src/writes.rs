@@ -193,6 +193,7 @@ fn needs_user(env: &Env, req: &Request) -> Result<Output, CliError> {
     Ok(Output { data, human, exit: 3, raw: false })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn add(
     env: &Env,
     topic: Option<String>,
@@ -201,6 +202,8 @@ pub fn add(
     given: Option<String>,
     assets: Vec<String>,
     inbox: Option<String>,
+    session: Option<String>,
+    quote: Option<String>,
 ) -> Result<Output, CliError> {
     let kind: Option<LessonType> = kind.map(|k| LessonType::from_name(&k).expect("clap checks the type"));
     if template {
@@ -225,7 +228,7 @@ pub fn add(
     } else {
         read_stdin()?
     };
-    let o = write::apply(&env.ctx(), &Action::Add { text, topic, assets: absolute(assets), inbox }, &[])?;
+    let o = write::apply(&env.ctx(), &Action::Add { text, topic, assets: absolute(assets), inbox, session, quote }, &[])?;
     outcome(env, o)
 }
 

@@ -452,7 +452,9 @@ pub fn apply(ctx: &Ctx, action: &Action, approved: &[Decision]) -> Result<Outcom
     }
     let mut snap = Snapshot::from_dir(ctx.root)?;
     let prepared = match action {
-        Action::Add { text, topic, assets, inbox } => add(ctx, &kb, &snap, action, approved, text, topic, assets, inbox.as_deref())?,
+        Action::Add { text, topic, assets, inbox, session, quote } => {
+            add(ctx, &kb, &snap, action, approved, text, topic, assets, inbox.as_deref(), session.as_deref(), quote.as_deref())?
+        }
         Action::Edit { id, text, base, assets } => edit(&kb, &snap, action, approved, id, text, base, assets)?,
         Action::Flag { id, reason } => flag(&snap, id, reason)?,
         Action::Supersede { id, by, reason } => supersede(&snap, id, by, reason)?,
@@ -672,6 +674,8 @@ pub(crate) fn add(
     topic: &str,
     assets: &[String],
     inbox: Option<&str>,
+    session: Option<&str>,
+    quote: Option<&str>,
 ) -> Result<Step> {
     let images = read_assets(assets)?;
     let (fm_text, body_text, _) = lesson::split(text).map_err(|e| refused(e.message))?;
@@ -699,7 +703,7 @@ pub(crate) fn add(
     if !map.contains_key("verified") {
         map.insert("verified".into(), ctx.today.to_string().into());
     }
-    set_meta(&mut map, "source", origin(ctx.today, inbox));
+    set_meta(&mut map, "source", origin(ctx.today, inbox, session, quote));
     let fm: Frontmatter = serde_norway::from_value(Value::Mapping(map)).map_err(|e| refused(format!("frontmatter: {e}")))?;
 
     let scope = scope_of(&fm.when);
@@ -809,7 +813,7 @@ pub(crate) fn add(
 }
 
 /// Where a write comes from: the harness and the date, and the inbox item when given.
-fn origin(date: Date, inbox: Option<&str>) -> Mapping {
+fn origin(date: Date, inbox: Option<&str>, session: Option<&str>, quote: Option<&str>) -> Mapping {
     let mut m = Mapping::new();
     let harness = if std::env::var("CLAUDECODE").is_ok_and(|v| v == "1") {
         Some("claude-code".to_string())
@@ -820,8 +824,14 @@ fn origin(date: Date, inbox: Option<&str>) -> Mapping {
         m.insert("harness".into(), h.into());
     }
     m.insert("date".into(), date.to_string().into());
+    if let Some(s) = session {
+        m.insert("session".into(), s.into());
+    }
     if let Some(i) = inbox {
         m.insert("inbox".into(), i.into());
+    }
+    if let Some(q) = quote.filter(|q| !q.is_empty()) {
+        m.insert("quote".into(), q.into());
     }
     m
 }
@@ -1018,7 +1028,7 @@ fn edit(
     if out.as_bytes() == snap.files[&old.path].as_slice() && same_images {
         return Ok(Err(Outcome::Unchanged { id: id.to_string(), path: old.path.clone() }));
     }
-    new.frontmatter.meta.insert("edited_by".into(), Value::Mapping(origin(jiff::Zoned::now().date(), None)));
+    new.frontmatter.meta.insert("edited_by".into(), Value::Mapping(origin(jiff::Zoned::now().date(), None, None, None)));
     let out = lesson::write(&new.frontmatter, &new.body);
     if let Some(step) = check_labels(kb, snap, action, approved, &old.path, &o.labels, &new.frontmatter.labels)? {
         return Ok(Err(step));

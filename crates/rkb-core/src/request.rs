@@ -22,6 +22,12 @@ pub enum Action {
         /// The inbox item the lesson was distilled from, for its provenance.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         inbox: Option<String>,
+        /// The session the inbox item came from, for the lesson's provenance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+        /// The first quote the promotion checked, for the lesson's provenance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quote: Option<String>,
     },
     Edit {
         id: String,

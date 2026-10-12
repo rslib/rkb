@@ -3336,6 +3336,191 @@ fn review_lists_candidates_with_reasons() {
 }
 
 #[test]
+fn review_health_lists_three_kinds() {
+    let env = kb_with_topics();
+    let (v, code) = env.json(&["review", "--health"], "");
+    assert_eq!(code, Some(0));
+    assert!(v["candidates"].as_array().unwrap().is_empty(), "no lessons yet: {v}");
+    assert!(stdout(&env.rkb(&["review", "--health", "--format", "human"])).contains("Nothing to review"));
+
+    let lesson = |tag: &str, query: &str, title: &str, body: &str| {
+        format!("---\ntype: pitfall\nverified_how: ran\ntags:\n  - {tag}\nqueries:\n  - {query}\n---\n\n# {title}\n\n{body}")
+    };
+    let orphan = add_ok(
+        &env,
+        "cmake",
+        &lesson(
+            "harbor",
+            "harbor ferry horn codes",
+            "Harbor ferry horn codes",
+            "## Symptom\nThe ferry horn pattern confuses deckhands.\n\n## Cause\nNo posted code sheet at the harbor gate.\n\n## Fix\nPin the horn code sheet beside the roster.\n\n## Evidence\nDeckhands waved the correct pennants after pinning.\n",
+        ),
+    );
+    let unmatched = add_ok(
+        &env,
+        "cmake",
+        &lesson(
+            "quartz",
+            "quartz scheduler flags",
+            "Quartz scheduler flags",
+            "## Symptom\nJobs stall past midnight on quartz.\n\n## Cause\nThe scheduler drops flags after migration.\n\n## Fix\nReapply flags with the quartz console.\n\n## Evidence\nQueues drained before sunrise after reapplying.\n",
+        ),
+    );
+    let healthy = add_ok(
+        &env,
+        "cpp",
+        &lesson(
+            "ninja",
+            "ninja build speed",
+            "Ninja build speed",
+            "## Symptom\nLinking drags each afternoon.\n\n## Cause\nThe spool directory fills with stale objects.\n\n## Fix\nEmpty the spool directory before lunch.\n\n## Evidence\nAfternoon links finish promptly now.\n",
+        ),
+    );
+    let old = add_ok(
+        &env,
+        "cpp",
+        &lesson(
+            "beacon",
+            "harbor ferry horn codes",
+            "Beacon battery winter storage",
+            "## Symptom\nBeacons dim during January patrols.\n\n## Cause\nCold cells lose charge overnight.\n\n## Fix\nSwap cells at dusk from the warm locker.\n\n## Evidence\nPatrols stayed lit through February.\n",
+        ),
+    );
+    // A fact is never pushed on a failure, so an unmatched query does not list it.
+    let fact = add_ok(
+        &env,
+        "cpp",
+        "---\ntype: fact\nverified_how: ran\nqueries:\n  - lighthouse lens polish schedule\n---\n\n# Lens polish schedule\n\n## Statement\nThe lens is polished every spring.\n\n## Evidence\nThe keeper log says so.\n",
+    );
+    let fact_path = fact["path"].as_str().unwrap().to_string();
+    // Links keep every lesson but the orphan connected; backdating stands in for age.
+    let (healthy_path, old_path, unmatched_path) = (
+        healthy["path"].as_str().unwrap().to_string(),
+        old["path"].as_str().unwrap().to_string(),
+        unmatched["path"].as_str().unwrap().to_string(),
+    );
+    let healthy_file = healthy_path.rsplit('/').next().unwrap();
+    for (path, link) in [
+        (&unmatched_path, format!("../cpp/{healthy_file}")),
+        (&old_path, format!("./{healthy_file}")),
+        (&fact_path, format!("./{healthy_file}")),
+    ] {
+        let text = std::fs::read_to_string(env.kb().join(path)).unwrap();
+        env.write(path, &format!("{text}\nSee [build speed]({link}).\n"));
+    }
+    let old_text = std::fs::read_to_string(env.kb().join(&old_path)).unwrap();
+    let backdated =
+        old_text.lines().map(|l| if l.starts_with("verified:") { "verified: 2025-01-01" } else { l }).collect::<Vec<_>>().join("\n") + "\n";
+    env.write(&old_path, &backdated);
+    env.git(&["add", "-A"]);
+    assert!(env.git(&["commit", "-q", "-m", "add: health fixture"]).status.success());
+    // The replay log holds failures that answer every query but one.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    env.write_abs(
+        &env.dir.path().join("state/rkb/replays.jsonl"),
+        &format!(
+            "{{\"time\":{now},\"session\":\"s1\",\"query\":\"what are the harbor ferry horn codes\"}}\n{{\"time\":{now},\"session\":\"s2\",\"query\":\"ninja build speed on this host\"}}\n"
+        ),
+    );
+
+    let (v, code) = env.json(&["review", "--health"], "");
+    assert_eq!(code, Some(0), "{v}");
+    let by_id = |id: &str| v["candidates"].as_array().unwrap().iter().find(|c| c["id"] == id).cloned();
+    assert!(by_id(fact["id"].as_str().unwrap()).is_none(), "a fact is not judged by failure queries: {v}");
+    let kinds = |id: &str| -> Vec<String> {
+        by_id(id).unwrap_or_else(|| panic!("{id} missing: {v}"))["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["kind"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(kinds(orphan["id"].as_str().unwrap()), ["orphan"]);
+    assert_eq!(kinds(unmatched["id"].as_str().unwrap()), ["unmatched"]);
+    assert_eq!(kinds(old["id"].as_str().unwrap()), ["old_verified"]);
+    assert!(by_id(healthy["id"].as_str().unwrap()).is_none(), "a linked, matched and recent lesson is healthy: {v}");
+    let detail = |id: &str| by_id(id).unwrap()["reasons"].as_array().unwrap()[0]["detail"].as_str().unwrap().to_string();
+    assert!(detail(unmatched["id"].as_str().unwrap()).contains("90"), "{v}");
+    assert!(detail(old["id"].as_str().unwrap()).contains("2025-01-01"), "{v}");
+    let human = stdout(&env.rkb(&["review", "--health", "--format", "human"]));
+    assert!(human.contains("orphan") && human.contains("unmatched") && human.contains("old_verified"), "{human}");
+
+    let (v, _) = env.json(&["review", "--health", "general/cpp"], "");
+    assert_eq!(v["candidates"].as_array().unwrap().len(), 1, "only the old lesson is under general/cpp: {v}");
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "", "the report changes nothing");
+}
+
+#[test]
+fn show_why_prints_the_source() {
+    let env = Env::new();
+    env.init();
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[observer]\npi = \"session\"\n");
+    approve_as_claude(&env);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    std::fs::create_dir_all(env.dir.path().join("state/rkb/inbox")).unwrap();
+    std::fs::write(
+        env.dir.path().join("state/rkb/inbox/3f2a1b4c5d.md"),
+        format!(
+            "---\nkind: note\ntime: {now}\nsession: s1\nsignatures:\n  - abc123def4\n---\n\ncmake could not find HDF5 on this machine\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        env.dir.path().join("state/rkb/signatures.jsonl"),
+        format!(
+            "{{\"time\":{now},\"sig\":\"abc123def4\",\"session\":\"s1\"}}\n{{\"time\":{now},\"sig\":\"abc123def4\",\"session\":\"s2\"}}\n"
+        ),
+    )
+    .unwrap();
+    let fake = env.dir.path().join("fake/pi");
+    env.write_abs(
+        &fake,
+        r#"#!/bin/sh
+cat > /dev/null
+printf '%s' '{"action":"add","topic":"cmake","type":"pitfall","title":"Cmake needs the prefix","queries":["cmake could not find HDF5"],"sections":{"Symptom":"cmake could not find HDF5 on this machine","Cause":"The prefix was missing.","Fix":"Set the prefix.","Evidence":"Saw it."},"quotes":["cmake could not find HDF5"]}'"#,
+    );
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut c = with_pi(&env);
+    c.env("RKB_HARNESS", "pi");
+    let o = rkb_with(c, &["promote", "--harness", "pi", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(v["promoted"], 1, "{v}");
+    let (found, _) = env.json(&["search", "cmake could not find HDF5"], "");
+    let id = found["results"][0]["id"].as_str().unwrap().to_string();
+    let path = found["results"][0]["path"].as_str().unwrap().to_string();
+    // The file carries the chain, and show reads it back.
+    let file = std::fs::read_to_string(env.kb().join(&path)).unwrap();
+    assert!(file.contains("3f2a1b4c5d") && file.contains("quote:") && file.contains("cmake could not find HDF5"), "{file}");
+    let today = jiff::Zoned::now().date().to_string();
+    let (v, code) = env.json(&["show", &id, "--why"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(v["source"]["inbox"], "3f2a1b4c5d", "{v}");
+    assert_eq!(v["source"]["quote"], "cmake could not find HDF5", "{v}");
+    assert_eq!(v["source"]["session"], "s1", "{v}");
+    assert_eq!(v["source"]["harness"], "pi", "{v}");
+    assert_eq!(v["source"]["date"], today.as_str(), "{v}");
+    let human = stdout(&env.rkb(&["show", &id, "--why", "--format", "human"]));
+    assert!(human.contains("inbox: 3f2a1b4c5d") && human.contains("quote: cmake could not find HDF5"), "{human}");
+    assert!(human.contains("session: s1") && human.contains("harness: pi") && human.contains(&format!("date: {today}")), "{human}");
+    let plain = stdout(&env.rkb(&["show", &id, "--format", "human"]));
+    assert!(plain.contains(file.trim()), "plain show still prints the whole file");
+    let (v, _) = env.json(&["show", &id], "");
+    assert!(v.get("source").is_none(), "no chain without --why: {v}");
+
+    // A hand-written lesson has no item, session or quote.
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env_remove("RKB_HARNESS");
+    let o = rkb_with(c, &["add", "--topic", "cmake", "--format", "json"], &lesson_with("A hand-written lesson"));
+    assert!(o.status.success(), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    let hand = v["id"].as_str().unwrap().to_string();
+    let human = stdout(&env.rkb(&["show", &hand, "--why", "--format", "human"]));
+    assert!(human.contains("inbox: unknown") && human.contains("quote: unknown"), "{human}");
+    assert!(human.contains("session: unknown") && human.contains("harness: unknown"), "{human}");
+    assert!(human.contains(&format!("date: {today}")), "{human}");
+}
+
+#[test]
 fn move_and_rename_rewrite_links() {
     let env = kb_with_topics();
     let a = add_ok(&env, "cpp", &lesson_with("Alpha lesson about linking"));

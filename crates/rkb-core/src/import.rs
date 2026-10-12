@@ -85,7 +85,7 @@ pub fn plan(ctx: &Ctx, dir: &Path) -> Result<Plan> {
     let mut announced: BTreeSet<String> = BTreeSet::new();
     let mut items = vec![];
     for Source { source, topic, text } in files {
-        let action = Action::Add { text: text.clone(), topic: topic.clone(), assets: vec![], inbox: None };
+        let action = Action::Add { text: text.clone(), topic: topic.clone(), assets: vec![], inbox: None, session: None, quote: None };
         let mut item = ImportItem {
             source: source.clone(),
             topic: topic.clone(),
@@ -99,7 +99,7 @@ pub fn plan(ctx: &Ctx, dir: &Path) -> Result<Plan> {
         };
         // Each retry approves one more decision of two kinds, so the loop ends.
         let prepared = loop {
-            match write::add(ctx, &kb, &sim, &action, &item.approved, &text, &topic, &[], None) {
+            match write::add(ctx, &kb, &sim, &action, &item.approved, &text, &topic, &[], None, None, None) {
                 Err(Error::Refused(m)) => break Err(vec![m]),
                 Err(e) => return Err(e),
                 Ok(Ok(p)) => break Ok(p),
@@ -195,8 +195,9 @@ pub fn write(ctx: &Ctx, items: &[ImportItem], skip_duplicates: bool) -> Result<O
             continue;
         }
         let snap = Snapshot::from_dir(ctx.root)?;
-        let action = Action::Add { text: item.text.clone(), topic: item.topic.clone(), assets: vec![], inbox: None };
-        let reason = match write::add(ctx, &kb, &snap, &action, &item.approved, &item.text, &item.topic, &[], None) {
+        let action =
+            Action::Add { text: item.text.clone(), topic: item.topic.clone(), assets: vec![], inbox: None, session: None, quote: None };
+        let reason = match write::add(ctx, &kb, &snap, &action, &item.approved, &item.text, &item.topic, &[], None, None, None) {
             Ok(Ok(p)) => match write::finish(ctx, snap, p) {
                 Ok(Outcome::Written(w)) => {
                     out.added.push(w);

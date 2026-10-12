@@ -10,10 +10,13 @@ use crate::error::{Error, Result};
 use crate::git;
 use crate::kb::{FileKind, NoteRole, Snapshot, note_role};
 use crate::lesson::Status;
-use crate::{matching, usage};
+use crate::{graph, hooks, matching, usage};
 
 pub const DEFAULT_STALE_DAYS: i64 = 90;
 pub const UNUSED_DAYS: i64 = 180;
+/// Days of replay log a lesson query must match, and days after which a verification counts as old.
+pub const MATCH_DAYS: u64 = 90;
+pub const OLD_VERIFIED_DAYS: i64 = 365;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,6 +29,9 @@ pub enum ReasonKind {
     NeverHelped,
     Unused,
     OftenIrrelevant,
+    Orphan,
+    Unmatched,
+    OldVerified,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -327,6 +333,69 @@ pub fn review(root: &Path, state: &Path, folder: Option<&str>) -> Result<Vec<Can
             reasons,
             last_worked,
             last_failed,
+        });
+    }
+    Ok(out)
+}
+
+/// A query with case and whitespace folded, so a replay matches a lesson query either way it holds it.
+fn folded(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Current lessons under `folder` (or the whole base) in one of three states. A lesson is listed
+/// when it has no link, supersedes or similar lesson, when it is a pitfall whose queries match no
+/// logged failure query of the last 90 days, or when it was verified over 365 days ago. Reads only.
+pub fn health(root: &Path, state: &Path, folder: Option<&str>) -> Result<Vec<Candidate>> {
+    let folder = folder.map(|f| f.trim_end_matches('/'));
+    if let Some(f) = folder
+        && (f.is_empty() || !root.join(f).is_dir())
+    {
+        return Err(Error::NoFolder(f.to_string()));
+    }
+    let replays: Vec<String> = hooks::replays(state, MATCH_DAYS).into_iter().map(|r| folded(&r.query)).filter(|q| !q.is_empty()).collect();
+    let graph = graph::Graph::load(root)?;
+    let orphan: std::collections::HashSet<usize> = graph.orphans().into_iter().collect();
+    let counts = usage::counts(root);
+    let today = jiff::Zoned::now().date();
+    let old_cutoff = today.saturating_sub(jiff::Span::new().days(OLD_VERIFIED_DAYS));
+    let mut out = vec![];
+    for (i, l) in graph.lessons.iter().enumerate() {
+        if !l.frontmatter.status.is_current() {
+            continue;
+        }
+        if folder.is_some_and(|f| !l.path.starts_with(&format!("{f}/"))) {
+            continue;
+        }
+        let mut reasons = vec![];
+        if orphan.contains(&i) {
+            reasons.push(Reason { kind: ReasonKind::Orphan, detail: "no links or similar lessons".into() });
+        }
+        let queries: Vec<String> = l.frontmatter.queries.iter().map(|q| folded(q)).filter(|q| !q.is_empty()).collect();
+        // Only failures are logged and only pitfalls are pushed on one, so other types and a base
+        // with no log at all cannot be judged here.
+        if !replays.is_empty()
+            && l.frontmatter.kind == crate::lesson::LessonType::Pitfall
+            && !queries.is_empty()
+            && queries.iter().all(|q| !replays.iter().any(|r| r.contains(q.as_str()) || q.contains(r.as_str())))
+        {
+            reasons.push(Reason { kind: ReasonKind::Unmatched, detail: format!("queries matched no logged query in {MATCH_DAYS} days") });
+        }
+        if l.frontmatter.verified < old_cutoff {
+            reasons.push(Reason { kind: ReasonKind::OldVerified, detail: format!("verified {}", l.frontmatter.verified) });
+        }
+        if reasons.is_empty() {
+            continue;
+        }
+        let c = counts.get(&l.frontmatter.id).cloned().unwrap_or_default();
+        out.push(Candidate {
+            id: l.frontmatter.id.clone(),
+            title: crate::body::scan(&l.body).h1.into_iter().next().map(|(_, t)| t).unwrap_or_default(),
+            path: l.path.clone(),
+            status: l.frontmatter.status,
+            reasons,
+            last_worked: c.last_worked,
+            last_failed: c.last_failed,
         });
     }
     Ok(out)

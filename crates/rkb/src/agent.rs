@@ -62,7 +62,7 @@ fn run_tool(name: &str, args: &Value) -> Result<Output, CliError> {
             rerank: None,
             no_model: false,
         },
-        "rkb_show" => Cmd::Show { id: text(args, "id") },
+        "rkb_show" => Cmd::Show { id: text(args, "id"), why: false },
         "rkb_note" => Cmd::Note { words: vec![text(args, "text")], priority: args["priority"].as_u64().map(|p| p.clamp(1, 3) as u8) },
         "rkb_add" => {
             let (topic, lesson) = tools::lesson(args).map_err(|m| CliError::new(ErrorCode::Usage, m, fix(name)))?;

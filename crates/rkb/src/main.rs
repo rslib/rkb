@@ -80,6 +80,9 @@ enum Cmd {
     Show {
         /// The lesson id, the `id:` field of its frontmatter.
         id: String,
+        /// Also print where the lesson came from: harness, date, session, inbox item and quote.
+        #[arg(long)]
+        why: bool,
     },
     /// Find lessons that answer a question or an error, ranked, only those that can hold here.
     #[command(after_help = "Example:\n  rkb search \"cmake cannot find hdf5\"\n  rkb search --literal \"Could NOT find HDF5\"")]
@@ -276,13 +279,16 @@ enum Cmd {
     #[command(after_help = "Example:\n  rkb tier\n  rkb tier --toon")]
     Tier,
     /// List lessons that may no longer matter (retired place, unsupported versions, long stale, missing commit). Changes nothing.
-    #[command(after_help = "Example:\n  rkb review\n  rkb review systems/quartz")]
+    #[command(after_help = "Example:\n  rkb review\n  rkb review systems/quartz\n  rkb review --health")]
     Review {
         /// Only lessons under this folder.
         folder: Option<String>,
         /// Instead, summarize this machine's sessions: signals, injections and whether they helped.
         #[arg(long)]
         signals: bool,
+        /// Instead, list orphan lessons, lessons whose queries matched no logged query in 90 days, and lessons verified over 365 days ago.
+        #[arg(long, conflicts_with = "signals")]
+        health: bool,
     },
     /// List what rkb wrote to the knowledge base lately, with reasons: adds, edits, flags, merges, archives. Changes nothing.
     #[command(after_help = "Example:\n  rkb changes\n  rkb changes --since 2026-09-01")]
@@ -799,15 +805,21 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             let listing = rkb_core::list::list(&root, folder.as_deref())?;
             Ok(list::render(&listing, &root, colored))
         }
-        Cmd::Add { topic, kind, template, text, assets, from_inbox } => writes::add(&env, topic, kind, template, text, assets, from_inbox),
+        Cmd::Add { topic, kind, template, text, assets, from_inbox } => {
+            writes::add(&env, topic, kind, template, text, assets, from_inbox, None, None)
+        }
         Cmd::Edit { id, base, assets, text } => writes::edit(&env, id, base, assets, text),
         Cmd::Flag { id, reason } => writes::flag(&env, id, reason),
         Cmd::Tier => {
             kb::open(&root)?;
             tier::tier(&env)
         }
-        Cmd::Review { folder, signals } => {
+        Cmd::Review { folder, signals, health } => {
             kb::open(&root)?;
+            if health {
+                let c = rkb_core::review::health(&root, &env.state, folder.as_deref())?;
+                return Ok(session::review(&c, colored));
+            }
             if signals {
                 let s = rkb_core::review::signals(&root, &env.state);
                 let mut out = session::signals(&s, rkb_core::promote::cost(&env.state), colored);
@@ -953,7 +965,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             }
             Ok(out)
         }
-        Cmd::Show { id } => {
+        Cmd::Show { id, why } => {
             kb::open(&root)?;
             let (lesson, text) = kb::find(&root, &id)?;
             let fm = &lesson.frontmatter;
@@ -1010,7 +1022,11 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             if !related.is_empty() {
                 human.push_str(&format!("\n{}{related_text}", paint(colored, "1", "related")));
             }
-            let data = json!({
+            let source = fm.meta.get("source");
+            let part = |key: &str| {
+                source.and_then(|s| s.get(key)).and_then(|v| v.as_str()).filter(|v| !v.is_empty()).unwrap_or("unknown").to_string()
+            };
+            let mut data = json!({
                 "id": fm.id,
                 "path": lesson.path,
                 "title": title,
@@ -1032,6 +1048,19 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
                 "body": lesson.body,
                 "related": related,
             });
+            if why {
+                let chain = ["harness", "date", "session", "inbox", "quote"].map(|k| (k, part(k)));
+                let mut lines = String::from("source:");
+                for (k, v) in &chain {
+                    lines.push_str(&format!("\n  {k}: {v}"));
+                }
+                human.push_str(&format!("\n{lines}\n"));
+                data["source"] = chain
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), serde_json::Value::String(v)))
+                    .collect::<serde_json::Map<String, serde_json::Value>>()
+                    .into();
+            }
             Ok(Output { data, human, exit: 0, raw: false })
         }
     }

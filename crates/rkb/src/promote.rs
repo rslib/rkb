@@ -186,6 +186,8 @@ pub fn run(env: &Env, max: Option<usize>, harness: &str) -> Result<Output, CliEr
                         topic: answer.json["topic"].as_str().unwrap_or("general").to_string(),
                         assets: vec![],
                         inbox: Some(item.id.clone()),
+                        session: item.meta.session.clone(),
+                        quote: provenance_quote(&answer),
                     })
                 };
                 if let Some(action) = held {
@@ -223,6 +225,8 @@ pub fn run(env: &Env, max: Option<usize>, harness: &str) -> Result<Output, CliEr
                 Some(lesson_text(&answer)),
                 vec![],
                 Some(item.id.clone()),
+                item.meta.session.clone(),
+                provenance_quote(&answer),
             ),
             "update" => {
                 let id = answer.id().unwrap_or_default().to_string();
@@ -281,6 +285,12 @@ pub fn run(env: &Env, max: Option<usize>, harness: &str) -> Result<Output, CliEr
     })
 }
 
+/// The first checked quote, kept for `rkb show --why` only when it cannot carry a path, an email
+/// or a home folder and fits a short line. Otherwise the leak scan would refuse the whole lesson.
+fn provenance_quote(answer: &promote::Answer) -> Option<String> {
+    answer.quotes().into_iter().next().filter(|q| q.chars().count() <= 200 && !q.contains(['/', '@', '~']))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +298,14 @@ mod tests {
 
     fn answer(json: serde_json::Value) -> Answer {
         Answer { action: json["action"].as_str().unwrap_or_default().to_string(), json }
+    }
+
+    #[test]
+    fn a_quote_with_a_path_is_not_kept() {
+        let q = |quote: &str| provenance_quote(&answer(json!({ "action": "add", "quotes": [quote] })));
+        assert_eq!(q("could not find HDF5"), Some("could not find HDF5".into()));
+        assert_eq!(q("cannot open /home/u/x.h5"), None);
+        assert_eq!(q(&"x".repeat(201)), None);
     }
 
     #[test]
