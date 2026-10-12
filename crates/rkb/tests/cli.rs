@@ -6008,3 +6008,257 @@ fn skill_draft_lists_and_writes() {
     want.sort_unstable();
     assert_eq!(ids, want, "the dated report counted as a session: {v}");
 }
+
+#[test]
+fn agent_sink_hides_labels() {
+    let env = Env::new();
+    env.init();
+    let kb_toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write("kb.toml", &format!("{kb_toml}\n[sinks.agent]\nallow = {{ sensitivity = [\"public\", \"internal\"] }}\n"));
+
+    let lesson = |id: &str, title: &str, label: Option<&str>, tag: &str, statement: &str| {
+        let labels = label.map_or(String::new(), |l| format!("labels:\n  sensitivity: {l}\n"));
+        format!(
+            "---\nschema: 1\nid: {id}\ntype: fact\nstatus: active\nverified: 2026-09-25\nverified_how: ran\ntags:\n  - {tag}\n{labels}---\n\n# {title}\n\n## Statement\n{statement}\n\n## Evidence\nSeen in a test.\n"
+        )
+    };
+    let public = |n: u8| {
+        let (id, extra) = match n {
+            1 => ("b000000001".to_string(), " See also [the cipher](secret-own.md).".to_string()),
+            n => (format!("b00000000{n}"), String::new()),
+        };
+        lesson(
+            &id,
+            &format!("Squirrel cache note {n}"),
+            Some("public"),
+            if n == 1 { "acorn" } else { "plain" },
+            &format!("The squirrel cache tunnels flood every spring, note {n}.{extra}"),
+        )
+    };
+    for n in 1..=5 {
+        env.write(&format!("general/nuts/note-{n}.md"), &public(n));
+    }
+    env.write(
+        "general/nuts/secret-own.md",
+        &lesson(
+            "b000000006",
+            "Squirrel cache cipher",
+            Some("confidential"),
+            "acorn",
+            "The squirrel cache cipher hides the winter tunnels.",
+        ),
+    );
+    env.write("general/vault/README.md", "---\nlabels:\n  sensitivity: confidential\n---\n\n# Vault\n");
+    env.write(
+        "general/vault/buried.md",
+        &lesson("b000000007", "Buried squirrel cache map", None, "buried", "The buried squirrel cache map marks the north tunnels."),
+    );
+    env.write(
+        "general/nuts/ledger.md",
+        &lesson("b000000008", "Squirrel cache ledger", Some("internal"), "ledger", "The squirrel cache ledger counts every tunnel."),
+    );
+    assert!(env.git(&["add", "-A"]).status.success());
+    let o = env.git(&["commit", "-q", "-m", "sink fixture"]);
+    assert!(o.status.success(), "{}{}", stdout(&o), String::from_utf8_lossy(&o.stderr));
+
+    let tool_json = |name: &str, args: &serde_json::Value| {
+        let o = env.rkb_in(&["tool", name, "--format", "json"], &args.to_string());
+        (serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap(), o.status.code())
+    };
+    let ids =
+        |v: &serde_json::Value| v["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+
+    // The user CLI stays unfiltered: every matching lesson comes back.
+    let (v, _) = env.json(&["search", "squirrel cache"], "");
+    let mine = ids(&v);
+    for id in ["b000000006", "b000000007", "b000000008"] {
+        assert!(mine.contains(&id.to_string()), "the user still sees {id}: {mine:?}");
+    }
+
+    // The agent search hides the confidential lessons, with no id, title or count of them.
+    let (v, code) = tool_json("rkb_search", &serde_json::json!({ "query": "squirrel cache" }));
+    assert_eq!(code, Some(0), "{v}");
+    let mine = ids(&v);
+    assert_eq!(mine.len(), 6, "five public plus one internal: {mine:?}");
+    let text = serde_json::to_string(&v).unwrap();
+    for hidden in ["b000000006", "b000000007", "Squirrel cache cipher", "Buried squirrel cache map"] {
+        assert!(!mine.contains(&hidden.to_string()) && !text.contains(hidden), "no trace of {hidden}: {text}");
+    }
+    assert!(v.get("hidden").is_none() && v.get("hidden_by").is_none(), "no count that could include hidden lessons: {v}");
+
+    // The filter runs before the limit: a limit of 5 still returns 5 allowed lessons.
+    let (v, code) = tool_json("rkb_search", &serde_json::json!({ "query": "squirrel cache", "limit": 5 }));
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(ids(&v).len(), 5, "{v}");
+
+    // An agent show of a hidden lesson is refused with the exact error text.
+    let (v, code) = tool_json("rkb_show", &serde_json::json!({ "id": "b000000006" }));
+    assert_eq!(code, Some(1), "{v}");
+    assert_eq!(v["error"]["message"].as_str().unwrap(), "lesson b000000006 is not available to agents on this machine", "{v}");
+    assert!(!v["error"]["fix"].as_str().unwrap().is_empty(), "{v}");
+    assert!(!serde_json::to_string(&v).unwrap().contains("winter tunnels"), "no lesson text leaks: {v}");
+
+    // A missing lesson reads exactly the same through the agent.
+    let (v, code) = tool_json("rkb_show", &serde_json::json!({ "id": "0000000000" }));
+    assert_eq!(code, Some(1), "{v}");
+    assert_eq!(v["error"]["message"].as_str().unwrap(), "lesson 0000000000 is not available to agents on this machine", "{v}");
+
+    // An allowed show comes back without the hidden related lesson; the user show keeps it.
+    let (v, code) = tool_json("rkb_show", &serde_json::json!({ "id": "b000000001" }));
+    assert_eq!(code, Some(0), "{v}");
+    let related: Vec<String> = v["related"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string()).collect();
+    assert!(!related.contains(&"b000000006".to_string()), "hidden related dropped: {related:?}");
+    assert!(!serde_json::to_string(&v).unwrap().contains("Squirrel cache cipher"), "no hidden title: {v}");
+    let (v, _) = env.json(&["show", "b000000001"], "");
+    assert!(v["related"].as_array().unwrap().iter().any(|r| r["id"] == "b000000006"), "the user still sees it: {v}");
+
+    // The machine config wins whole over kb.toml: public-only there hides the internal lesson.
+    let kb_toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write(
+        "kb.toml",
+        &kb_toml.replace(
+            "allow = { sensitivity = [\"public\", \"internal\"] }",
+            "allow = { sensitivity = [\"public\", \"internal\", \"confidential\"] }",
+        ),
+    );
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[sinks.agent]\nallow = { sensitivity = [\"public\"] }\n");
+    let (v, code) = tool_json("rkb_search", &serde_json::json!({ "query": "squirrel cache" }));
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(ids(&v).len(), 5, "only the public lessons: {v:?}");
+
+    // A machine config that does not parse fails closed with an error and a fix, never lessons.
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[sinks.agent\n");
+    let (v, code) = tool_json("rkb_search", &serde_json::json!({ "query": "squirrel cache" }));
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("config.toml"), "{v}");
+    assert!(!v["error"]["fix"].as_str().unwrap().is_empty(), "{v}");
+    assert!(v.get("results").is_none(), "no lessons on failure: {v}");
+
+    // An agent sink with bad fields fails the same way.
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[sinks.agent]\nbogus = 1\n");
+    let (v, code) = tool_json("rkb_search", &serde_json::json!({ "query": "squirrel cache" }));
+    assert_eq!(code, Some(1), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("[sinks.agent]"), "{v}");
+    assert!(!v["error"]["fix"].as_str().unwrap().is_empty(), "{v}");
+}
+
+#[test]
+fn agent_sink_blocks_injection() {
+    let env = Env::new();
+    env.init();
+    let pitfall = |id: &str, title: &str, label: &str, symptom: &str, cause: &str, fix: &str, evidence: &str| {
+        format!(
+            "---\nschema: 1\nid: {id}\ntype: pitfall\nstatus: active\nverified: 2026-09-25\nverified_how: ran\ntags:\n  - link\nlabels:\n  sensitivity: {label}\n---\n\n# {title}\n\n## Symptom\n{symptom}\n\n## Cause\n{cause}\n\n## Fix\n{fix}\n\n## Evidence\n{evidence}\n"
+        )
+    };
+    env.write(
+        "general/link/strong.md",
+        &pitfall(
+            "c000000001",
+            "Linker vtable failure",
+            "confidential",
+            "The link fails with `undefined reference to vtable for Widget` in main.cpp text.",
+            "vtable widget undefined reference vtable widget undefined reference.",
+            "Define the first virtual function: vtable widget undefined reference.",
+            "Seen with g++ and ld; `tunnel cipher mismatch at dawn cache`; `no usable tunnel remains`.",
+        ),
+    );
+    env.write(
+        "general/link/plain.md",
+        &pitfall(
+            "c000000002",
+            "Linker vtable miss",
+            "public",
+            "The link fails with `undefined reference to vtable for Widget` in main.cpp text.",
+            "A missing virtual definition confuses the morning build. The morning notebook sits by the river.",
+            "Define the missing virtual function for Widget. A pencil rests on the chair.",
+            "Seen with g++ and ld. The garden letter waits by the window.",
+        ),
+    );
+    assert!(env.git(&["add", "-A"]).status.success());
+    assert!(env.git(&["commit", "-q", "-m", "sink fixture"]).status.success());
+    let cwd = env.kb();
+
+    let vtable = "Exit code 1\n/usr/bin/ld: main.o: in function `main':\nmain.cpp:(.text+0x1f): undefined reference to `vtable for Widget'\ncollect2: error: ld returned 1 exit status\n";
+    let mut failed = bash("s-control", &cwd, "g++ main.o -o app");
+    failed["error"] = vtable.into();
+    let out = hook(&env, "tool-failed", &failed);
+    assert!(out.contains("c000000001"), "without a sink the confidential lesson pushes: {out}");
+
+    let kb_toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write("kb.toml", &format!("{kb_toml}\n[sinks.agent]\nallow = {{ sensitivity = [\"public\", \"internal\"] }}\n"));
+    let replays = || -> Vec<serde_json::Value> {
+        std::fs::read_to_string(env.dir.path().join("state/rkb/replays.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    };
+
+    // The hidden lesson never takes the slot: the allowed runner-up is injected instead.
+    let mut failed = bash("s2", &cwd, "g++ main.o -o app");
+    failed["error"] = vtable.into();
+    let out = hook(&env, "tool-failed", &failed);
+    assert!(out.contains("c000000002"), "the allowed lesson takes the freed slot: {out}");
+    assert!(!out.contains("c000000001"), "no trace of the hidden lesson: {out}");
+    assert_eq!(replays().last().unwrap()["injected"], "c000000002", "the replay log names the injected lesson");
+
+    // A failure only the hidden lesson covers injects nothing and logs no id.
+    let cipher = "squirrel-cipher: fatal: tunnel cipher mismatch at dawn cache\nsquirrel-cipher: failed: no usable tunnel remains\n";
+    let mut failed = bash("s3", &cwd, "squirrel-cipher --rotate");
+    failed["error"] = cipher.into();
+    assert_eq!(hook(&env, "tool-failed", &failed), "", "nothing is injected");
+    let log = replays();
+    assert!(log.last().unwrap()["injected"].is_null(), "the replay log records no id: {:?}", log.last().unwrap());
+    let session = std::fs::read_to_string(env.dir.path().join("state/rkb/sessions/s3.jsonl")).unwrap();
+    assert!(!session.contains("injected"), "no injection recorded: {session}");
+    // The preference digest at session start leaves out a hidden preference.
+    let preference = |id: &str, label: &str, rule: &str| {
+        format!(
+            "---\nschema: 1\nid: {id}\ntype: preference\nstatus: active\nverified: 2026-09-25\nverified_how: told\nlabels:\n  sensitivity: {label}\ntags:\n  - style\n---\n\n# {rule}\n\n## Rule\n{rule}\n\n## Why\nThe user said so.\n\n## How to apply\nFollow it.\n"
+        )
+    };
+    env.write("general/link/open-rule.md", &preference("c000000003", "public", "Use short commit subjects."));
+    env.write("general/link/secret-rule.md", &preference("c000000004", "confidential", "Name the cipher project only in person."));
+    let kb_toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write("kb.toml", &format!("{kb_toml}\n[hooks]\ndigest = true\n"));
+    assert!(env.git(&["add", "-A"]).status.success());
+    let o = env.git(&["commit", "-q", "-m", "preferences"]);
+    assert!(o.status.success(), "{}{}", stdout(&o), String::from_utf8_lossy(&o.stderr));
+    let start = hook(&env, "session-start", &serde_json::json!({ "session_id": "s4", "cwd": cwd, "source": "startup" }));
+    assert!(start.contains("Use short commit subjects."), "the allowed preference is in the digest: {start}");
+    assert!(!start.contains("cipher project"), "the hidden preference stays out: {start}");
+    assert!(stdout(&env.rkb(&["digest"])).contains("cipher project"), "the user digest keeps it");
+}
+
+#[test]
+fn doctor_shows_agent_sink() {
+    let env = Env::new();
+    env.init();
+    let line = || {
+        let (v, _) = env.json(&["doctor"], "");
+        v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "agent sink").cloned().unwrap()
+    };
+    let l = line();
+    assert_eq!(l["status"], "ok", "{l}");
+    assert!(l["detail"].as_str().unwrap().contains("every lesson passes"), "{l}");
+
+    let kb_toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write("kb.toml", &format!("{kb_toml}\n[sinks.agent]\nallow = {{ sensitivity = [\"public\", \"internal\"] }}\n"));
+    let l = line();
+    assert_eq!(l["status"], "ok", "{l}");
+    let detail = l["detail"].as_str().unwrap();
+    assert!(detail.contains("kb.toml") && detail.contains("internal"), "{l}");
+
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[sinks.agent]\nallow = { sensitivity = [\"public\"] }\n");
+    let l = line();
+    assert_eq!(l["status"], "ok", "{l}");
+    let detail = l["detail"].as_str().unwrap();
+    assert!(detail.contains("config.toml") && detail.contains("public") && !detail.contains("internal"), "{l}");
+
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[sinks.agent\n");
+    let l = line();
+    assert_eq!(l["status"], "fail", "{l}");
+    assert!(l["detail"].as_str().unwrap().contains("config.toml"), "{l}");
+    assert!(!l["fix"].as_str().unwrap().is_empty(), "{l}");
+}

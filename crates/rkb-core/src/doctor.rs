@@ -97,6 +97,7 @@ pub fn run(root: &Path, place: &Place, state_dir: &Path, config_dir: &Path, env:
         }
     }
     out.push(trust_check(config_dir));
+    out.push(agent_sink_check(root, config_dir));
     out.push(observer_check(config_dir, state_dir));
     out.extend(triage_check(state_dir));
     out.extend(recall_check(root, state_dir));
@@ -460,6 +461,33 @@ pub fn triage_check(state_dir: &Path) -> Option<Check> {
         return Some(check("triage", Level::Warn, format!("{detail}; under half of the kept became lessons"), Some(fix.into())));
     }
     Some(check("triage", Level::Ok, detail, None))
+}
+
+/// The agent sink in force: what agents may read and where the rule came from. A machine config
+/// that fails closed is a failing check with a fix, so a blind server does not go unnoticed.
+pub fn agent_sink_check(root: &Path, config_dir: &Path) -> Check {
+    let fix = || {
+        Some(
+            "fix [sinks.agent] in the machine config.toml (it must be a table with an allow map of known label keys), or remove that table"
+                .to_string(),
+        )
+    };
+    match config::agent_sink(root, config_dir) {
+        Err(e) => check("agent sink", Level::Fail, e, fix()),
+        Ok((None, _)) => check("agent sink", Level::Ok, "no agent sink is set; every lesson passes to agents", None),
+        Ok((Some(sink), source)) => {
+            let allow = if sink.allow.is_empty() {
+                "nothing (the allow list is empty)".to_string()
+            } else {
+                sink.allow.iter().map(|(k, v)| format!("{k}: {}", v.join(", "))).collect::<Vec<_>>().join("; ")
+            };
+            let from = match source {
+                Some(config::AgentSinkSource::Machine) => "the machine config.toml",
+                _ => "kb.toml",
+            };
+            check("agent sink", Level::Ok, format!("agents may read {allow} (from {from})"), None)
+        }
+    }
 }
 
 pub fn observer_check(config_dir: &Path, _state_dir: &Path) -> Check {

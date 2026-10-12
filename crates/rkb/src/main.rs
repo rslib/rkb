@@ -853,7 +853,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         }
         Cmd::Digest => {
             kb::open(&root)?;
-            Ok(session::digest(&rkb_core::review::digest(&root)?))
+            Ok(session::digest(&rkb_core::review::digest(&root, &|_| true)?))
         }
         Cmd::SkillDraft { id } => {
             kb::open(&root)?;

@@ -41,6 +41,83 @@ fn fix(name: &str) -> String {
     format!("run `rkb tools --toon` to see the arguments of {name}")
 }
 
+fn agent_sink_fix() -> String {
+    "fix [sinks.agent] in the machine config.toml (it must be a table with an allow map of known label keys), or remove that table"
+        .to_string()
+}
+
+/// The `[sinks.agent]` in force, or an error with a fix when the machine config fails closed.
+fn resolve_sink() -> Result<Option<rkb_core::config::Sink>, CliError> {
+    let (sink, _) = rkb_core::config::agent_sink(&rkb_core::kb::home(), &rkb_core::paths::config_dir())
+        .map_err(|m| CliError::new(ErrorCode::Refused, m, agent_sink_fix()))?;
+    Ok(sink)
+}
+
+fn snapshot(root: &std::path::Path) -> Result<rkb_core::kb::Snapshot, CliError> {
+    rkb_core::kb::Snapshot::from_dir(root)
+        .map_err(|e| CliError::new(ErrorCode::Refused, format!("the labels could not be read: {e}"), agent_sink_fix()))
+}
+
+fn allows(sink: &rkb_core::config::Sink, snap: &rkb_core::kb::Snapshot, path: &str) -> bool {
+    rkb_core::config::sink_allows(&sink.allow, &rkb_core::write::effective_at(snap, path))
+}
+
+/// Agent search with the sink applied before the limit, so a limit of 5 still returns up to 5
+/// allowed lessons. One search asks for the limit plus every lesson the sink hides, which is
+/// enough to fill it, so the reranker runs once. Hidden lessons leave no id, title or count behind.
+fn agent_search(sink: &rkb_core::config::Sink, args: &Value, limit: usize) -> Result<Output, CliError> {
+    use rkb_core::matching::Hints;
+    let root = rkb_core::kb::home();
+    let snap = snapshot(&root)?;
+    let hidden = snap.lessons().0.iter().filter(|l| !allows(sink, &snap, &l.path)).count();
+    let cmd = Cmd::Search {
+        query: Some(text(args, "query")),
+        literal: None,
+        regex: None,
+        all: args["all"].as_bool().unwrap_or(false),
+        status: None,
+        tier: args["tier"].as_str().map(String::from),
+        limit: limit + hidden,
+        rerank: None,
+        no_model: false,
+    };
+    let mut out = run(Some(cmd), Format::Toon, &Hints::default(), &[])?;
+    let rows = out.data["results"].as_array().cloned().unwrap_or_default();
+    let kept: Vec<Value> = rows.into_iter().filter(|r| r["path"].as_str().is_some_and(|p| allows(sink, &snap, p))).take(limit).collect();
+    out.data["results"] = Value::Array(kept);
+    // The count of lessons that do not apply here would count hidden ones too.
+    if let Some(o) = out.data.as_object_mut() {
+        o.remove("hidden");
+        o.remove("hidden_by");
+    }
+    Ok(out)
+}
+
+/// Agent show with the sink applied: a hidden lesson reads exactly like a missing one, and an
+/// allowed lesson comes back without the related lessons the sink hides.
+fn agent_show(sink: &rkb_core::config::Sink, id: &str) -> Result<Output, CliError> {
+    use rkb_core::matching::Hints;
+    let refused = || {
+        CliError::new(
+            ErrorCode::Refused,
+            format!("lesson {id} is not available to agents on this machine"),
+            "search for another lesson; only the user can read this one",
+        )
+    };
+    let root = rkb_core::kb::home();
+    let snap = snapshot(&root)?;
+    let (lesson, _) = rkb_core::kb::find(&root, id).map_err(|_| refused())?;
+    if !allows(sink, &snap, &lesson.path) {
+        return Err(refused());
+    }
+    let mut out = run(Some(Cmd::Show { id: id.to_string(), why: false }), Format::Toon, &Hints::default(), &[])?;
+    if let Some(related) = out.data.get("related").and_then(|r| r.as_array()).cloned() {
+        let kept: Vec<Value> = related.into_iter().filter(|r| r["path"].as_str().is_some_and(|p| allows(sink, &snap, p))).collect();
+        out.data["related"] = Value::Array(kept);
+    }
+    Ok(out)
+}
+
 fn strings(args: &Value, key: &str) -> Vec<String> {
     args[key].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect()
 }
@@ -51,18 +128,30 @@ fn text(args: &Value, key: &str) -> String {
 
 fn run_tool(name: &str, args: &Value) -> Result<Output, CliError> {
     let cmd = match name {
-        "rkb_search" => Cmd::Search {
-            query: Some(text(args, "query")),
-            literal: None,
-            regex: None,
-            all: args["all"].as_bool().unwrap_or(false),
-            status: None,
-            tier: args["tier"].as_str().map(String::from),
-            limit: args["limit"].as_u64().map_or(10, |n| n as usize),
-            rerank: None,
-            no_model: false,
-        },
-        "rkb_show" => Cmd::Show { id: text(args, "id"), why: false },
+        "rkb_search" => {
+            let limit = args["limit"].as_u64().map_or(10, |n| n as usize);
+            if let Some(sink) = resolve_sink()? {
+                return agent_search(&sink, args, limit);
+            }
+            Cmd::Search {
+                query: Some(text(args, "query")),
+                literal: None,
+                regex: None,
+                all: args["all"].as_bool().unwrap_or(false),
+                status: None,
+                tier: args["tier"].as_str().map(String::from),
+                limit,
+                rerank: None,
+                no_model: false,
+            }
+        }
+        "rkb_show" => {
+            let id = text(args, "id");
+            if let Some(sink) = resolve_sink()? {
+                return agent_show(&sink, &id);
+            }
+            Cmd::Show { id, why: false }
+        }
         "rkb_note" => Cmd::Note { words: vec![text(args, "text")], priority: args["priority"].as_u64().map(|p| p.clamp(1, 3) as u8) },
         "rkb_add" => {
             let (topic, lesson) = tools::lesson(args).map_err(|m| CliError::new(ErrorCode::Usage, m, fix(name)))?;

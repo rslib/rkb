@@ -118,8 +118,10 @@ fn session_start(p: &Value, state: &Path) -> Result<Option<String>> {
     let place = state::locate(&root, &cwd(p), &Hints::default(), state)?;
     let s = state::build(&root, place, state)?;
     let mut text = crate::session::context(&s).human;
+    // A sink that fails closed leaves the digest out; the context lines still go out.
     if hooks_config(&root).get("digest").and_then(toml::Value::as_bool) == Some(true)
-        && let Ok(lines) = rkb_core::review::digest(&root)
+        && let Ok(keep) = agent_keep(&root)
+        && let Ok(lines) = rkb_core::review::digest(&root, &keep)
         && !lines.is_empty()
     {
         // A digest that fails to read never fails session start: the context lines still go out.
@@ -332,10 +334,31 @@ fn ranked_search(
     if let Some(scores) = &ranked.scores {
         search::apply_relevance(&mut found.hits, scores, ranked.order.as_deref());
     }
-    if settings.chain.iter().any(|b| b != rerank::BM25) && !found.hits.is_empty() {
-        hooks::log_ranking(state, hook, &ranked, &found.hits, start.elapsed().as_millis() as u64);
+    let hits = sink_filter(root, std::mem::take(&mut found.hits))?;
+    if settings.chain.iter().any(|b| b != rerank::BM25) && !hits.is_empty() {
+        hooks::log_ranking(state, hook, &ranked, &hits, start.elapsed().as_millis() as u64);
     }
-    Ok((found.hits, ranked, place))
+    Ok((hits, ranked, place))
+}
+
+/// Drops the lessons the agent sink hides before any injection choice, cap or log sees them, so a
+/// hidden lesson never takes a slot and the replay log never records its id. A machine config that
+/// fails closed injects nothing: the error travels up to the hook error log.
+fn sink_filter(root: &Path, hits: Vec<search::Hit>) -> Result<Vec<search::Hit>> {
+    let keep = agent_keep(root)?;
+    Ok(hits.into_iter().filter(|h| keep(&h.path)).collect())
+}
+
+/// Whether the agent sink lets the lesson at a path through.
+type Keep = Box<dyn Fn(&str) -> bool>;
+
+/// The agent sink as a path check; everything passes with no sink.
+fn agent_keep(root: &Path) -> Result<Keep> {
+    let (sink, _) = config::agent_sink(root, &paths::config_dir())
+        .map_err(|m| format!("agent sink: {m}; fix [sinks.agent] in the machine config.toml"))?;
+    let Some(sink) = sink else { return Ok(Box::new(|_| true)) };
+    let snap = kb::Snapshot::from_dir(root).map_err(|e| format!("agent sink: the labels could not be read: {e}"))?;
+    Ok(Box::new(move |path| config::sink_allows(&sink.allow, &rkb_core::write::effective_at(&snap, path))))
 }
 
 fn prompt(p: &Value, state: &Path, session: &str) -> Result<Option<String>> {

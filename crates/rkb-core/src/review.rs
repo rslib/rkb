@@ -415,14 +415,16 @@ pub struct DigestLine {
 
 /// The standing preference lessons, one line each: the `Rule` section as one line, ordered by
 /// `worked` reports. Only active lessons: stale ones were flagged as wrong, and other lesson types
-/// and tombstones are never preferences the user stands by. Reads only.
-pub fn digest(root: &Path) -> Result<Vec<DigestLine>> {
+/// and tombstones are never preferences the user stands by. `keep` drops a lesson by its path
+/// before the budget, so a dropped one never takes room. Reads only.
+pub fn digest(root: &Path, keep: &dyn Fn(&str) -> bool) -> Result<Vec<DigestLine>> {
     let snap = Snapshot::from_dir(root)?;
     let counts = usage::counts(root);
     let (lessons, _) = snap.lessons();
     let mut out: Vec<DigestLine> = lessons
         .iter()
         .filter(|l| l.frontmatter.kind == crate::lesson::LessonType::Preference && l.frontmatter.status == Status::Active)
+        .filter(|l| keep(&l.path))
         .filter_map(|l| {
             let rule = crate::body::section_text(&l.body, "Rule")?;
             let one: String = rule.split_whitespace().collect::<Vec<_>>().join(" ");

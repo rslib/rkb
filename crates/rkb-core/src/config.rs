@@ -41,7 +41,7 @@ pub struct SiteConfig {
     pub analytics: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sink {
     #[serde(default)]
@@ -183,6 +183,42 @@ pub fn machine(config_dir: &std::path::Path) -> Result<(std::path::PathBuf, toml
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((path, toml::Table::new())),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
+}
+
+/// Where the `[sinks.agent]` in force came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSinkSource {
+    /// The machine `config.toml`; it wins whole over `kb.toml`.
+    Machine,
+    /// `kb.toml`.
+    Kb,
+}
+
+/// The `[sinks.agent]` in force and where it came from: the machine `config.toml` wins whole over
+/// `kb.toml`, and `None` when neither sets one. A machine config that does not parse, or an agent
+/// sink with bad fields, is an error that names the file. An empty `allow` lets nothing through,
+/// like every other sink.
+pub fn agent_sink(root: &std::path::Path, config_dir: &std::path::Path) -> Result<(Option<Sink>, Option<AgentSinkSource>), String> {
+    let (path, table) = machine(config_dir)?;
+    if let Some(sink) = agent_sink_in(&table, &path)? {
+        return Ok((Some(sink), Some(AgentSinkSource::Machine)));
+    }
+    let text = std::fs::read_to_string(root.join("kb.toml")).unwrap_or_default();
+    if text.trim().is_empty() {
+        return Ok((None, None));
+    }
+    // A broken `kb.toml` could hide a sink, so it fails closed like a broken machine config.
+    let kb = parse::<KbConfig>(&text).map_err(|e| format!("kb.toml does not parse: {e}"))?;
+    Ok(kb.sinks.get("agent").cloned().map_or((None, None), |s| (Some(s), Some(AgentSinkSource::Kb))))
+}
+
+/// The `[sinks.agent]` of one config table. Unknown keys and mistyped values are errors, never
+/// silently dropped, so a stricter-looking typo cannot open the sink.
+fn agent_sink_in(table: &toml::Table, path: &std::path::Path) -> Result<Option<Sink>, String> {
+    let Some(sinks) = table.get("sinks") else { return Ok(None) };
+    let sinks = sinks.as_table().ok_or_else(|| format!("{}: [sinks] must be a table", path.display()))?;
+    let Some(agent) = sinks.get("agent") else { return Ok(None) };
+    agent.clone().try_into::<Sink>().map(Some).map_err(|e: toml::de::Error| format!("{}: [sinks.agent] {}", path.display(), e.message()))
 }
 
 /// The harnesses an observer chain can be set for, as `[observer]` keys.
@@ -381,5 +417,55 @@ mod tests {
         assert!(t.is_empty() && path.ends_with("config.toml"));
         std::fs::write(d.path().join("config.toml"), "[jev\n").unwrap();
         assert!(machine(d.path()).is_err());
+    }
+
+    fn agent_sink_dirs() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let (root, config) = (d.path().join("kb"), d.path().join("config"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        (d, root, config)
+    }
+
+    #[test]
+    fn agent_sink_needs_no_config() {
+        let (_d, root, config) = agent_sink_dirs();
+        assert_eq!(agent_sink(&root, &config).unwrap(), (None, None));
+    }
+
+    #[test]
+    fn agent_sink_machine_wins_whole() {
+        let (_d, root, config) = agent_sink_dirs();
+        std::fs::write(root.join("kb.toml"), "[sinks.agent]\nallow = { sensitivity = [\"public\", \"internal\", \"confidential\"] }\n")
+            .unwrap();
+        std::fs::write(config.join("config.toml"), "[sinks.agent]\nallow = { sensitivity = [\"public\"] }\n").unwrap();
+        let (sink, source) = agent_sink(&root, &config).unwrap();
+        assert_eq!(source, Some(AgentSinkSource::Machine));
+        assert_eq!(sink.unwrap().allow["sensitivity"], ["public"]);
+    }
+
+    #[test]
+    fn agent_sink_falls_back_to_kb() {
+        let (_d, root, config) = agent_sink_dirs();
+        std::fs::write(root.join("kb.toml"), "[sinks.agent]\nallow = { sensitivity = [\"public\", \"internal\"] }\n").unwrap();
+        let (sink, source) = agent_sink(&root, &config).unwrap();
+        assert_eq!(source, Some(AgentSinkSource::Kb));
+        assert_eq!(sink.unwrap().allow["sensitivity"], ["public", "internal"]);
+    }
+
+    #[test]
+    fn agent_sink_fails_closed() {
+        let (_d, root, config) = agent_sink_dirs();
+        std::fs::write(config.join("config.toml"), "[sinks.agent\n").unwrap();
+        let e = agent_sink(&root, &config).unwrap_err();
+        assert!(e.contains("config.toml") && e.contains("does not parse"), "{e}");
+        std::fs::write(config.join("config.toml"), "[sinks.agent]\nbogus = 1\n").unwrap();
+        let e = agent_sink(&root, &config).unwrap_err();
+        assert!(e.contains("config.toml") && e.contains("[sinks.agent]"), "{e}");
+        std::fs::write(config.join("config.toml"), "[sinks]\nagent = \"x\"\n").unwrap();
+        assert!(agent_sink(&root, &config).is_err());
+        std::fs::remove_file(config.join("config.toml")).unwrap();
+        std::fs::write(root.join("kb.toml"), "[sinks.agent\n").unwrap();
+        assert!(agent_sink(&root, &config).unwrap_err().contains("kb.toml"), "a broken kb.toml fails closed too");
     }
 }
