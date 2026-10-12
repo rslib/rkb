@@ -1,9 +1,12 @@
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock, test as kitTest } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 type Json = Record<string, unknown>
 type Call = { args: string[]; stdin?: string }
+
+// The kit stops a test after 5 s, and a loaded machine has stalled these 20 ms tests for 11 s.
+const test = (name: string, body: ($: Engine, on: On) => Promise<void>) => kitTest(name, { timeoutMs: 30000 }, body)
 
 const STOP = { session_id: 's1', transcript_path: '/t/s1.jsonl', cwd: '/work/demo', stop_hook_active: false }
 const REQUEST = { id: 'r-4f2a9c', question: 'Add this lesson although it is close to 2b81d05e77?', options: ['add anyway', 'cancel'] }
