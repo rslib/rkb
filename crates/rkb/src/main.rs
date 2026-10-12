@@ -809,7 +809,13 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Review { folder, signals } => {
             kb::open(&root)?;
             if signals {
-                return Ok(session::signals(&rkb_core::review::signals(&root, &env.state), rkb_core::promote::cost(&env.state), colored));
+                let s = rkb_core::review::signals(&root, &env.state);
+                let mut out = session::signals(&s, rkb_core::promote::cost(&env.state), colored);
+                out.human.push_str(&format!(
+                    "\n  {} lessons added in the last 30 days, {} of {} injected at least once",
+                    s.new_lessons, s.new_lessons_injected, s.new_lessons
+                ));
+                return Ok(out);
             }
             let c = rkb_core::review::review(&root, &env.state, folder.as_deref())?;
             Ok(session::review(&c, colored))

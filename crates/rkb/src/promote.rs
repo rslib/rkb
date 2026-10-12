@@ -129,13 +129,13 @@ pub fn run(env: &Env, max: Option<usize>, harness: &str) -> Result<Output, CliEr
         let (text, (input, output)) = match ran {
             Ran::Ok { text, usage } => (text, usage.unwrap_or((0, 0))),
             Ran::Failed(reason) => {
-                promote::log_call(&env.state, &item.id, &model, 0, 0, "failed");
+                promote::log_call(&env.state, &item.id, &model, 0, 0, "failed", None);
                 distill::remove(&env.state, &item.id);
                 results.push(json!({ "id": item.id, "action": "failed", "reason": reason }));
                 continue;
             }
             Ran::Timeout => {
-                promote::log_call(&env.state, &item.id, &model, 0, 0, "timeout");
+                promote::log_call(&env.state, &item.id, &model, 0, 0, "timeout", None);
                 distill::remove(&env.state, &item.id);
                 results.push(json!({ "id": item.id, "action": "timeout" }));
                 continue;
@@ -144,16 +144,32 @@ pub fn run(env: &Env, max: Option<usize>, harness: &str) -> Result<Output, CliEr
         let answer = match promote::parse(&text) {
             Ok(answer) => answer,
             Err(e) => {
-                promote::log_call(&env.state, &item.id, &model, input, output, "noop");
+                promote::log_call(&env.state, &item.id, &model, input, output, "noop", None);
                 distill::remove(&env.state, &item.id);
                 results.push(json!({ "id": item.id, "action": "unparsed", "reason": e.to_string() }));
                 continue;
             }
         };
         if !promote::quotes_match(&answer, item) {
-            promote::log_call(&env.state, &item.id, &model, input, output, "noop");
+            // The item stays in the inbox. One later pass may retry it; after a second miss its
+            // signatures close, so a stuck item stops paying for a call and taking a slot each pass.
+            if promote::quote_failures(&env.state, &item.id) >= 1 {
+                for sig in &item.meta.signatures {
+                    distill::mark_done(&env.state, sig);
+                }
+            }
+            promote::log_call(&env.state, &item.id, &model, input, output, "noop", Some(promote::BAD_QUOTE));
+            results.push(json!({ "id": item.id, "action": "noop", "reason": promote::BAD_QUOTE, "quotes": answer.quotes() }));
+            continue;
+        }
+        if matches!(answer.action.as_str(), "add" | "update") && !answer.changes_behavior() {
+            let reason = "the lesson would not change what an agent does in a different session";
+            promote::log_call(&env.state, &item.id, &model, input, output, "noop", Some(reason));
+            for sig in &item.meta.signatures {
+                distill::mark_done(&env.state, sig);
+            }
             distill::remove(&env.state, &item.id);
-            results.push(json!({ "id": item.id, "action": "noop", "reason": "the quote is not in the item", "quotes": answer.quotes() }));
+            results.push(json!({ "id": item.id, "action": "noop", "reason": reason }));
             continue;
         }
         // A lesson with a shell command or a URL waits for the user. Transcript text can carry
@@ -187,7 +203,7 @@ pub fn run(env: &Env, max: Option<usize>, harness: &str) -> Result<Output, CliEr
                     };
                     request::save(&env.state.join("requests"), &req)
                         .map_err(|e| CliError::new(ErrorCode::Refused, e.to_string(), "check the state directory"))?;
-                    promote::log_call(&env.state, &item.id, &model, input, output, &answer.action);
+                    promote::log_call(&env.state, &item.id, &model, input, output, &answer.action, None);
                     for sig in &item.meta.signatures {
                         distill::mark_done(&env.state, sig);
                     }
@@ -227,13 +243,13 @@ pub fn run(env: &Env, max: Option<usize>, harness: &str) -> Result<Output, CliEr
             Ok(written) => written,
             Err(e) => {
                 // The item goes, or every session end would pay for the same failed write again.
-                promote::log_call(&env.state, &item.id, &model, input, output, "failed");
+                promote::log_call(&env.state, &item.id, &model, input, output, "failed", None);
                 distill::remove(&env.state, &item.id);
                 results.push(json!({ "id": item.id, "action": "failed", "reason": e.message }));
                 continue;
             }
         };
-        promote::log_call(&env.state, &item.id, &model, input, output, &answer.action);
+        promote::log_call(&env.state, &item.id, &model, input, output, &answer.action, None);
         if written.exit == 3 {
             // The request holds the write, so the item goes and no pass pays for the same call again.
             for sig in &item.meta.signatures {

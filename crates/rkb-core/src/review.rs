@@ -114,6 +114,10 @@ pub struct Signals {
     pub repeated_with_lesson: usize,
     /// Per injection path (`tool-failed`, `recall`, `other`), from the use records of these sessions.
     pub paths: BTreeMap<String, PathSignals>,
+    /// Lessons added in the last 30 days.
+    pub new_lessons: usize,
+    /// Of those, how many a hook injected at least once.
+    pub new_lessons_injected: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -178,7 +182,53 @@ pub fn signals(root: &Path, state: &Path) -> Signals {
         out.repeated_with_lesson +=
             usize::from(log.lines().any(|l| serde_json::from_str::<serde_json::Value>(l).is_ok_and(|r| r["kind"] == "injected")));
     }
+    (out.new_lessons, out.new_lessons_injected) = new_lessons(root);
     out
+}
+
+/// How far back a lesson still counts as new for the injected share.
+pub const NEW_DAYS: i64 = 30;
+
+/// Lessons added in the last 30 days and how many a hook injected at least once, as `(added, injected)`.
+/// A lesson's added date is the commit that added its file; the injected set comes from the use records.
+/// Anything unknown counts as not new, so a knowledge base without that history reports none.
+pub fn new_lessons(root: &Path) -> (usize, usize) {
+    let Ok(snap) = Snapshot::from_dir(root) else { return (0, 0) };
+    let (lessons, _) = snap.lessons();
+    if lessons.is_empty() {
+        return (0, 0);
+    }
+    let mut args = vec!["log".to_string(), "--diff-filter=A".into(), "--format=COMMIT:%cs".into(), "--name-only".into(), "--".into()];
+    args.extend(lessons.iter().map(|l| l.path.clone()));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let Ok(out) = git::run(root, &refs) else { return (0, 0) };
+    let mut added: HashMap<String, String> = HashMap::new();
+    let mut date = String::new();
+    for line in String::from_utf8_lossy(&out).lines() {
+        if let Some(d) = line.strip_prefix("COMMIT:") {
+            date = d.to_string();
+        } else if !line.trim().is_empty() {
+            added
+                .entry(line.trim().to_string())
+                .and_modify(|e| {
+                    if date > *e {
+                        *e = date.clone()
+                    }
+                })
+                .or_insert_with(|| date.clone());
+        }
+    }
+    let today = jiff::Zoned::now().date();
+    let cutoff = today.saturating_sub(jiff::Span::new().days(NEW_DAYS)).to_string();
+    let counts = usage::counts(root);
+    let (mut new, mut hit) = (0, 0);
+    for l in &lessons {
+        if added.get(&l.path).is_some_and(|d| d.as_str() >= cutoff.as_str()) {
+            new += 1;
+            hit += usize::from(counts.get(&l.frontmatter.id).is_some_and(|c| c.injected > 0));
+        }
+    }
+    (new, hit)
 }
 
 pub fn review(root: &Path, state: &Path, folder: Option<&str>) -> Result<Vec<Candidate>> {

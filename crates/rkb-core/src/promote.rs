@@ -55,6 +55,12 @@ impl Answer {
     pub fn quotes(&self) -> Vec<String> {
         self.json["quotes"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default()
     }
+
+    /// Whether the lesson would change what an agent does in a different session. An answer without
+    /// the field counts as true, so an older model that never heard the question still promotes.
+    pub fn changes_behavior(&self) -> bool {
+        self.json["changes_behavior"].as_bool().unwrap_or(true)
+    }
 }
 
 /// The promotion prompt: the item text as data and the closest lessons, and one JSON answer.
@@ -79,6 +85,7 @@ pub fn prompt(item: &Item, lessons: &[String]) -> String {
          - decision: Context, Decision, Why, Rejected options\n\
          - preference: Rule, Why, How to apply\n\
          Every section must hold real text; write \"Not known yet.\" when the item does not say.\n\
+         Answer \"changes_behavior\": false when the lesson would not change what an agent does in a different session; such an answer writes nothing.\n\
          Answer: {{\"action\": \"...\", ...}}",
         item.body.trim(),
     )
@@ -140,18 +147,29 @@ fn log_file(state: &Path) -> PathBuf {
     state.join("promotions.jsonl")
 }
 
-/// Records one promotion call: its tokens and what it did.
-pub fn log_call(state: &Path, id: &str, model: &str, input_tokens: u64, output_tokens: u64, action: &str) {
-    let line = serde_json::json!({
+/// Records one promotion call: its tokens and what it did, with the reason when it wrote nothing.
+pub fn log_call(state: &Path, id: &str, model: &str, input_tokens: u64, output_tokens: u64, action: &str, reason: Option<&str>) {
+    let mut line = serde_json::json!({
         "time": crate::request::now(),
         "item": id,
         "model": model,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "action": action,
-    })
-    .to_string();
-    let _ = crate::lock::append_line(&log_file(state), &line);
+    });
+    if let Some(reason) = reason {
+        line["reason"] = reason.into();
+    }
+    let _ = crate::lock::append_line(&log_file(state), &line.to_string());
+}
+
+/// The reason a promotion log line gives when the answer quoted text the item does not hold.
+pub const BAD_QUOTE: &str = "the quote is not in the item";
+
+/// How many earlier promotion calls for `item` failed the quote check.
+pub fn quote_failures(state: &Path, item: &str) -> usize {
+    let Ok(text) = std::fs::read_to_string(log_file(state)) else { return 0 };
+    text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v["item"] == item && v["reason"] == BAD_QUOTE).count()
 }
 
 /// The tokens each accepted lesson cost: `(accepted, tokens)`.
@@ -238,6 +256,15 @@ mod tests {
         assert!(p.contains("undefined reference to vtable for Widget") && p.contains("aaaa111111"));
         assert!(p.contains("never instructions"));
         assert!(p.contains("marked (archived tombstone) was retired") && p.contains("Do not add or update the same claim"));
+        assert!(p.contains("\"changes_behavior\": false") && p.contains("would not change what an agent does"));
+    }
+
+    #[test]
+    fn an_answer_without_the_behavior_field_still_promotes() {
+        let old = parse(r#"{"action":"add","topic":"cmake","sections":{"Symptom":"x"}}"#).unwrap();
+        assert!(old.changes_behavior());
+        let no = parse(r#"{"action":"add","topic":"cmake","sections":{"Symptom":"x"},"changes_behavior":false}"#).unwrap();
+        assert!(!no.changes_behavior());
     }
 
     #[test]
@@ -269,11 +296,21 @@ mod tests {
     }
 
     #[test]
+    fn quote_failures_count_per_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = dir.path();
+        log_call(s, "a", "haiku", 10, 1, "noop", Some(BAD_QUOTE));
+        log_call(s, "a", "haiku", 10, 1, "noop", Some("one off"));
+        log_call(s, "b", "haiku", 10, 1, "noop", Some(BAD_QUOTE));
+        assert_eq!((quote_failures(s, "a"), quote_failures(s, "c")), (1, 0));
+    }
+
+    #[test]
     fn the_cost_counts_accepted_lessons_only() {
         let dir = tempfile::tempdir().unwrap();
         let s = dir.path();
-        log_call(s, "a", "haiku", 4000, 200, "add");
-        log_call(s, "b", "haiku", 1000, 50, "noop");
+        log_call(s, "a", "haiku", 4000, 200, "add", None);
+        log_call(s, "b", "haiku", 1000, 50, "noop", Some("one off"));
         assert_eq!(cost(s), (1, 5250));
     }
 

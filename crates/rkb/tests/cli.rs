@@ -4962,6 +4962,129 @@ fn promote_holds_a_lesson_with_a_url() {
 }
 
 #[test]
+fn promote_skips_a_lesson_that_changes_nothing() {
+    let env = Env::new();
+    env.init();
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[observer]\npi = \"session\"\n");
+    approve_as_claude(&env);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let dir = env.dir.path().join("state/rkb/inbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("0a1b2c3d4e.md"),
+        format!("---\nkind: note\ntime: {now}\nsignatures:\n  - aaabbbcccddd\n---\n\ncmake could not find HDF5 on this machine\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        env.dir.path().join("state/rkb/signatures.jsonl"),
+        format!(
+            "{{\"time\":{now},\"sig\":\"aaabbbcccddd\",\"session\":\"s1\"}}\n{{\"time\":{now},\"sig\":\"aaabbbcccddd\",\"session\":\"s2\"}}\n"
+        ),
+    )
+    .unwrap();
+    let fake = env.dir.path().join("fake/pi");
+    env.write_abs(
+        &fake,
+        r#"#!/bin/sh
+cat > /dev/null
+printf '%s' '{"action":"add","topic":"cmake","type":"fact","title":"Cmake needs the prefix","queries":["cmake could not find HDF5","HDF5 prefix fix"],"sections":{"Statement":"cmake could not find HDF5 on this machine","Evidence":"saw it"},"quotes":["cmake could not find HDF5"],"changes_behavior":false}'"#,
+    );
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let o = rkb_with(with_pi(&env), &["promote", "--harness", "pi", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!((v["promoted"].as_u64(), v["ready"].as_u64()), (Some(0), Some(1)), "{v}");
+    assert_eq!(v["results"][0]["action"], "noop", "{v}");
+    assert!(
+        v["results"][0]["reason"].as_str().unwrap().contains("change what an agent does"),
+        "the reason names the behavior question: {v}"
+    );
+    let (found, _) = env.json(&["search", "cmake could not find HDF5"], "");
+    assert!(found["results"].as_array().unwrap().is_empty(), "nothing written: {found}");
+    assert!(inbox_items(&env).is_empty(), "the answered item is gone");
+    let log = std::fs::read_to_string(env.dir.path().join("state/rkb/promotions.jsonl")).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    assert_eq!(entry["action"], "noop", "{log}");
+    assert!(entry["reason"].as_str().unwrap().contains("change what an agent does"), "the log names the behavior question: {log}");
+}
+
+#[test]
+fn promote_keeps_an_item_with_a_bad_quote() {
+    let env = Env::new();
+    env.init();
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[observer]\npi = \"session\"\n");
+    approve_as_claude(&env);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let dir = env.dir.path().join("state/rkb/inbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("0a1b2c3d4e.md"),
+        format!("---\nkind: note\ntime: {now}\nsignatures:\n  - aaabbbcccddd\n---\n\ncmake could not find HDF5 on this machine\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        env.dir.path().join("state/rkb/signatures.jsonl"),
+        format!(
+            "{{\"time\":{now},\"sig\":\"aaabbbcccddd\",\"session\":\"s1\"}}\n{{\"time\":{now},\"sig\":\"aaabbbcccddd\",\"session\":\"s2\"}}\n"
+        ),
+    )
+    .unwrap();
+    let fake = env.dir.path().join("fake/pi");
+    env.write_abs(
+        &fake,
+        r#"#!/bin/sh
+cat > /dev/null
+printf '%s' '{"action":"add","topic":"cmake","type":"fact","title":"Cmake needs the prefix","queries":["cmake could not find HDF5","HDF5 prefix fix"],"sections":{"Statement":"cmake could not find HDF5 on this machine","Evidence":"saw it"},"quotes":["a line the item never said"]}'"#,
+    );
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let o = rkb_with(with_pi(&env), &["promote", "--harness", "pi", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(v["results"][0]["action"], "noop", "{v}");
+    assert_eq!(v["results"][0]["reason"], "the quote is not in the item", "{v}");
+    let (found, _) = env.json(&["search", "cmake could not find HDF5"], "");
+    assert!(found["results"].as_array().unwrap().is_empty(), "nothing written: {found}");
+    let items = inbox_items(&env);
+    assert!(items.iter().any(|i| i["id"] == "0a1b2c3d4e"), "the item stays in the inbox: {items:?}");
+    let sigs = std::fs::read_to_string(env.dir.path().join("state/rkb/signatures.jsonl")).unwrap();
+    assert!(!sigs.lines().any(|l| l.contains("\"done\":true")), "the signature is not marked done: {sigs}");
+    // A second miss closes the signature, so a third pass makes no call; the item still stays.
+    let o = rkb_with(with_pi(&env), &["promote", "--harness", "pi", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(v["results"][0]["reason"], "the quote is not in the item", "{v}");
+    let o = rkb_with(with_pi(&env), &["promote", "--harness", "pi", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert!(v["results"].as_array().unwrap().is_empty(), "no third call: {v}");
+    assert!(inbox_items(&env).iter().any(|i| i["id"] == "0a1b2c3d4e"), "the item still stays");
+}
+
+#[test]
+fn review_signals_counts_injected_new_lessons() {
+    let env = kb_with_topics();
+    let vtable = "---\ntype: pitfall\nverified_how: ran\ntags:\n  - cpp\n---\n\n# Undefined reference to vtable means a missing definition\n\n## Symptom\nThe link fails with undefined reference to vtable for Widget.\n\n## Cause\nA virtual function is declared but never defined.\n\n## Fix\nDefine every virtual function.\n\n## Evidence\nThe link passed after adding the definition.\n";
+    let ninja = "---\ntype: fact\nverified_how: ran\ntags:\n  - cmake\n---\n\n# Ninja builds faster than make here\n\n## Statement\nNinja builds this tree faster than make.\n\n## Evidence\nTimed both on the same tree.\n";
+    let zlib = "---\ntype: pitfall\nverified_how: ran\ntags:\n  - cmake\n---\n\n# ZLIB outside the prefix needs ZLIB_ROOT\n\n## Symptom\nThe configure step fails with Could NOT find ZLIB.\n\n## Cause\nZLIB lives under /opt/zlib, outside the search prefix.\n\n## Fix\nPoint the build at it with ZLIB_ROOT=/opt/zlib.\n\n## Evidence\nConfigure passed with the flag.\n";
+    let ssh = "---\ntype: fact\nverified_how: ran\ntags:\n  - cmake\n---\n\n# BatchMode makes ssh fail at once\n\n## Statement\nssh -o BatchMode=yes fails at once instead of asking for a password.\n\n## Evidence\nSaw it in a script.\n";
+    add_ok(&env, "cmake", PITFALL);
+    add_ok(&env, "cpp", vtable);
+    add_ok(&env, "cmake", ninja);
+    add_ok(&env, "cmake", zlib);
+    add_ok(&env, "cmake", ssh);
+    let cwd = env.kb();
+    let mut cmake = bash("s1", &cwd, "cmake -B build");
+    cmake["error"] = "Exit code 1\nCMake Error: could not find HDF5, set HDF5_ROOT to configure the module\n".into();
+    let out = hook(&env, "tool-failed", &cmake);
+    assert!(out.contains("HDF5_ROOT"), "the HDF5 lesson is injected: {out}");
+    let linker = "Exit code 1\n/usr/bin/ld: main.o: in function `main':\nmain.cpp:(.text+0x1f): undefined reference to `vtable for Widget'\ncollect2: error: ld returned 1 exit status\n";
+    let mut gxx = bash("s2", &cwd, "g++ main.o -o app");
+    gxx["error"] = linker.into();
+    let out = hook(&env, "tool-failed", &gxx);
+    assert!(out.contains("missing definition"), "the vtable lesson is injected: {out}");
+    let (v, code) = env.json(&["review", "--signals"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!((v["signals"]["new_lessons"].as_u64(), v["signals"]["new_lessons_injected"].as_u64()), (Some(5), Some(2)), "{v}");
+    assert!(stdout(&env.rkb(&["review", "--signals"])).contains("2 of 5"), "the report says 2 of 5");
+}
+
+#[test]
 fn eval_drafts_a_reviewed_set() {
     let env = kb_with_topics();
     let lesson = add_ok(&env, "cmake", &lesson_with("Cmake prefix lesson"));
