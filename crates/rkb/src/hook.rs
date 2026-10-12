@@ -188,6 +188,7 @@ fn injected(h: &search::Hit, notes: Vec<String>) -> hooks::Injected<'_> {
         verified: &h.verified,
         how: &h.verified_how,
         applies: h.applies.as_str(),
+        tier: h.tier,
         notes,
     }
 }
@@ -224,7 +225,8 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
     }
     let query = hooks::error_query(command, error);
     let cfg = hooks_config(&root);
-    let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, &query, "failure")?;
+    let with = vec![("tool".to_string(), program.clone())];
+    let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, &query, "failure", &with)?;
     let chosen = hooks::would_inject(
         &hits,
         |id| kb::find(&root, id).map(|(_, t)| t).unwrap_or_default(),
@@ -263,8 +265,12 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
         &json!({ "kind": "injected", "id": hit.id, "hook": "tool-failed", "explore": explore, "time": rkb_core::request::now() }),
     )?;
     let reason = if explore { format!("explore, {}", ranked.describe()) } else { format!("tool-failed, {}", ranked.describe()) };
-    record_use(&root, state, &hit.id, "injected", session, Some(reason))?;
-    let context = hooks::render(&[injected(hit, missing_note(&place, &hit.path, &text))]);
+    // The injection is already recorded, so a failed use record only adds a note.
+    let mut notes = missing_note(&place, &hit.path, &text);
+    if let Err(e) = record_use(&root, state, &hit.id, "injected", session, Some(reason)) {
+        notes.push(format!("usage not recorded: {e}"));
+    }
+    let context = hooks::render(&[injected(hit, notes)]);
     Ok(Some(reply("PostToolUseFailure", "additionalContext", json!(context))))
 }
 
@@ -294,6 +300,7 @@ fn start_promotion(p: &Value, state: &Path, harness: &str) -> Result<()> {
 }
 
 /// The hits for `query` from the current place, reranked by the chain within the hook time limit.
+/// `with` holds extra facts, such as the failed command's program as `tool`.
 fn ranked_search(
     root: &Path,
     p: &Value,
@@ -301,9 +308,10 @@ fn ranked_search(
     cfg: &toml::Table,
     query: &str,
     hook: &str,
+    with: &[(String, String)],
 ) -> Result<(Vec<search::Hit>, rerank::Ranked, Place)> {
     let place = state::locate(root, &cwd(p), &Hints::default(), state)?;
-    let facts = Facts::gather(root, &place, &[]);
+    let facts = Facts::gather(root, &place, with);
     let settings = rerank::Settings::load(root);
     let opts =
         Options { all: false, every_status: false, limit: settings.top.max(1), probes: rkb_core::search::ProbeMode::Cached, tier: None };
@@ -344,7 +352,7 @@ fn recall(p: &Value, state: &Path, session: &str, text: &str) -> Result<Option<S
     if cfg.get("recall").and_then(toml::Value::as_bool) == Some(false) {
         return Ok(None);
     }
-    let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, text, "recall")?;
+    let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, text, "recall", &[])?;
     let (min_default, margin_default) = hooks::recall_defaults(&ranked.backend);
     let table = hooks::path_threshold(&cfg, &ranked.backend, "prompt");
     let flat = |k: &str| cfg.get(k).and_then(toml::Value::as_float);

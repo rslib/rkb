@@ -535,6 +535,13 @@ mod tests {
     }
 
     #[test]
+    fn tool_fact_matches_the_program_name() {
+        assert_eq!(eval("tool: cmake", &[("tool", "cmake")]).result, Verdict::Yes);
+        assert_eq!(eval("tool: cmake", &[("tool", "make")]).result, Verdict::No);
+        assert_eq!(eval("tool: cmake", &[]).result, Verdict::Unknown);
+    }
+
+    #[test]
     fn since_and_until() {
         assert_eq!(eval("since: aaaaaaa", &[]).result, Verdict::Yes);
         assert_eq!(eval("until: aaaaaaa", &[]).result, Verdict::No);
