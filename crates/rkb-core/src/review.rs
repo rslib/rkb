@@ -401,6 +401,47 @@ pub fn health(root: &Path, state: &Path, folder: Option<&str>) -> Result<Vec<Can
     Ok(out)
 }
 
+/// Characters the preference digest holds at most, about 300 tokens. Whole lines only: a
+/// lesson past the budget stays out, so the digest never cuts a rule in half.
+pub const DIGEST_CHARS: usize = 1200;
+
+/// One line of the preference digest: the standing rule of one preference lesson.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DigestLine {
+    pub id: String,
+    pub line: String,
+    pub worked: u32,
+}
+
+/// The standing preference lessons, one line each: the `Rule` section as one line, ordered by
+/// `worked` reports. Only active lessons: stale ones were flagged as wrong, and other lesson types
+/// and tombstones are never preferences the user stands by. Reads only.
+pub fn digest(root: &Path) -> Result<Vec<DigestLine>> {
+    let snap = Snapshot::from_dir(root)?;
+    let counts = usage::counts(root);
+    let (lessons, _) = snap.lessons();
+    let mut out: Vec<DigestLine> = lessons
+        .iter()
+        .filter(|l| l.frontmatter.kind == crate::lesson::LessonType::Preference && l.frontmatter.status == Status::Active)
+        .filter_map(|l| {
+            let rule = crate::body::section_text(&l.body, "Rule")?;
+            let one: String = rule.split_whitespace().collect::<Vec<_>>().join(" ");
+            if one.is_empty() {
+                return None;
+            }
+            let worked = counts.get(&l.frontmatter.id).map_or(0, |c| c.worked);
+            Some(DigestLine { id: l.frontmatter.id.clone(), line: one, worked })
+        })
+        .collect();
+    out.sort_by(|a, b| b.worked.cmp(&a.worked).then(a.id.cmp(&b.id)));
+    let mut chars = 0;
+    out.retain(|d| {
+        chars += d.line.chars().count() + 1;
+        chars <= DIGEST_CHARS + 1
+    });
+    Ok(out)
+}
+
 /// One rkb commit in the knowledge base, for `rkb changes`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Change {

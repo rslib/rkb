@@ -61,6 +61,12 @@ impl Answer {
     pub fn changes_behavior(&self) -> bool {
         self.json["changes_behavior"].as_bool().unwrap_or(true)
     }
+
+    /// Whether the answer marks a preference as a one-off request (`standing: false`). Only
+    /// preferences carry the flag: other lesson types hold facts about the world, not standing rules.
+    pub fn one_off(&self) -> bool {
+        self.json["type"].as_str() == Some("preference") && self.json["standing"].as_bool() == Some(false)
+    }
 }
 
 /// The promotion prompt: the item text as data and the closest lessons, and one JSON answer.
@@ -86,6 +92,7 @@ pub fn prompt(item: &Item, lessons: &[String]) -> String {
          - preference: Rule, Why, How to apply\n\
          Every section must hold real text; write \"Not known yet.\" when the item does not say.\n\
          Answer \"changes_behavior\": false when the lesson would not change what an agent does in a different session; such an answer writes nothing.\n\
+         Answer \"standing\": false when a preference is a one-off request for this session only; such an answer writes nothing.\n\
          Answer: {{\"action\": \"...\", ...}}",
         item.body.trim(),
     )

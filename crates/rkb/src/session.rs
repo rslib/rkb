@@ -219,6 +219,13 @@ fn doctor_human(c: bool, checks: &[Check], failed: usize, warned: usize) -> Stri
     out
 }
 
+/// `rkb digest`: the standing preference lessons, one line each, for agents and people. Reads only.
+pub fn digest(lines: &[rkb_core::review::DigestLine]) -> Output {
+    let rows: Vec<Value> = lines.iter().map(|l| json!({ "id": l.id, "line": l.line, "worked": l.worked })).collect();
+    let human = lines.iter().map(|l| l.line.as_str()).collect::<Vec<_>>().join("\n");
+    Output { data: json!({ "lines": rows }), human, exit: 0, raw: false }
+}
+
 /// `rkb review`: one block per candidate with every reason and the use dates.
 pub fn signals(s: &rkb_core::review::Signals, cost: (u64, u64), c: bool) -> Output {
     let share = |n: usize, of: usize| (n * 100).checked_div(of).map_or_else(|| "-".to_string(), |p| format!("{p}%"));

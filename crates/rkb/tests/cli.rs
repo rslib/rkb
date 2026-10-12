@@ -399,6 +399,67 @@ fn lesson_with(title: &str) -> String {
     PITFALL.replace("CMake cannot find HDF5 unless HDF5_ROOT is set", title)
 }
 
+fn preference_with(title: &str, rule: &str) -> String {
+    format!(
+        "---\ntype: preference\nverified_how: told\ntags:\n  - demo\n---\n\n# {title}\n\n## Rule\n{rule}\n\n## Why\nThe user asked for it.\n\n## How to apply\nDo what the rule says.\n"
+    )
+}
+
+#[test]
+fn digest_ranks_and_caps() {
+    let env = kb_with_topics();
+    let a = add_ok(
+        &env,
+        "cmake",
+        &preference_with("Always pass the module prefix explicitly", "Pass the module prefix explicitly on every configure."),
+    );
+    let b = add_ok(&env, "cmake", &preference_with("Prefer ninja over make for local builds", "Use ninja for every local build."));
+    let c = add_ok(&env, "cpp", &preference_with("Avoid std regex in hot loops", "Never use std regex in a hot loop."));
+    let (a, b, c) = (a["id"].as_str().unwrap().to_string(), b["id"].as_str().unwrap().to_string(), c["id"].as_str().unwrap().to_string());
+    for _ in 0..5 {
+        assert_eq!(env.json(&["used", &a, "--worked"], "").0["status"], "recorded");
+    }
+    for _ in 0..2 {
+        assert_eq!(env.json(&["used", &c, "--worked"], "").0["status"], "recorded");
+    }
+    // Ranked by worked reports: 5, 2, 0.
+    let (v, code) = env.json(&["digest"], "");
+    assert_eq!(code, Some(0), "{v}");
+    let ids: Vec<&str> = v["lines"].as_array().unwrap().iter().map(|l| l["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [&a, &c, &b], "{v}");
+    let human = stdout(&env.rkb(&["digest"]));
+    let (ia, ib, ic) = (human.find("module prefix").unwrap(), human.find("local build").unwrap(), human.find("std regex").unwrap());
+    assert!(ia < ic && ic < ib, "ranked 5, 2, 0: {human}");
+    // A pitfall, a stale preference and an archived preference stay out of the digest.
+    let pitfall = add_ok(&env, "cmake", PITFALL)["id"].as_str().unwrap().to_string();
+    assert_eq!(env.json(&["flag", &c, "--reason", "rule no longer holds"], "").0["status"], "written");
+    assert!(current(&env, &c).0.contains("status: stale"));
+    assert_eq!(env.json(&["archive", &b, "--reason", "no longer wanted"], "").0["status"], "written");
+    let (v, code) = env.json(&["digest"], "");
+    assert_eq!(code, Some(0), "{v}");
+    let ids: Vec<&str> = v["lines"].as_array().unwrap().iter().map(|l| l["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [&a], "only the standing preference: {v}");
+    let human = stdout(&env.rkb(&["digest"]));
+    assert!(human.contains("module prefix"), "{human}");
+    assert!(!human.contains(&pitfall) && !human.contains("local build") && !human.contains("std regex"), "{human}");
+
+    for i in 0..100 {
+        add_ok(
+            &env,
+            if i % 2 == 0 { "cmake" } else { "cpp" },
+            &preference_with(
+                &format!("Standing preference number {i} for daily work"),
+                &format!("Follow standing preference number {i} in daily work."),
+            ),
+        );
+    }
+    let human = stdout(&env.rkb(&["digest"]));
+    assert!(human.chars().count() <= 1200, "{} chars: {human}", human.chars().count());
+    let (v, _) = env.json(&["digest"], "");
+    assert!(v["lines"].as_array().unwrap().len() < 103, "the budget keeps lines out: {v}");
+    assert!(human.lines().all(|l| l.ends_with("in daily work.") || l.ends_with("every configure.")), "whole lines only: {human}");
+}
+
 /// A knowledge base with committed topic folders `general/cmake` and `general/cpp` (aliases c++ and cxx).
 fn kb_with_topics() -> Env {
     let env = Env::new();
@@ -5575,4 +5636,90 @@ fn worked_adds_the_failure_query() {
     assert_eq!(v["status"], "recorded");
     assert_eq!(queries_of(&env).len(), 8, "full stays full");
     assert_eq!(commits(), before, "full adds no commit");
+}
+
+fn promote_item(env: &Env, id: &str, sig: &str, body: &str, answer: &str) -> serde_json::Value {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let dir = env.dir.path().join("state/rkb/inbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{id}.md")), format!("---\nkind: note\ntime: {now}\nsignatures:\n  - {sig}\n---\n\n{body}\n")).unwrap();
+    std::fs::write(
+        env.dir.path().join("state/rkb/signatures.jsonl"),
+        format!("{{\"time\":{now},\"sig\":\"{sig}\",\"session\":\"s1\"}}\n{{\"time\":{now},\"sig\":\"{sig}\",\"session\":\"s2\"}}\n"),
+    )
+    .unwrap();
+    let fake = env.dir.path().join("fake/pi");
+    env.write_abs(&fake, &format!("#!/bin/sh\ncat > /dev/null\nprintf '%s' '{answer}'\n"));
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let o = rkb_with(with_pi(env), &["promote", "--harness", "pi", "--format", "json"], "");
+    serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)))
+}
+
+fn promote_env() -> Env {
+    let env = Env::new();
+    env.init();
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[observer]\npi = \"session\"\n");
+    approve_as_claude(&env);
+    env
+}
+
+#[test]
+fn promote_skips_a_one_off_preference() {
+    let env = promote_env();
+    let v = promote_item(
+        &env,
+        "0a1b2c3d4e",
+        "aaabbbcccddd",
+        "use ninja for this build only",
+        r#"{"action":"add","topic":"cmake","type":"preference","title":"Use ninja for this build","queries":["ninja for this build"],"sections":{"Rule":"Use ninja for this build only.","Why":"The user asked for it this time.","How to apply":"Pass -G Ninja this once."},"quotes":["use ninja for this build only"],"standing":false}"#,
+    );
+    assert_eq!((v["promoted"].as_u64(), v["ready"].as_u64()), (Some(0), Some(1)), "{v}");
+    assert_eq!(v["results"][0]["action"], "noop", "{v}");
+    assert!(v["results"][0]["reason"].as_str().unwrap().contains("one-off"), "the reason names the one-off: {v}");
+    let (found, _) = env.json(&["search", "ninja for this build"], "");
+    assert!(found["results"].as_array().unwrap().is_empty(), "nothing written: {found}");
+    assert!(inbox_items(&env).is_empty(), "the answered item is gone");
+    let log = std::fs::read_to_string(env.dir.path().join("state/rkb/promotions.jsonl")).unwrap();
+    let entry: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+    assert_eq!(entry["action"], "noop", "{log}");
+    assert!(entry["reason"].as_str().unwrap().contains("one-off"), "the log names the one-off: {log}");
+    // A pitfall the model marks one-off still promotes: the flag fits failures, not lesson types.
+    let v = promote_item(
+        &env,
+        "0a1b2c3d4f",
+        "eeefff000111",
+        "cmake could not find HDF5 on this machine",
+        r#"{"action":"add","topic":"cmake","type":"pitfall","title":"Cmake needs the prefix","queries":["cmake could not find HDF5"],"sections":{"Symptom":"cmake could not find HDF5 on this machine","Cause":"Not known yet.","Fix":"Set the prefix.","Evidence":"saw it"},"quotes":["cmake could not find HDF5"],"standing":false}"#,
+    );
+    assert_eq!(v["promoted"].as_u64(), Some(1), "a pitfall ignores the one-off flag: {v}");
+    let (found, _) = env.json(&["search", "cmake could not find HDF5"], "");
+    assert_eq!(found["results"].as_array().unwrap().len(), 1, "{found}");
+}
+
+#[test]
+fn session_start_adds_the_digest_when_on() {
+    let env = kb_with_topics();
+    add_ok(
+        &env,
+        "cmake",
+        &preference_with("Always pass the module prefix explicitly", "Pass the module prefix explicitly on every configure."),
+    );
+    // A pitfall must not leak into the digest.
+    add_ok(&env, "cmake", PITFALL);
+    let payload = serde_json::json!({ "session_id": "s", "cwd": env.dir.path(), "source": "startup" });
+    let off = hook(&env, "session-start", &payload);
+    assert!(!off.contains("module prefix"), "off by default: {off}");
+    let before = off.chars().count();
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write("kb.toml", &format!("{toml}\n[hooks]\ndigest = true\n"));
+    assert!(env.rkb(&["lint"]).status.success(), "{}", stdout(&env.rkb(&["lint"])));
+    let on = hook(&env, "session-start", &payload);
+    assert!(on.contains("module prefix"), "the digest follows the context lines: {on}");
+    assert!(on.find("rkb search").unwrap() < on.find("module prefix").unwrap(), "after the context lines: {on}");
+    assert!(!on.contains("Configure fails"), "the pitfall stays out: {on}");
+    // The second command reads the digest the first wrote: session start uses it.
+    let (v, _) = env.json(&["digest"], "");
+    let rule = v["lines"][0]["line"].as_str().unwrap();
+    assert!(on.contains(rule), "session start prints the real digest line: {on}");
+    assert!(on.chars().count() <= before + 1200 + 200, "{} chars on, {} off", on.chars().count(), before);
 }

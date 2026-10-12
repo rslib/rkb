@@ -109,14 +109,24 @@ fn reply(event: &str, key: &str, value: Value) -> String {
     json!({ "hookSpecificOutput": out }).to_string()
 }
 
-/// The session context, with no work nudge: the inbox count stays in `rkb status`.
+/// The session context, with no work nudge: the inbox count stays in `rkb status`. With
+/// `hooks.digest = true` in `kb.toml`, the standing preference digest follows the context lines.
 fn session_start(p: &Value, state: &Path) -> Result<Option<String>> {
     hooks::cleanup(state);
     let root = kb::home();
     kb::open(&root)?;
     let place = state::locate(&root, &cwd(p), &Hints::default(), state)?;
     let s = state::build(&root, place, state)?;
-    Ok(Some(crate::session::context(&s).human))
+    let mut text = crate::session::context(&s).human;
+    if hooks_config(&root).get("digest").and_then(toml::Value::as_bool) == Some(true)
+        && let Ok(lines) = rkb_core::review::digest(&root)
+        && !lines.is_empty()
+    {
+        // A digest that fails to read never fails session start: the context lines still go out.
+        text.push_str("\npreferences:\n");
+        text.push_str(&lines.iter().map(|l| format!("  - {}", l.line)).collect::<Vec<_>>().join("\n"));
+    }
+    Ok(Some(text))
 }
 
 fn pre_tool(p: &Value, state: &Path) -> Result<Option<String>> {

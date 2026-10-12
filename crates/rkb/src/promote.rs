@@ -162,6 +162,16 @@ pub fn run(env: &Env, max: Option<usize>, harness: &str) -> Result<Output, CliEr
             results.push(json!({ "id": item.id, "action": "noop", "reason": promote::BAD_QUOTE, "quotes": answer.quotes() }));
             continue;
         }
+        if matches!(answer.action.as_str(), "add" | "update") && answer.one_off() {
+            let reason = "the preference is a one-off request for this session only, not a standing rule";
+            promote::log_call(&env.state, &item.id, &model, input, output, "noop", Some(reason));
+            for sig in &item.meta.signatures {
+                distill::mark_done(&env.state, sig);
+            }
+            distill::remove(&env.state, &item.id);
+            results.push(json!({ "id": item.id, "action": "noop", "reason": reason }));
+            continue;
+        }
         if matches!(answer.action.as_str(), "add" | "update") && !answer.changes_behavior() {
             let reason = "the lesson would not change what an agent does in a different session";
             promote::log_call(&env.state, &item.id, &model, input, output, "noop", Some(reason));

@@ -254,6 +254,9 @@ enum Cmd {
         #[arg(long, value_name = "ID")]
         from_inbox: Option<String>,
     },
+    /// Print the standing preference lessons, one line each, ranked by `worked` reports. Changes nothing.
+    #[command(after_help = "Example:\n  rkb digest")]
+    Digest,
     /// Replace a lesson with the file read from stdin, or edit it in $EDITOR.
     #[command(after_help = "Example:\n  rkb edit 7f3a9c2b41 --base 3f9a1c0d2e4b < lesson.md")]
     Edit {
@@ -831,6 +834,10 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             }
             let c = rkb_core::review::review(&root, &env.state, folder.as_deref())?;
             Ok(session::review(&c, colored))
+        }
+        Cmd::Digest => {
+            kb::open(&root)?;
+            Ok(session::digest(&rkb_core::review::digest(&root)?))
         }
         Cmd::Changes { since } => {
             kb::open(&root)?;
