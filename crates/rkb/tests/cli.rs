@@ -1760,6 +1760,199 @@ fn search_falls_back_to_bm25_without_a_model() {
     assert!(v["error"]["message"].as_str().unwrap().contains("missing"), "{v}");
 }
 
+fn dir_tree(dir: &Path) -> Vec<String> {
+    fn walk(p: &Path, prefix: &str, out: &mut Vec<String>) {
+        for e in std::fs::read_dir(p).unwrap().flatten() {
+            let name = format!("{prefix}/{}", e.file_name().to_string_lossy());
+            if e.file_type().unwrap().is_dir() {
+                walk(&e.path(), &name, out);
+            } else {
+                out.push(name);
+            }
+        }
+    }
+    let mut out = vec![];
+    walk(dir, "", &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn no_home_stops_before_writing_anything() {
+    let env = search_kb();
+    let clean = env.dir.path().join("empty-cwd");
+    std::fs::create_dir_all(&clean).unwrap();
+    let bare = |args: &[&str], vars: &[(&str, &str)]| {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.current_dir(&clean);
+        for k in ["RKB_HOME", "RKB_TEST_HOME", "HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME"] {
+            c.env_remove(k);
+        }
+        for (k, v) in vars {
+            c.env(k, v);
+        }
+        c.args(args).stdin(std::process::Stdio::null()).output().unwrap()
+    };
+    let before = dir_tree(&clean);
+    for args in [vec!["--format", "json", "list"], vec!["--format", "json", "search", "git rebase"], vec!["--format", "json", "doctor"]] {
+        let o = bare(&args, &[]);
+        assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("RKB_HOME") && msg.contains("HOME"), "names both: {v}");
+        assert!(v["error"]["fix"].as_str().unwrap().contains("RKB_HOME") && v["error"]["fix"].as_str().unwrap().contains("HOME"), "{v}");
+    }
+    for (args, input) in [
+        (vec!["mcp"], r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#),
+        (vec!["hook", "session-start"], r#"{"session_id":"s1","cwd":"."}"#),
+        (vec!["tool", "rkb_note"], r#"{"text":"from a homeless agent"}"#),
+    ] {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.current_dir(&clean);
+        for k in ["RKB_HOME", "RKB_TEST_HOME", "HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME"] {
+            c.env_remove(k);
+        }
+        let mut child = c.args(&args).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), input.as_bytes()).unwrap();
+        let o = child.wait_with_output().unwrap();
+        assert_eq!(o.status.code(), Some(1), "{args:?} stops: {}", stdout(&o));
+    }
+    assert_eq!(dir_tree(&clean), before, "the throwaway folder is unchanged");
+
+    let o = bare(&["--format", "json", "list"], &[("RKB_HOME", env.kb().to_str().unwrap())]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(v.get("error").is_none(), "RKB_HOME alone runs: {v}");
+    // With RKB_HOME alone, state goes inside the knowledge base's .git, never into the working directory.
+    let o = bare(&["--format", "json", "note", "kept inside git"], &[("RKB_HOME", env.kb().to_str().unwrap())]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    assert_eq!(dir_tree(&clean), before, "the working directory is unchanged");
+    assert!(env.kb().join(".git/rkb-home/.local/state/rkb").is_dir(), "state lives in .git/rkb-home");
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "", "the knowledge base stays clean");
+}
+
+#[test]
+fn doctor_reports_server_state() {
+    let env = search_kb();
+    let doctor = |lock: &str| {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        std::fs::write(env.kb().join(".git/rkb.lock"), lock).unwrap();
+        c.args(["doctor", "--format", "json"]).env("RKB_OFFLINE", "1");
+        let o = c.output().unwrap();
+        serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap()
+    };
+    let find = |v: &serde_json::Value, name: &str| {
+        v["checks"].as_array().unwrap().iter().find(|c| c["check"] == name).cloned().unwrap_or_else(|| panic!("{name} missing: {v}"))
+    };
+
+    let v = doctor("other 4242 0");
+    assert!(find(&v, "offline")["detail"].as_str().unwrap().contains("on"), "{v}");
+    let files = find(&v, "model files");
+    assert!(files["detail"].as_str().unwrap().starts_with("0 present, 3 missing"), "{v}");
+    assert!(files["fix"].as_str().unwrap().contains("rkb models path"), "{v}");
+    let lock = find(&v, "write lock")["detail"].as_str().unwrap().to_string();
+    assert!(lock.contains("pid 4242") && lock.contains("other"), "names the pid and the host: {lock}");
+
+    let v = doctor("4242 0");
+    let lock = find(&v, "write lock")["detail"].as_str().unwrap().to_string();
+    assert!(lock.contains("pid 4242") && lock.contains("old lock"), "an old lock file still names the holder: {lock}");
+
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.args(["doctor", "--format", "human"]).env("RKB_OFFLINE", "1");
+    let human = stdout(&c.output().unwrap());
+    assert!(human.contains("offline") && human.contains("pid 4242"), "{human}");
+}
+
+const MODEL_SHAS: [&str; 3] = [
+    "69f22ccd1ee0971b6173678c4fcadd29a49a3f5b6b8a6927002418abe4bd5b9c",
+    "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30",
+    "dea4708ed1a6df7306b483037750464a96e77ccb0c7e88f4f61a0116944a71dd",
+];
+
+/// A local HTTP server that only counts connections, so a test proves an offline run connects nowhere.
+fn counting_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = count.clone();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        }
+    });
+    (url, count)
+}
+
+#[test]
+fn offline_never_downloads_the_model() {
+    let env = search_kb();
+    set_chain(&env, "chain = [\"bm25-bert\", \"bm25\"]");
+    let (url, hits) = counting_server();
+    let model_dir = env.dir.path().join("data/rkb/models/modernbert-embed-base");
+    let plain = env.json(&["search", "git rebase"], "").0;
+    let run = |vars: &[(&str, &str)], args: &[&str]| {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.args(args).env("RKB_MODELS_URL", &url);
+        for (k, v) in vars {
+            c.env(k, v);
+        }
+        c.stdin(std::process::Stdio::null()).output().unwrap()
+    };
+
+    let offline_search = |var: &str| {
+        let o = run(&[(var, "1")], &["search", "git rebase", "--format", "json"]);
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        assert_eq!(o.status.code(), Some(0), "{v}");
+        let by = v["ranked_by"].as_str().unwrap();
+        assert!(by.starts_with("bm25 (bm25-bert: offline mode is on"), "{v}");
+        assert!(by.contains(&model_dir.display().to_string()), "names the folder: {v}");
+        for sha in MODEL_SHAS {
+            assert!(by.contains(sha), "names each sha: {v}");
+        }
+        assert!(by.contains("copy them from a machine that has them") && by.contains("rkb models path"), "{v}");
+        assert_eq!(ids(&v), ids(&plain), "BM25 results stay: {v}");
+    };
+    offline_search("RKB_OFFLINE");
+    offline_search("HF_HUB_OFFLINE");
+
+    let o = run(&[("RKB_OFFLINE", "1")], &["search", "git rebase", "--format", "json", "--no-model"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!((v["ranked_by"].as_str(), o.status.code()), (Some("bm25"), Some(0)), "{v}");
+
+    for args in [["models", "warm"], ["models", "fetch"]] {
+        let o = run(&[("RKB_OFFLINE", "1")], &["--format", "json", args[0], args[1]]);
+        assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.starts_with("offline mode is on"), "{v}");
+        assert!(msg.contains(&model_dir.display().to_string()) && msg.contains("copy them from a machine that has them"), "{v}");
+    }
+
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "offline made a network request");
+    assert!(!model_dir.exists(), "offline created the model folder");
+}
+
+#[test]
+fn models_path_prints_the_folder_and_the_files() {
+    let env = Env::new();
+    let dir = env.dir.path().join("data/rkb/models/modernbert-embed-base");
+    let o = env.rkb(&["models", "path", "--format", "human"]);
+    assert!(o.status.success(), "{}", stdout(&o));
+    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), dir.display().to_string());
+
+    let (v, code) = env.json(&["models", "path"], "");
+    assert_eq!(code, Some(0));
+    assert_eq!(v["path"].as_str().unwrap(), dir.display().to_string());
+    let files = v["files"].as_array().unwrap();
+    for (i, name) in ["model.safetensors", "tokenizer.json", "config.json"].into_iter().enumerate() {
+        assert_eq!((files[i]["name"].as_str(), files[i]["sha256"].as_str()), (Some(name), Some(MODEL_SHAS[i])), "{v}");
+        assert_eq!(files[i]["present"], serde_json::json!(false), "{v}");
+    }
+    assert_eq!(env.rkb(&["models", "path", "--toon"]).status.code(), Some(0));
+}
+
 fn graph_kb() -> Env {
     let env = Env::new();
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");

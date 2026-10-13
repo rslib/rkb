@@ -18,13 +18,43 @@ pub const FILES: [File; 3] = [
     ("config.json", "dea4708ed1a6df7306b483037750464a96e77ccb0c7e88f4f61a0116944a71dd", 1_261),
 ];
 
+/// The same rule as `rkb_core::paths::home_base`: `$HOME`, else `.git/rkb-home` in the `RKB_HOME` knowledge base.
+fn home_base() -> PathBuf {
+    let set = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
+    match set("HOME") {
+        Some(h) => PathBuf::from(h),
+        None => set("RKB_TEST_HOME").or_else(|| set("RKB_HOME")).map(|kb| PathBuf::from(kb).join(".git/rkb-home")).unwrap_or_default(),
+    }
+}
+
 /// `$XDG_DATA_HOME/rkb/models/modernbert-embed-base`, or `~/.local/share/rkb/models/modernbert-embed-base`.
 pub fn default_dir() -> PathBuf {
     let base = match std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
         Some(v) => PathBuf::from(v),
-        None => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"),
+        None => home_base().join(".local/share"),
     };
     base.join("rkb/models/modernbert-embed-base")
+}
+
+/// Whether this process must make no network request: `RKB_OFFLINE=1` or `HF_HUB_OFFLINE=1`.
+pub fn offline() -> bool {
+    ["RKB_OFFLINE", "HF_HUB_OFFLINE"].iter().any(|k| std::env::var(k).as_deref() == Ok("1"))
+}
+
+/// The offline refusal for a missing model: the folder to fill, each file with its pinned SHA-256,
+/// and the fix. One text for `models fetch`, `models warm` and a search that needs the model.
+pub fn offline_error(dir: &Path) -> String {
+    let list = FILES.iter().map(|(name, sha, _)| format!("{name} (sha256 {sha})")).collect::<Vec<_>>().join("; ");
+    format!(
+        "offline mode is on, so the model files are not downloaded; fill {}: {}; copy them from a machine that has them, or run `rkb models fetch` there; `rkb models path` prints the folder",
+        dir.display(),
+        list
+    )
+}
+
+/// Whether one pinned file is present and matches its hash, without hashing an unchanged file.
+pub fn is_present(dir: &Path, name: &str, sha: &str, size: u64) -> bool {
+    verified(dir, name, sha, size).unwrap_or(false)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -79,9 +109,15 @@ pub fn check(dir: &Path) -> Result<()> {
 fn check_files(dir: &Path, files: &[File]) -> Result<()> {
     for &(name, sha, size) in files {
         if !dir.join(name).is_file() {
+            if offline() {
+                bail!("{}", offline_error(dir));
+            }
             bail!("not configured: {name} is missing; run `rkb models fetch`");
         }
         if !verified(dir, name, sha, size)? {
+            if offline() {
+                bail!("{}", offline_error(dir));
+            }
             bail!("model files do not match ({name}); run `rkb models fetch`");
         }
     }
@@ -115,6 +151,9 @@ fn agent() -> &'static ureq::Agent {
 
 fn fetch_files(dir: &Path, base: &str, files: &[File]) -> Result<Fetched> {
     let mut out = Fetched::default();
+    if offline() {
+        bail!("{}", offline_error(dir));
+    }
     std::fs::create_dir_all(dir)?;
     for &(name, sha, size) in files {
         if verified(dir, name, sha, size)? {

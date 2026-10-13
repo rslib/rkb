@@ -177,6 +177,30 @@ pub fn open() -> Result<Box<dyn Reranker>, String> {
     Ok(Box::new(Bert { embedder, cache: cache_path(), warm: spawn_warm }))
 }
 
+/// `rkb doctor`: the server lines. Offline mode, and the model files present whatever the chain is.
+pub fn server_checks() -> Vec<Check> {
+    let dir = files::default_dir();
+    let present = files::FILES.iter().filter(|(n, s, sz)| files::is_present(&dir, n, s, *sz)).count();
+    let missing = files::FILES.len() - present;
+    let mut out = vec![Check {
+        name: "offline",
+        level: Level::Ok,
+        detail: if files::offline() { "on: no model download runs; copy the model files in".into() } else { "off".into() },
+        fix: None,
+    }];
+    out.push(if missing == 0 {
+        Check { name: "model files", level: Level::Ok, detail: format!("{present} present, 0 missing"), fix: None }
+    } else {
+        Check {
+            name: "model files",
+            level: Level::Warn,
+            detail: format!("{present} present, {missing} missing in {}", dir.display()),
+            fix: Some("copy them from a machine that has them; `rkb models path` prints the folder".into()),
+        }
+    });
+    out
+}
+
 /// `rkb doctor`: the model files and the cache of lesson vectors.
 pub fn checks(root: &Path) -> Vec<Check> {
     let check = |level, detail: String, fix: Option<&str>| vec![Check { name: NAME, level, detail, fix: fix.map(String::from) }];
@@ -201,7 +225,37 @@ fn io_error(what: &str, e: impl std::fmt::Display, fix: &str) -> CliError {
     CliError::new(ErrorCode::Io, format!("{what}: {e}"), fix)
 }
 
+fn offline_refusal(when_model_missing: bool) -> Option<CliError> {
+    let dir = files::default_dir();
+    if !files::offline() || (when_model_missing && files::check(&dir).is_ok()) {
+        return None;
+    }
+    Some(CliError::new(
+        ErrorCode::Refused,
+        files::offline_error(&dir),
+        "copy the model files in from a machine that has them; `rkb models path` prints the folder",
+    ))
+}
+
+/// `rkb models path`: the folder alone for a person, and each file with its pinned hash for an agent.
+pub fn models_path() -> Result<Output, CliError> {
+    let dir = files::default_dir();
+    let entries: Vec<serde_json::Value> = files::FILES
+        .iter()
+        .map(|(name, sha, size)| json!({ "name": name, "sha256": sha, "present": files::is_present(&dir, name, sha, *size) }))
+        .collect();
+    Ok(Output {
+        data: json!({ "path": dir.display().to_string(), "files": entries }),
+        human: dir.display().to_string(),
+        exit: 0,
+        raw: false,
+    })
+}
+
 pub fn models_fetch(colored: bool) -> Result<Output, CliError> {
+    if let Some(e) = offline_refusal(false) {
+        return Err(e);
+    }
     let dir = files::default_dir();
     let base = std::env::var("RKB_MODELS_URL").unwrap_or_else(|_| "https://huggingface.co".into());
     let f = files::fetch(&dir, &base).map_err(|e| {
@@ -237,6 +291,9 @@ pub fn models_warm(root: &Path) -> Result<Output, CliError> {
 }
 
 fn warm(root: &Path) -> Result<Output, CliError> {
+    if let Some(e) = offline_refusal(true) {
+        return Err(e);
+    }
     let start = Instant::now();
     let embedder = Embedder::open(&files::default_dir(), std::env::var("RKB_EMBED_DEVICE").is_ok_and(|v| v == "cpu"))
         .map_err(|e| io_error("the model did not load", format!("{e:#}"), "run `rkb models fetch`"))?;

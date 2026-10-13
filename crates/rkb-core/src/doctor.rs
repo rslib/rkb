@@ -320,12 +320,15 @@ fn kb_checks(root: &Path, place: &Place, state_dir: &Path, env: &LintEnv, out: &
 
     if let Some(lock) = lock_path(root) {
         out.push(match std::fs::read_to_string(&lock) {
-            Ok(holder) => check(
-                "write lock",
-                Level::Warn,
-                format!("held by {}", holder.trim()),
-                Some("if no rkb command is running, run `rkb doctor --break-lock`".into()),
-            ),
+            Ok(holder) => {
+                let parts: Vec<&str> = holder.split_whitespace().collect();
+                let detail = match parts.as_slice() {
+                    [host, pid, _] => format!("held by pid {pid} on host {host}"),
+                    [pid, _] => format!("held by pid {pid}; an old lock file without a host"),
+                    _ => format!("held by {}", holder.trim()),
+                };
+                check("write lock", Level::Warn, detail, Some("if no rkb command is running, run `rkb doctor --break-lock`".into()))
+            }
             Err(_) => check("write lock", Level::Ok, "free", None),
         });
     }

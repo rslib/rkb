@@ -478,8 +478,8 @@ enum Cmd {
         #[command(subcommand)]
         action: JobCmd,
     },
-    /// Download the local rerank model, or embed the lessons ahead of searches.
-    #[command(after_help = "Example:\n  rkb models fetch\n  rkb models warm")]
+    /// Download the local rerank model, embed the lessons ahead of searches, or print the model folder.
+    #[command(after_help = "Example:\n  rkb models fetch\n  rkb models warm\n  rkb models path")]
     Models {
         #[command(subcommand)]
         action: ModelsCmd,
@@ -596,6 +596,8 @@ enum ModelsCmd {
     Fetch,
     /// Embed every active lesson into the cache, so a search embeds only its query. Needs no network.
     Warm,
+    /// Print the model folder, and each file with its SHA-256 and whether it is present.
+    Path,
 }
 
 /// Turns a clap error into rkb's error record on stdout, so an agent can correct the call in one step.
@@ -667,6 +669,21 @@ fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => return parse_error(&args, e),
     };
+    // Before mcp, tool and hook too: each of them writes state.
+    if kb::no_home() {
+        let e = CliError::new(
+            output::ErrorCode::Refused,
+            "no home folder: neither RKB_HOME nor HOME is set, so rkb has nowhere to keep the knowledge base and its state",
+            "set RKB_HOME to the knowledge base folder, or set HOME",
+        );
+        // An MCP client reads only JSON-RPC on stdout, and a harness puts hook stdout into the prompt.
+        if matches!(cli.cmd, Some(Cmd::Mcp { .. } | Cmd::Hook { .. })) {
+            eprintln!("error: {}\nhelp: {}", e.message, e.fix);
+        } else {
+            output::print_error(if cli.toon { Format::Toon } else { cli.format.unwrap_or(Format::Human) }, &e);
+        }
+        return ExitCode::from(1);
+    }
     if let Some(Cmd::Mcp { tools }) = &cli.cmd {
         mcp::serve(tools);
         return ExitCode::SUCCESS;
@@ -951,6 +968,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             kb::open(&root)?;
             models_warm(&root)
         }
+        Cmd::Models { action: ModelsCmd::Path } => models_path(),
         Cmd::Publish { dir, check, no_ask } => {
             if check {
                 site::check(&env, &dir)
@@ -1114,6 +1132,16 @@ fn models_fetch(colored: bool) -> Result<Output, CliError> {
 #[cfg(feature = "bert")]
 fn models_warm(root: &std::path::Path) -> Result<Output, CliError> {
     embedding::models_warm(root)
+}
+
+#[cfg(feature = "bert")]
+fn models_path() -> Result<Output, CliError> {
+    embedding::models_path()
+}
+
+#[cfg(not(feature = "bert"))]
+fn models_path() -> Result<Output, CliError> {
+    models_fetch(false)
 }
 
 #[cfg(not(feature = "bert"))]

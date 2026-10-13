@@ -45,6 +45,8 @@ fn alive(pid: u32) -> bool {
 
 /// A lock is stale when its process on this host is gone or it is older than `stale_s`.
 /// An unreadable lock (a writer died between create and write) is judged by its file age.
+/// `pid time` is the old format from before the host was written: only its age clears it, because
+/// the pid belongs to a machine this one cannot ask about.
 fn is_stale(path: &Path, stale_s: u64) -> bool {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let parts: Vec<&str> = text.split_whitespace().collect();
@@ -53,6 +55,10 @@ fn is_stale(path: &Path, stale_s: u64) -> bool {
             let (Ok(pid), Ok(time)) = (pid.parse::<u32>(), time.parse::<u64>()) else { return false };
             (*host == hostname() && !alive(pid)) || now().saturating_sub(time) > stale_s
         }
+        [_, time] => match time.parse::<u64>() {
+            Ok(time) => now().saturating_sub(time) > stale_s,
+            Err(_) => false,
+        },
         _ => std::fs::metadata(path)
             .and_then(|m| m.modified())
             .ok()
@@ -137,6 +143,16 @@ mod tests {
         drop(acquire(&p, 600, Duration::from_millis(200)).unwrap());
         std::fs::write(&p, format!("otherhost 1 {}", now())).unwrap();
         assert!(acquire(&p, 600, Duration::from_millis(200)).is_err());
+    }
+
+    #[test]
+    fn an_old_lock_without_a_host_clears_only_by_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("l.lock");
+        std::fs::write(&p, format!("999 {}", now() - 3600)).unwrap();
+        drop(acquire(&p, 600, Duration::from_millis(200)).unwrap());
+        std::fs::write(&p, format!("999 {}", now())).unwrap();
+        assert!(acquire(&p, 600, Duration::from_millis(200)).is_err(), "a fresh old-format lock holds");
     }
 
     #[test]

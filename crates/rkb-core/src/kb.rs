@@ -23,6 +23,14 @@ pub fn home() -> PathBuf {
     }
 }
 
+/// Whether neither `RKB_HOME` nor `HOME` is set. Then the knowledge base path is relative, so rkb stops
+/// before it creates any file or folder, rather than write into the working directory. XDG variables
+/// alone do not help, since they place the state but not the knowledge base.
+pub fn no_home() -> bool {
+    let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    !["RKB_TEST_HOME", "RKB_HOME", "HOME"].iter().any(|k| set(k))
+}
+
 /// Fails with `NotAKb` unless `root` has `kb.toml` and a git repository.
 pub fn open(root: &Path) -> Result<()> {
     if root.join("kb.toml").is_file() && root.join(".git").exists() { Ok(()) } else { Err(Error::NotAKb(root.to_path_buf())) }
