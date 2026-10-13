@@ -98,6 +98,7 @@ pub fn run(root: &Path, place: &Place, state_dir: &Path, config_dir: &Path, env:
     }
     out.push(trust_check(config_dir));
     out.push(agent_sink_check(root, config_dir));
+    out.push(extra_kbs_check(root, config_dir));
     out.push(observer_check(config_dir, state_dir));
     out.extend(triage_check(state_dir));
     out.extend(recall_check(root, state_dir));
@@ -486,6 +487,28 @@ pub fn agent_sink_check(root: &Path, config_dir: &Path) -> Check {
                 _ => "kb.toml",
             };
             check("agent sink", Level::Ok, format!("agents may read {allow} (from {from})"), None)
+        }
+    }
+}
+
+/// The extra read-only knowledge bases of the machine config: what a search reads, and what it had
+/// to skip. A skipped folder is a warning, so a share that is down does not go unnoticed.
+pub fn extra_kbs_check(root: &Path, config_dir: &Path) -> Check {
+    match kb::Roots::load(root, config_dir) {
+        Err(e) => {
+            check("extra knowledge bases", Level::Fail, e.to_string(), Some("fix the [[extra]] tables in the machine config.toml".into()))
+        }
+        Ok(roots) => {
+            let reading: Vec<String> = roots.extras.iter().map(|e| e.name.clone()).collect();
+            let skipped: Vec<String> = roots.skipped.iter().map(|(name, why)| format!("{name} ({why})")).collect();
+            let detail = match (reading.is_empty(), skipped.is_empty()) {
+                (true, true) => "none are configured".to_string(),
+                (false, true) => format!("reading {}", reading.join(", ")),
+                (true, false) => format!("skipped: {}", skipped.join("; ")),
+                (false, false) => format!("reading {}; skipped: {}", reading.join(", "), skipped.join("; ")),
+            };
+            let fix = (!skipped.is_empty()).then(|| "check the path in its [[extra]] table, or remove that table".to_string());
+            check("extra knowledge bases", if skipped.is_empty() { Level::Ok } else { Level::Warn }, detail, fix)
         }
     }
 }

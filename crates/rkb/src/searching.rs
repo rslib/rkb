@@ -68,10 +68,11 @@ pub fn rerank_hits(
 
 pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options, only: Option<&str>) -> Result<Output, CliError> {
     let place = env.place.clone().unwrap_or_default();
+    let roots = rkb_core::kb::Roots::load(&env.root, &rkb_core::paths::config_dir())?;
     let ranked = matches!(mode, Mode::Ranked(_));
     let top = if ranked { Settings::load(&env.root).top } else { 0 };
     let limit = opts.limit;
-    let mut r = search::search(&env.root, &place, facts, &mode, &Options { limit: limit.max(top), ..opts })?;
+    let mut r = search::search_with(&env.root, &roots.extras, &place, facts, &mode, &Options { limit: limit.max(top), ..opts })?;
     let ranking = match &mode {
         Mode::Ranked(q) => Some(rerank_hits(env, q, &mut r, limit, only, None)?),
         _ => None,
@@ -148,6 +149,9 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options, only: Option<
                 "injected": u.injected,
                 "irrelevant": u.irrelevant,
             });
+            if let Some(kb) = &h.kb {
+                row["kb"] = json!(kb);
+            }
             if let Some(rel) = h.relevance {
                 row["relevance"] = json!(crate::output::score2(rel));
             }
@@ -174,7 +178,11 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options, only: Option<
         ]
     } else {
         vec!["Run `rkb show <id>` to read a lesson; check `applies` before you act on it".into()]
-    };
+    }
+    .into_iter()
+    // One line per extra knowledge base the search had to skip, so a down share is visible.
+    .chain(roots.skipped.iter().map(|(name, why)| format!("the extra knowledge base `{name}` was skipped: {why}; run `rkb doctor`")))
+    .collect();
     data["help"] = json!(help);
     Ok(Output { data, human, exit: 0, raw: false })
 }

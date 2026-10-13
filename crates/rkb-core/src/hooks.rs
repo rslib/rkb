@@ -991,6 +991,8 @@ mod tests {
         let state = dir.path();
         let hit = |id: &str| crate::search::Hit {
             id: id.into(),
+            kb: None,
+            root: std::path::PathBuf::new(),
             kind: crate::lesson::LessonType::Fact,
             title: "t".into(),
             path: "general/a.md".into(),
@@ -1016,6 +1018,8 @@ mod tests {
     fn only_proven_pushes_and_one_explore_candidate() {
         let hit = |tier| crate::search::Hit {
             id: "a".into(),
+            kb: None,
+            root: std::path::PathBuf::new(),
             kind: crate::lesson::LessonType::Fact,
             title: "t".into(),
             path: "general/a.md".into(),

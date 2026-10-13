@@ -109,8 +109,33 @@ pub fn env_session() -> Option<String> {
     ["CLAUDE_CODE_SESSION_ID", "PI_SESSION_ID", "RKB_SESSION"].iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }
 
+/// The agent named by `RKB_AGENT`, or `None` when it is unset or empty. A value that is not 1 to 32
+/// characters from `a-z`, `0-9`, `_` and `-` is ignored with one warning on stderr, so a value with
+/// a newline can never reach a git trailer line.
+pub fn agent() -> Option<String> {
+    let value = std::env::var("RKB_AGENT").ok().filter(|v| !v.is_empty())?;
+    if valid_agent(&value) {
+        return Some(value);
+    }
+    warn_bad_agent_once();
+    None
+}
+
+fn valid_agent(value: &str) -> bool {
+    (1..=32).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+fn warn_bad_agent_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("warning: RKB_AGENT is not 1 to 32 characters from a-z, 0-9, _ and -; it is ignored");
+    }
+}
+
 /// Appends one record to this machine's file. The first append moves the records of the per-machine
-/// state files an earlier rkb wrote into it.
+/// state files an earlier rkb wrote into it. A record carries `agent` as an extra field when
+/// `RKB_AGENT` names one, so every machine can tell which agent used a lesson.
 pub fn record(root: &Path, config: &Path, state: &Path, r: &Record) -> Result<()> {
     let path = file(root, config);
     let ignore = root.join(".rkb/.gitignore");
@@ -119,7 +144,11 @@ pub fn record(root: &Path, config: &Path, state: &Path, r: &Record) -> Result<()
         std::fs::write(&ignore, "*.lock\n").map_err(crate::error::io(&ignore))?;
     }
     migrate(state, &path)?;
-    lock::append_line(&path, &serde_json::to_string(r).expect("record serializes"))
+    let mut value = serde_json::to_value(r).expect("record serializes");
+    if let (Some(agent), Some(map)) = (agent(), value.as_object_mut()) {
+        map.insert("agent".into(), serde_json::Value::String(agent));
+    }
+    lock::append_line(&path, &serde_json::to_string(&value).expect("record serializes"))
 }
 
 fn migrate(state: &Path, to: &Path) -> Result<()> {

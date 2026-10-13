@@ -35,6 +35,28 @@ fn stdin_is_terminal() -> bool {
     std::io::stdin().is_terminal()
 }
 
+/// The extra knowledge base a `name:` prefix names, or `None` for a main id.
+fn extra_of(id: &str) -> Result<Option<String>, CliError> {
+    let extras = rkb_core::config::extras(&paths::config_dir())
+        .map_err(|reason| CliError::new(ErrorCode::Refused, reason, "fix the [[extra]] tables in the machine config.toml"))?;
+    Ok(id.split_once(':').and_then(|(name, _)| extras.iter().any(|e| e.name == name).then(|| name.to_string())))
+}
+
+/// Refuses a write to a lesson in an extra read-only knowledge base, before any lock, file write or
+/// git call. An id whose prefix no extra uses is left to the normal not-found path.
+pub(crate) fn guard_writable(root: &std::path::Path, id: &str) -> Result<(), CliError> {
+    let Some(name) = extra_of(id)? else { return Ok(()) };
+    let plain = rkb_core::kb::unqualified(id);
+    Err(CliError::new(
+        ErrorCode::Refused,
+        format!("{id} is in the extra knowledge base `{name}`, which is read-only"),
+        format!(
+            "the main knowledge base at {} is the only writable one; write the lesson there, for example `rkb edit {plain}`",
+            root.display()
+        ),
+    ))
+}
+
 fn read_stdin() -> Result<String, CliError> {
     let mut text = String::new();
     std::io::stdin()
@@ -239,6 +261,7 @@ fn absolute(assets: Vec<String>) -> Vec<String> {
 
 pub fn edit(env: &Env, id: String, base: Option<String>, assets: Vec<String>, given: Option<String>) -> Result<Output, CliError> {
     kb::open(&env.root)?;
+    guard_writable(&env.root, &id)?;
     let (text, base) = if let Some(text) = given {
         let base = base.ok_or_else(|| usage_error("rkb_edit needs `base`", &format!("run rkb_show {id} and pass its hash as base")))?;
         (text, base)
@@ -261,6 +284,7 @@ pub fn edit(env: &Env, id: String, base: Option<String>, assets: Vec<String>, gi
 
 pub fn flag(env: &Env, id: String, reason: String) -> Result<Output, CliError> {
     kb::open(&env.root)?;
+    guard_writable(&env.root, &id)?;
     let o = write::apply(&env.ctx(), &Action::Flag { id, reason }, &[])?;
     outcome(env, o)
 }
@@ -303,6 +327,14 @@ pub fn label(env: &Env, folder: String, assignment: Option<String>, unset: bool)
 
 pub fn lifecycle(env: &Env, action: Action) -> Result<Output, CliError> {
     kb::open(&env.root)?;
+    let target = match &action {
+        Action::Supersede { id, .. } | Action::Move { id, .. } | Action::Rename { id, .. } | Action::Unarchive { id } => Some(id),
+        Action::Archive { target, .. } => Some(target),
+        _ => None,
+    };
+    if let Some(id) = target {
+        guard_writable(&env.root, id)?;
+    }
     let restored = match &action {
         Action::Unarchive { id } => Some(id.clone()),
         _ => None,
@@ -318,7 +350,16 @@ pub fn lifecycle(env: &Env, action: Action) -> Result<Output, CliError> {
 /// `result` is `worked`, `failed` (also flags) or `irrelevant`.
 pub fn used(env: &Env, id: String, result: &str, reason: Option<String>, session: Option<String>) -> Result<Output, CliError> {
     kb::open(&env.root)?;
-    kb::find(&env.root, &id)?;
+    // The main usage file records a use of an extra lesson too, under its prefixed id. An extra
+    // lesson is never flagged, archived or edited, so a failed report and a demote are refused.
+    let extra = extra_of(&id)?.is_some();
+    if result == "failed" {
+        guard_writable(&env.root, &id)?;
+    } else if extra {
+        kb::Roots::load(&env.root, &paths::config_dir())?.find(&id)?;
+    } else {
+        kb::find(&env.root, &id)?;
+    }
     let failed = result == "failed";
     if failed && reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
         return Err(usage_error("a failed use needs a reason", &format!("used {id} --failed --reason \"what went wrong\"")));
@@ -330,6 +371,7 @@ pub fn used(env: &Env, id: String, result: &str, reason: Option<String>, session
     let mut human = format!("Recorded: {id} {result}");
     // The report is already recorded, so a failed query edit only adds a note.
     if result == "worked"
+        && !extra
         && let Err(e) = learn_query(env, &id, session.as_deref(), &mut data, &mut human)
     {
         human.push_str(&format!("\nnote: the failure query was not added: {}", e.message));
@@ -342,7 +384,7 @@ pub fn used(env: &Env, id: String, result: &str, reason: Option<String>, session
         data["flag"] = flagged.data;
     }
     // The demote rule: bad signals move a lesson to archive, never age alone.
-    if let Some(reason) = demote_reason(env, &id)? {
+    if !extra && let Some(reason) = demote_reason(env, &id)? {
         let archived = outcome(env, write::apply(&env.ctx(), &Action::Archive { target: id.clone(), reason }, &[])?)?;
         if archived.exit == 3 {
             // The archive waits for the user; the question must reach the caller with exit 3.

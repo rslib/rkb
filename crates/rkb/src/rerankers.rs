@@ -378,7 +378,14 @@ const JEV: &str = "jev";
 fn jev_allowed(root: &Path, query: &str, hits: &[Hit], items: &[String]) -> Result<Vec<bool>, String> {
     let kb: KbConfig = std::fs::read_to_string(root.join("kb.toml")).ok().and_then(|t| config::parse(&t).ok()).unwrap_or_default();
     let Some(sink) = kb.sinks.get(JEV) else { return Err("kb.toml has no [sinks.jev]".into()) };
-    let Ok(snap) = Snapshot::from_dir(root) else { return Err("the lessons' labels could not be read".into()) };
+    // One snapshot per knowledge base a candidate lives in, so an extra lesson takes its own labels.
+    let mut snapshots: std::collections::HashMap<&Path, Snapshot> = std::collections::HashMap::new();
+    for h in hits {
+        if !snapshots.contains_key(h.root.as_path()) {
+            let Ok(snap) = Snapshot::from_dir(&h.root) else { return Err("the lessons' labels could not be read".into()) };
+            snapshots.insert(h.root.as_path(), snap);
+        }
+    }
     let env = rkb_core::lint::LintEnv::from_process();
     let scanner = LeakScanner::new(&kb.leak, env.user.as_deref(), env.home.as_deref());
     if !scanner.scan(query).is_empty() {
@@ -387,7 +394,10 @@ fn jev_allowed(root: &Path, query: &str, hits: &[Hit], items: &[String]) -> Resu
     let allowed: Vec<bool> = hits
         .iter()
         .zip(items)
-        .map(|(h, t)| config::sink_allows(&sink.allow, &rkb_core::write::effective_at(&snap, &h.path)) && scanner.scan(t).is_empty())
+        .map(|(h, t)| {
+            config::sink_allows(&sink.allow, &rkb_core::write::effective_at(&snapshots[h.root.as_path()], &h.path))
+                && scanner.scan(t).is_empty()
+        })
         .collect();
     if !allowed.contains(&true) && !hits.is_empty() {
         return Err("no candidate is allowed by sinks.jev or passes the leak scan".into());

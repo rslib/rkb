@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::config;
 use crate::error::{Error, Result, io};
 use crate::git;
 use crate::lesson::{self, Lesson, ParseError};
@@ -173,6 +174,85 @@ impl Snapshot {
         }
         (ok, bad)
     }
+}
+
+/// The main knowledge base plus the extra read-only ones of the machine config.
+#[derive(Debug, Clone)]
+pub struct Roots {
+    pub main: PathBuf,
+    /// The extras whose folder is a readable knowledge base, in config order.
+    pub extras: Vec<config::Extra>,
+    /// One `(name, reason)` per configured extra that could not be read.
+    pub skipped: Vec<(String, String)>,
+}
+
+impl Roots {
+    /// Reads the machine config. A bad `[[extra]]` entry is an error with a fix; a missing or
+    /// unreadable folder is skipped, because one broken share must not stop a search.
+    pub fn load(main: &Path, config_dir: &Path) -> Result<Roots> {
+        let fix = "fix the [[extra]] tables in the machine config.toml: each needs a unique name of 1 to 32 characters from a-z, 0-9 and - that is not `main`, and an absolute path";
+        let configured = config::extras(config_dir).map_err(|reason| Error::NotReady { reason, fix: fix.to_string() })?;
+        let mut extras = vec![];
+        let mut skipped = vec![];
+        for extra in configured {
+            match std::fs::read_dir(&extra.path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    skipped.push((extra.name.clone(), format!("{} does not exist", extra.path.display())))
+                }
+                Err(e) => skipped.push((extra.name.clone(), format!("{} cannot be read: {e}", extra.path.display()))),
+                Ok(_) if !extra.path.join("kb.toml").is_file() => {
+                    skipped.push((extra.name.clone(), format!("{} has no kb.toml", extra.path.display())))
+                }
+                // A snapshot reads the git index, so a folder that is not a clone would fail every search.
+                Ok(_) if !extra.path.join(".git").exists() => {
+                    skipped.push((extra.name.clone(), format!("{} is not a git clone", extra.path.display())))
+                }
+                Ok(_) => extras.push(extra),
+            }
+        }
+        Ok(Roots { main: main.to_path_buf(), extras, skipped })
+    }
+
+    /// The root of the knowledge base `kb` names, or the main one.
+    pub fn root_of(&self, kb: Option<&str>) -> &Path {
+        kb.and_then(|name| self.extras.iter().find(|e| e.name == name)).map_or(&self.main, |e| e.path.as_path())
+    }
+
+    /// The lesson `id` names, in the main or an extra knowledge base, with the name of that base.
+    pub fn find(&self, id: &str) -> Result<(Option<String>, Lesson, String)> {
+        let (kb, plain) = split_id(id, &self.extras);
+        let (lesson, text) = find(self.root_of(kb.as_deref()), plain)?;
+        Ok((kb, lesson, text))
+    }
+
+    /// A snapshot of every readable knowledge base, main first.
+    pub fn snapshots(&self) -> Result<Vec<(Option<String>, Snapshot)>> {
+        let mut out = vec![(None, Snapshot::from_dir(&self.main)?)];
+        for extra in &self.extras {
+            out.push((Some(extra.name.clone()), Snapshot::from_dir(&extra.path)?));
+        }
+        Ok(out)
+    }
+}
+
+/// The `name` of an extra id such as `shared:2b81d05e77`, and the id without it. `None` and the
+/// whole id for a main id, or for a prefix no extra uses.
+pub fn split_id<'a>(id: &'a str, extras: &[config::Extra]) -> (Option<String>, &'a str) {
+    match id.split_once(':') {
+        Some((name, rest)) if extras.iter().any(|e| e.name == name) => (Some(name.to_string()), rest),
+        _ => (None, id),
+    }
+}
+
+/// `id` without an extra prefix, for looking a lesson up in its own knowledge base.
+pub fn unqualified(id: &str) -> &str {
+    id.split_once(':').map_or(id, |(_, rest)| rest)
+}
+
+/// The effective labels of the lesson at `path` in the knowledge base `kb`, from the snapshot of
+/// that same knowledge base, so a folder note of one base never labels a lesson of another.
+pub fn labels(snapshots: &[(Option<String>, Snapshot)], kb: Option<&str>, path: &str) -> std::collections::BTreeMap<String, String> {
+    snapshots.iter().find(|(name, _)| name.as_deref() == kb).map(|(_, snap)| crate::write::effective_at(snap, path)).unwrap_or_default()
 }
 
 /// The lesson with `id` in the working tree and its full file text.

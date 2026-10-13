@@ -872,6 +872,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Rename { id, slug } => writes::lifecycle(&env, rkb_core::request::Action::Rename { id, slug }),
         Cmd::Approve { id, kind } => {
             kb::open(&root)?;
+            writes::guard_writable(&root, &id)?;
             let o = if id == "observer" {
                 match rkb_core::observer::approve_request(&env.ctx())? {
                     Some(req) => rkb_core::write::Outcome::NeedsUser(req),
@@ -997,8 +998,10 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         }
         Cmd::Show { id, why } => {
             kb::open(&root)?;
-            let (lesson, text) = kb::find(&root, &id)?;
+            let roots = rkb_core::kb::Roots::load(&root, &rkb_core::paths::config_dir())?;
+            let (origin, lesson, text) = roots.find(&id)?;
             let fm = &lesson.frontmatter;
+            let out_id = rkb_core::search::qualified(origin.as_deref(), &fm.id);
             let title = rkb_core::body::scan(&lesson.body).h1.into_iter().next().map(|(_, t)| t).unwrap_or_default();
             let days = jiff::Zoned::now().date().since(fm.verified).map(|s| s.get_days()).unwrap_or(0);
             let age = match days {
@@ -1008,7 +1011,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
                 n => format!("{n} days ago"),
             };
             let hash = rkb_core::write::content_hash(text.as_bytes());
-            let counts = usage::counts(&root).remove(&fm.id).unwrap_or_default();
+            let counts = usage::counts(&root).remove(&out_id).unwrap_or_default();
             let (worked, failed) = (counts.last_worked.clone(), counts.last_failed.clone());
             let uses = format!(
                 "hash {hash}  worked {} (last {})  failed {} (last {})  injected {}  irrelevant {}",
@@ -1034,9 +1037,9 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
                     applies_text.push_str(&format!("\n  {:<8} {:<10} {}", k.result.as_str(), k.key, k.reason));
                 }
             }
-            let g = rkb_core::graph::Graph::load(&root)?;
+            let g = rkb_core::graph::Graph::load(roots.root_of(origin.as_deref()))?;
             let (related, related_text) = match g.find(&fm.id) {
-                Some(i) => graphing::related_of(&g, i, 3, colored),
+                Some(i) => graphing::related_of(&g, i, 3, colored, origin.as_deref()),
                 None => (vec![], String::new()),
             };
             let mut human = format!(
@@ -1057,7 +1060,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
                 source.and_then(|s| s.get(key)).and_then(|v| v.as_str()).filter(|v| !v.is_empty()).unwrap_or("unknown").to_string()
             };
             let mut data = json!({
-                "id": fm.id,
+                "id": out_id,
                 "path": lesson.path,
                 "title": title,
                 "hash": hash,

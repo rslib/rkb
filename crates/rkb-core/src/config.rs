@@ -185,6 +185,52 @@ pub fn machine(config_dir: &std::path::Path) -> Result<(std::path::PathBuf, toml
     }
 }
 
+/// An extra read-only knowledge base from the machine `[[extra]]` tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Extra {
+    pub name: String,
+    pub path: std::path::PathBuf,
+}
+
+/// The `[[extra]]` knowledge bases of the machine `config.toml`, in order. An entry that breaks a
+/// rule is an error naming it, so a typo cannot silently drop a whole knowledge base.
+pub fn extras(config_dir: &std::path::Path) -> Result<Vec<Extra>, String> {
+    let (path, table) = machine(config_dir)?;
+    let Some(value) = table.get("extra") else { return Ok(vec![]) };
+    let list = value.as_array().ok_or_else(|| format!("{}: [[extra]] must be an array of tables", path.display()))?;
+    let mut out: Vec<Extra> = vec![];
+    for (i, entry) in list.iter().enumerate() {
+        let at = format!("{}: [[extra]] entry {}", path.display(), i + 1);
+        let entry = entry.as_table().ok_or_else(|| format!("{at}: it is not a table"))?;
+        for key in entry.keys() {
+            if key != "name" && key != "path" {
+                return Err(format!("{at}: unknown key `{key}`"));
+            }
+        }
+        let name = entry.get("name").and_then(|v| v.as_str()).ok_or_else(|| format!("{at}: it has no name"))?;
+        let at = format!("{at} ({name})");
+        if !valid_extra_name(name) {
+            return Err(format!("{at}: the name must be 1 to 32 characters from `a-z`, `0-9` and `-`"));
+        }
+        if name == "main" {
+            return Err(format!("{at}: `main` belongs to the main knowledge base"));
+        }
+        if out.iter().any(|e| e.name == name) {
+            return Err(format!("{at}: another [[extra]] entry already uses this name"));
+        }
+        let path_value = entry.get("path").and_then(|v| v.as_str()).ok_or_else(|| format!("{at}: it has no path"))?;
+        if !std::path::Path::new(path_value).is_absolute() {
+            return Err(format!("{at}: the path `{path_value}` is not absolute"));
+        }
+        out.push(Extra { name: name.to_string(), path: std::path::PathBuf::from(path_value) });
+    }
+    Ok(out)
+}
+
+fn valid_extra_name(name: &str) -> bool {
+    (1..=32).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// Where the `[sinks.agent]` in force came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentSinkSource {

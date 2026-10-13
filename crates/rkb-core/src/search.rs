@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use serde_norway::Value;
 
 use crate::conditions::{Facts, Verdict, evaluate};
+use crate::config::Extra;
 use crate::error::{Error, Result};
 use crate::kb::{FileKind, Snapshot, classify};
 use crate::lesson::{Lesson, LessonType, Status};
@@ -131,7 +132,12 @@ fn probe_results(root: &Path, place: &Place, lessons: &[&Lesson], mode: ProbeMod
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
+    /// `id` for a main lesson, `<name>:<id>` for one of an extra knowledge base.
     pub id: String,
+    /// The extra knowledge base the lesson came from; `None` for the main one.
+    pub kb: Option<String>,
+    /// The root of the knowledge base the lesson file lives in.
+    pub root: PathBuf,
     pub kind: LessonType,
     pub title: String,
     pub path: String,
@@ -203,10 +209,12 @@ fn title(l: &Lesson) -> String {
     title_and_headings(l).0
 }
 
-fn hit(l: &Lesson, score: f64, line: Option<(usize, String)>) -> Hit {
+fn hit(l: &Lesson, kb: Option<&str>, root: &Path, score: f64, line: Option<(usize, String)>) -> Hit {
     let fm = &l.frontmatter;
     Hit {
-        id: fm.id.clone(),
+        id: qualified(kb, &fm.id),
+        kb: kb.map(String::from),
+        root: root.to_path_buf(),
         kind: fm.kind,
         title: title(l),
         path: l.path.clone(),
@@ -223,12 +231,21 @@ fn hit(l: &Lesson, score: f64, line: Option<(usize, String)>) -> Hit {
     }
 }
 
+/// The id of a lesson as it leaves rkb: `<name>:<id>` for an extra knowledge base, the id alone
+/// otherwise. Every printer and log reads this, so they cannot disagree.
+pub fn qualified(kb: Option<&str>, id: &str) -> String {
+    match kb {
+        Some(name) => format!("{name}:{id}"),
+        None => id.to_string(),
+    }
+}
+
 /// The text a reranker reads for each hit: the title, the type's first section, `Cause`, and `Fix` or `Steps`.
 /// Only these, so a long lesson does not cost more to score.
-pub fn rerank_items(root: &Path, hits: &[Hit]) -> Vec<String> {
+pub fn rerank_items(_root: &Path, hits: &[Hit]) -> Vec<String> {
     hits.iter()
         .map(|h| {
-            let body = std::fs::read_to_string(root.join(&h.path))
+            let body = std::fs::read_to_string(h.root.join(&h.path))
                 .ok()
                 .and_then(|t| crate::lesson::split(&t).ok().map(|(_, b, _)| b.to_string()))
                 .unwrap_or_default();
@@ -244,10 +261,10 @@ pub fn rerank_items(root: &Path, hits: &[Hit]) -> Vec<String> {
 }
 
 /// The example queries of each hit's lesson, in the hits' order.
-pub fn rerank_queries(root: &Path, hits: &[Hit]) -> Vec<Vec<String>> {
+pub fn rerank_queries(_root: &Path, hits: &[Hit]) -> Vec<Vec<String>> {
     hits.iter()
         .map(|h| {
-            let text = std::fs::read_to_string(root.join(&h.path)).unwrap_or_default();
+            let text = std::fs::read_to_string(h.root.join(&h.path)).unwrap_or_default();
             crate::lesson::parse(&h.path, &text).map(|l| l.frontmatter.queries).unwrap_or_default()
         })
         .collect()
@@ -256,7 +273,7 @@ pub fn rerank_queries(root: &Path, hits: &[Hit]) -> Vec<Vec<String>> {
 /// The rerank text and example queries of every active lesson, for filling a model's cache ahead of searches.
 pub fn current_rerank_items(root: &Path) -> Result<(Vec<String>, Vec<Vec<String>>)> {
     let (lessons, _) = Snapshot::from_dir(root)?.lessons();
-    let hits: Vec<Hit> = lessons.iter().filter(|l| l.frontmatter.status.is_current()).map(|l| hit(l, 0.0, None)).collect();
+    let hits: Vec<Hit> = lessons.iter().filter(|l| l.frontmatter.status.is_current()).map(|l| hit(l, None, root, 0.0, None)).collect();
     Ok((rerank_items(root, &hits), rerank_queries(root, &hits)))
 }
 
@@ -335,8 +352,10 @@ fn pieces(query: &str) -> Vec<Vec<String>> {
 }
 
 /// BM25 scores, times the place boost and each lesson's usage factor (0.9–1.1).
+/// `ids` are the lessons' ids as rkb shows them (`<name>:<id>` for an extra), the keys of `usage`.
 fn rank(
     lessons: &[&Lesson],
+    ids: &[String],
     place: &Place,
     query: &str,
     usage: &std::collections::BTreeMap<String, crate::usage::Counts>,
@@ -430,7 +449,7 @@ fn rank(
                     w * idf * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * c.len / avg))
                 })
                 .sum();
-            let used = usage.get(&lessons[d].frontmatter.id).map_or(1.0, crate::usage::Counts::factor);
+            let used = usage.get(&ids[d]).map_or(1.0, crate::usage::Counts::factor);
             (s > 0.0).then(|| (d, s * boost(&lessons[d].path, place) * used))
         })
         .collect();
@@ -448,20 +467,51 @@ fn scope_order(path: &str, place: &Place) -> u8 {
     }
 }
 
-/// Runs a search from `place` with `facts` for the `when` conditions.
+/// Runs a search from `place` with `facts` for the `when` conditions, over the main knowledge base only.
 pub fn search(root: &Path, place: &Place, facts: &Facts, mode: &Mode, opts: &Options) -> Result<Results> {
+    search_with(root, &[], place, facts, mode, opts)
+}
+
+/// Runs one search over the main knowledge base and every extra one, ranked in one BM25 corpus so
+/// the scores compare. An extra lesson keeps the root of its own knowledge base and carries its
+/// `<name>:` id.
+pub fn search_with(root: &Path, extras: &[Extra], place: &Place, facts: &Facts, mode: &Mode, opts: &Options) -> Result<Results> {
     let folders = scope(place, opts.all);
     let in_scope = |p: &str| folders.as_ref().is_none_or(|f| f.iter().any(|x| p.starts_with(x.as_str())));
-    let paths: Vec<String> = crate::kb::paths(root)?.into_iter().filter(|p| classify(p) == FileKind::Lesson && in_scope(p)).collect();
-    let texts: Vec<(&String, String)> = paths.iter().filter_map(|p| std::fs::read_to_string(root.join(p)).ok().map(|t| (p, t))).collect();
-    let loaded: Vec<(Lesson, String)> =
-        parallel(&texts, |(p, text)| crate::lesson::parse(p, text).ok().map(|l| (l, text.clone()))).into_iter().flatten().collect();
-    let raw: HashMap<&str, &str> = loaded.iter().map(|(l, t)| (l.path.as_str(), t.as_str())).collect();
-    let lessons: Vec<&Lesson> = loaded.iter().map(|(l, _)| l).filter(|l| opts.every_status || l.frontmatter.status.is_current()).collect();
+    let mut sources: Vec<(Option<String>, &Path)> = vec![(None, root)];
+    sources.extend(extras.iter().map(|e| (Some(e.name.clone()), e.path.as_path())));
+
+    struct Loaded {
+        lesson: Lesson,
+        text: String,
+        kb: Option<String>,
+        root: PathBuf,
+    }
+    let mut loaded: Vec<Loaded> = vec![];
+    for (kb, src) in &sources {
+        let paths: Vec<String> = crate::kb::paths(src)?.into_iter().filter(|p| classify(p) == FileKind::Lesson && in_scope(p)).collect();
+        let texts: Vec<(&String, String)> =
+            paths.iter().filter_map(|p| std::fs::read_to_string(src.join(p)).ok().map(|t| (p, t))).collect();
+        let parsed: Vec<(Lesson, String)> =
+            parallel(&texts, |(p, text)| crate::lesson::parse(p, text).ok().map(|l| (l, text.clone()))).into_iter().flatten().collect();
+        for (lesson, text) in parsed {
+            loaded.push(Loaded { lesson, text, kb: kb.clone(), root: src.to_path_buf() });
+        }
+    }
+    let current: Vec<usize> =
+        (0..loaded.len()).filter(|&i| opts.every_status || loaded[i].lesson.frontmatter.status.is_current()).collect();
+    let lessons: Vec<&Lesson> = current.iter().map(|&i| &loaded[i].lesson).collect();
+    let ids: Vec<String> = current.iter().map(|&i| qualified(loaded[i].kb.as_deref(), &loaded[i].lesson.frontmatter.id)).collect();
 
     let counts = crate::usage::counts(root);
     let ordered: Vec<Hit> = match mode {
-        Mode::Ranked(q) => rank(&lessons, place, q, &counts).into_iter().map(|(i, s)| hit(lessons[i], s, None)).collect(),
+        Mode::Ranked(q) => rank(&lessons, &ids, place, q, &counts)
+            .into_iter()
+            .map(|(i, s)| {
+                let d = &loaded[current[i]];
+                hit(&d.lesson, d.kb.as_deref(), &d.root, s, None)
+            })
+            .collect(),
         Mode::Literal(_) | Mode::Regex(_) => {
             let re = match mode {
                 Mode::Literal(t) => Regex::new(&regex::escape(t)),
@@ -469,12 +519,12 @@ pub fn search(root: &Path, place: &Place, facts: &Facts, mode: &Mode, opts: &Opt
                 Mode::Ranked(_) => unreachable!(),
             }
             .map_err(|e| Error::BadPattern(e.to_string()))?;
-            let mut found: Vec<Hit> = lessons
+            let mut found: Vec<Hit> = current
                 .iter()
-                .filter_map(|l| {
-                    let text = raw[l.path.as_str()];
-                    let (n, line) = text.lines().enumerate().find(|(_, line)| re.is_match(line))?;
-                    Some(hit(l, 1.0, Some((n + 1, line.trim().to_string()))))
+                .filter_map(|&i| {
+                    let d = &loaded[i];
+                    let (n, line) = d.text.lines().enumerate().find(|(_, line)| re.is_match(line))?;
+                    Some(hit(&d.lesson, d.kb.as_deref(), &d.root, 1.0, Some((n + 1, line.trim().to_string()))))
                 })
                 .collect();
             found.sort_by(|a, b| scope_order(&a.path, place).cmp(&scope_order(&b.path, place)).then(a.title.cmp(&b.title)));
@@ -482,18 +532,23 @@ pub fn search(root: &Path, place: &Place, facts: &Facts, mode: &Mode, opts: &Opt
         }
     };
 
-    let by_id: HashMap<&str, &&Lesson> = lessons.iter().map(|l| (l.frontmatter.id.as_str(), l)).collect();
+    let by_id: HashMap<String, &Loaded> = loaded.iter().map(|d| (qualified(d.kb.as_deref(), &d.lesson.frontmatter.id), d)).collect();
     let evaluated: Vec<(Hit, crate::conditions::Applies)> = ordered
         .into_iter()
         .map(|mut h| {
-            let l = by_id[h.id.as_str()];
-            h.tier = crate::tier::of(l.frontmatter.status, counts.get(&h.id));
-            let a = evaluate(&l.frontmatter.when, facts);
+            let d = by_id[&h.id];
+            h.tier = crate::tier::of(d.lesson.frontmatter.status, counts.get(&h.id));
+            let a = evaluate(&d.lesson.frontmatter.when, facts);
             (h, a)
         })
         .collect();
-    let top: Vec<&Lesson> =
-        evaluated.iter().filter(|(_, a)| a.result != Verdict::No).take(PROBE_TOP).map(|(h, _)| *by_id[h.id.as_str()]).collect();
+    // Only main lessons probe: `rkb approve` refuses an extra id, and the result map keys bare ids.
+    let top: Vec<&Lesson> = evaluated
+        .iter()
+        .filter(|(h, a)| a.result != Verdict::No && h.kb.is_none())
+        .take(PROBE_TOP)
+        .map(|(h, _)| &by_id[&h.id].lesson)
+        .collect();
     let probes = probe_results(root, place, &top, opts.probes);
 
     let mut out = Results::default();
@@ -744,6 +799,8 @@ mod tests {
     fn unrated_hits_keep_their_place() {
         let h = |id: &str| Hit {
             id: id.into(),
+            kb: None,
+            root: PathBuf::new(),
             kind: crate::lesson::LessonType::Fact,
             title: String::new(),
             path: String::new(),

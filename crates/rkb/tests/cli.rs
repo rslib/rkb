@@ -42,6 +42,7 @@ impl Env {
             .env_remove("CLAUDECODE")
             .env_remove("RKB_TEST_HOME")
             .env_remove("RKB_FORMAT")
+            .env_remove("RKB_AGENT")
             .env_remove("EMAIL")
             .env_remove("GIT_AUTHOR_NAME")
             .env_remove("GIT_AUTHOR_EMAIL")
@@ -6261,4 +6262,175 @@ fn doctor_shows_agent_sink() {
     assert_eq!(l["status"], "fail", "{l}");
     assert!(l["detail"].as_str().unwrap().contains("config.toml"), "{l}");
     assert!(!l["fix"].as_str().unwrap().is_empty(), "{l}");
+}
+
+/// The machine config file of a test home, so a test can add `[[extra]]` or a sink.
+fn machine_config(env: &Env, text: &str) {
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), text);
+}
+
+fn rev_count(o: &Output) -> usize {
+    String::from_utf8_lossy(&o.stdout).trim().parse().unwrap()
+}
+
+#[test]
+fn extra_kb_search_and_refuse() {
+    let env = Env::new();
+    env.init();
+    let shared = env.dir.path().join("shared");
+    let init_shared = env.cmd(env!("CARGO_BIN_EXE_rkb")).env("RKB_HOME", &shared).arg("init").output().unwrap();
+    assert!(init_shared.status.success(), "{}", stdout(&init_shared));
+    let lesson = |id: &str, title: &str, body: &str| {
+        format!(
+            "---\nschema: 1\nid: {id}\ntype: fact\nstatus: active\nverified: 2026-09-25\nverified_how: ran\ntags:\n  - cachetunnel\n---\n\n# {title}\n\n## Statement\n{body}\n\n## Evidence\nSeen in a test.\n"
+        )
+    };
+    let write_shared = |rel: &str, text: &str| {
+        let p = shared.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, text).unwrap();
+    };
+    write_shared("general/team/note.md", &lesson("c000000001", "Shared cache tunnels", "The shared cache tunnels flood every spring."));
+    write_shared("general/secret/README.md", "---\nlabels:\n  sensitivity: confidential\n---\n\n# Secret\n");
+    write_shared(
+        "general/secret/hidden.md",
+        &lesson("c000000002", "Hidden shared cache cipher", "The hidden shared cache cipher marks the tunnels."),
+    );
+    let extra_git = |args: &[&str]| env.cmd("git").arg("-C").arg(&shared).args(args).output().unwrap();
+    assert!(extra_git(&["add", "-A"]).status.success());
+    assert!(extra_git(&["commit", "-q", "-m", "seed"]).status.success());
+    env.write("general/team/main-note.md", &lesson("d000000001", "Main cache tunnels", "The main cache tunnels flood every spring."));
+    assert!(env.git(&["add", "-A"]).status.success());
+    assert!(env.git(&["commit", "-q", "-m", "main seed"]).status.success());
+
+    machine_config(&env, "[[extra]]\nname = \"Shared KB\"\npath = \"/tmp/shared\"\n");
+    let (v, _) = env.json(&["search", "cache tunnels"], "");
+    assert_eq!(v["error"]["code"], "refused", "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("Shared KB"), "{v}");
+    assert!(!v["error"]["fix"].as_str().unwrap().is_empty(), "{v}");
+
+    machine_config(&env, "[[extra]]\nname = \"shared\"\npath = \"/nonexistent/shared-kb\"\n");
+    let (v, code) = env.json(&["search", "main cache tunnels"], "");
+    assert_eq!(code, Some(0), "{v}");
+    let ids: Vec<&str> = v["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"d000000001"), "{v}");
+    assert!(v["help"].as_array().unwrap().iter().any(|h| h.as_str().unwrap().contains("shared")), "the skipped extra is named: {v}");
+
+    machine_config(&env, &format!("[[extra]]\nname = \"shared\"\npath = \"{}\"\n", shared.display()));
+    let (v, code) = env.json(&["search", "shared cache tunnels"], "");
+    assert_eq!(code, Some(0), "{v}");
+    let ids: Vec<&str> = v["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"shared:c000000001"), "{v}");
+    assert!(ids.contains(&"d000000001"), "main and extra rank in one corpus: {v}");
+    assert_eq!(ids[0], "shared:c000000001", "the extra title ranks first: {v}");
+
+    let (v, code) = env.json(&["show", "shared:c000000001"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(v["id"], "shared:c000000001", "{v}");
+    assert!(v["body"].as_str().unwrap().contains("shared cache tunnels flood"), "{v}");
+    let hash = v["hash"].as_str().unwrap().to_string();
+
+    let extra_file = shared.join("general/team/note.md");
+    let before = std::fs::read_to_string(&extra_file).unwrap();
+    let (main_before, extra_before) = (commit_count(&env), rev_count(&extra_git(&["rev-list", "--count", "HEAD"])));
+    let (v, code) = env.json(&["edit", "shared:c000000001", "--base", &hash], "changed");
+    assert_eq!(code, Some(1), "{v}");
+    assert_eq!(v["error"]["code"], "refused", "{v}");
+    assert!(v["error"]["fix"].as_str().unwrap().contains("main"), "{v}");
+    assert_eq!(std::fs::read_to_string(&extra_file).unwrap(), before, "the extra file is unchanged");
+    assert_eq!(
+        (commit_count(&env), rev_count(&extra_git(&["rev-list", "--count", "HEAD"]))),
+        (main_before, extra_before),
+        "no commit in either repo"
+    );
+
+    let (v, code) = env.json(&["used", "shared:c000000001", "--worked"], "");
+    assert_eq!(code, Some(0), "{v}");
+    let usage: String =
+        std::fs::read_dir(env.kb().join(".rkb/usage")).unwrap().map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap()).collect();
+    assert!(usage.contains("\"id\":\"shared:c000000001\""), "the main usage file records the prefixed id: {usage}");
+    let (v, code) = env.json(&["used", "shared:c999999999", "--worked"], "");
+    assert_eq!(code, Some(1), "a missing extra lesson records nothing: {v}");
+
+    // A main lesson with the same bare id as an extra one keeps its own use counts in the ranking:
+    // the two tie on text, the extra title sorts first, and only the main lesson worked.
+    let pair = |title: &str| lesson("c000000003", title, "The pair tunnels flood in autumn.");
+    write_shared("general/team/pair.md", &pair("Alpha pair tunnels"));
+    assert!(extra_git(&["add", "-A"]).status.success());
+    assert!(extra_git(&["commit", "-q", "-m", "pair"]).status.success());
+    env.write("general/team/pair.md", &pair("Omega pair tunnels"));
+    assert!(env.git(&["add", "-A"]).status.success());
+    assert!(env.git(&["commit", "-q", "-m", "pair"]).status.success());
+    for _ in 0..5 {
+        assert_eq!(env.json(&["used", "c000000003", "--worked"], "").1, Some(0));
+    }
+    let (v, _) = env.json(&["search", "pair tunnels autumn"], "");
+    let ids: Vec<&str> = v["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids[..2], ["c000000003", "shared:c000000003"], "the extra lesson does not borrow the main counts: {v}");
+
+    // A folder with a kb.toml that is not a git clone is skipped, not a failed search.
+    let plain = env.dir.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::copy(env.kb().join("kb.toml"), plain.join("kb.toml")).unwrap();
+    machine_config(
+        &env,
+        &format!(
+            "[[extra]]\nname = \"shared\"\npath = \"{}\"\n\n[[extra]]\nname = \"plain\"\npath = \"{}\"\n",
+            shared.display(),
+            plain.display()
+        ),
+    );
+    let (v, code) = env.json(&["search", "shared cache tunnels"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert!(v["help"].as_array().unwrap().iter().any(|h| h.as_str().unwrap().contains("plain")), "the skipped extra is named: {v}");
+
+    machine_config(
+        &env,
+        &format!(
+            "[sinks.agent]\nallow = {{ sensitivity = [\"internal\"] }}\n\n[[extra]]\nname = \"shared\"\npath = \"{}\"\n",
+            shared.display()
+        ),
+    );
+    let (out, _) = tool(&env, "rkb_search", &serde_json::json!({ "query": "hidden shared cache cipher" }));
+    assert!(!out.contains("c000000002"), "a confidential extra lesson is hidden: {out}");
+    let (out, _) = tool(&env, "rkb_search", &serde_json::json!({ "query": "shared cache tunnels" }));
+    assert!(out.contains("shared:c000000001"), "an internal extra lesson passes the sink: {out}");
+}
+
+#[test]
+fn agent_identity_recorded() {
+    let env = Env::new();
+    env.init();
+    let add = |agent: Option<&str>, title: &str| -> (String, Output) {
+        let text = format!(
+            "---\ntype: fact\nverified_how: ran\ntags:\n  - agenttag\n---\n\n# {title}\n\n## Statement\nThe agent recorded its name.\n\n## Evidence\nSeen in a test.\n"
+        );
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        if let Some(a) = agent {
+            c.env("RKB_AGENT", a);
+        }
+        let o = rkb_with(c, &["add", "--topic", "agents", "--format", "json"], &text);
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("not json: {}", stdout(&o)));
+        (v["id"].as_str().unwrap_or_default().to_string(), o)
+    };
+    let message = || stdout(&env.git(&["log", "-1", "--format=%B"]));
+
+    let (_, o) = add(None, "Agent note one");
+    assert!(o.status.success(), "{}", stdout(&o));
+    assert!(!message().contains("Rkb-Agent:"), "no trailer without RKB_AGENT: {}", message());
+
+    let (id, o) = add(Some("raven"), "Agent note two");
+    assert!(o.status.success(), "{}", stdout(&o));
+    assert!(message().contains("Rkb-Agent: raven"), "{}", message());
+
+    let o = env.cmd(env!("CARGO_BIN_EXE_rkb")).env("RKB_AGENT", "raven").args(["used", &id, "--worked"]).output().unwrap();
+    assert!(o.status.success(), "{}", stdout(&o));
+    let usage: String =
+        std::fs::read_dir(env.kb().join(".rkb/usage")).unwrap().map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap()).collect();
+    assert!(usage.contains("\"agent\":\"raven\"") && usage.contains(&id), "{usage}");
+
+    let (_, o) = add(Some("rav\nen"), "Agent note three");
+    assert!(o.status.success(), "{}", stdout(&o));
+    assert!(!message().contains("Rkb-Agent:"), "a value with a newline writes no trailer: {}", message());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("RKB_AGENT"), "{}", String::from_utf8_lossy(&o.stderr));
 }

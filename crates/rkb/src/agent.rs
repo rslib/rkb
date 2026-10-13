@@ -53,13 +53,15 @@ fn resolve_sink() -> Result<Option<rkb_core::config::Sink>, CliError> {
     Ok(sink)
 }
 
-fn snapshot(root: &std::path::Path) -> Result<rkb_core::kb::Snapshot, CliError> {
-    rkb_core::kb::Snapshot::from_dir(root)
-        .map_err(|e| CliError::new(ErrorCode::Refused, format!("the labels could not be read: {e}"), agent_sink_fix()))
+/// The main knowledge base plus the configured extras, for the sink to label a lesson from its own base.
+fn roots() -> Result<rkb_core::kb::Roots, CliError> {
+    rkb_core::kb::Roots::load(&rkb_core::kb::home(), &rkb_core::paths::config_dir())
+        .map_err(|e| CliError::new(ErrorCode::Refused, e.to_string(), agent_sink_fix()))
 }
 
-fn allows(sink: &rkb_core::config::Sink, snap: &rkb_core::kb::Snapshot, path: &str) -> bool {
-    rkb_core::config::sink_allows(&sink.allow, &rkb_core::write::effective_at(snap, path))
+/// The labels a lesson takes, from the snapshot of the knowledge base it lives in.
+fn allows(sink: &rkb_core::config::Sink, snapshots: &[(Option<String>, rkb_core::kb::Snapshot)], kb: Option<&str>, path: &str) -> bool {
+    rkb_core::config::sink_allows(&sink.allow, &rkb_core::kb::labels(snapshots, kb, path))
 }
 
 /// Agent search with the sink applied before the limit, so a limit of 5 still returns up to 5
@@ -67,9 +69,13 @@ fn allows(sink: &rkb_core::config::Sink, snap: &rkb_core::kb::Snapshot, path: &s
 /// enough to fill it, so the reranker runs once. Hidden lessons leave no id, title or count behind.
 fn agent_search(sink: &rkb_core::config::Sink, args: &Value, limit: usize) -> Result<Output, CliError> {
     use rkb_core::matching::Hints;
-    let root = rkb_core::kb::home();
-    let snap = snapshot(&root)?;
-    let hidden = snap.lessons().0.iter().filter(|l| !allows(sink, &snap, &l.path)).count();
+    let roots = roots()?;
+    let snapshots =
+        roots.snapshots().map_err(|e| CliError::new(ErrorCode::Refused, format!("the labels could not be read: {e}"), agent_sink_fix()))?;
+    let hidden: usize = snapshots
+        .iter()
+        .map(|(kb, snap)| snap.lessons().0.iter().filter(|l| !allows(sink, &snapshots, kb.as_deref(), &l.path)).count())
+        .sum();
     let cmd = Cmd::Search {
         query: Some(text(args, "query")),
         literal: None,
@@ -83,7 +89,11 @@ fn agent_search(sink: &rkb_core::config::Sink, args: &Value, limit: usize) -> Re
     };
     let mut out = run(Some(cmd), Format::Toon, &Hints::default(), &[])?;
     let rows = out.data["results"].as_array().cloned().unwrap_or_default();
-    let kept: Vec<Value> = rows.into_iter().filter(|r| r["path"].as_str().is_some_and(|p| allows(sink, &snap, p))).take(limit).collect();
+    let kept: Vec<Value> = rows
+        .into_iter()
+        .filter(|r| r["path"].as_str().is_some_and(|p| allows(sink, &snapshots, r["kb"].as_str(), p)))
+        .take(limit)
+        .collect();
     out.data["results"] = Value::Array(kept);
     // The count of lessons that do not apply here would count hidden ones too.
     if let Some(o) = out.data.as_object_mut() {
@@ -104,15 +114,17 @@ fn agent_show(sink: &rkb_core::config::Sink, id: &str) -> Result<Output, CliErro
             "search for another lesson; only the user can read this one",
         )
     };
-    let root = rkb_core::kb::home();
-    let snap = snapshot(&root)?;
-    let (lesson, _) = rkb_core::kb::find(&root, id).map_err(|_| refused())?;
-    if !allows(sink, &snap, &lesson.path) {
+    let roots = roots()?;
+    let snapshots =
+        roots.snapshots().map_err(|e| CliError::new(ErrorCode::Refused, format!("the labels could not be read: {e}"), agent_sink_fix()))?;
+    let (origin, lesson, _) = roots.find(id).map_err(|_| refused())?;
+    if !allows(sink, &snapshots, origin.as_deref(), &lesson.path) {
         return Err(refused());
     }
     let mut out = run(Some(Cmd::Show { id: id.to_string(), why: false }), Format::Toon, &Hints::default(), &[])?;
     if let Some(related) = out.data.get("related").and_then(|r| r.as_array()).cloned() {
-        let kept: Vec<Value> = related.into_iter().filter(|r| r["path"].as_str().is_some_and(|p| allows(sink, &snap, p))).collect();
+        let kept: Vec<Value> =
+            related.into_iter().filter(|r| r["path"].as_str().is_some_and(|p| allows(sink, &snapshots, r["kb"].as_str(), p))).collect();
         out.data["related"] = Value::Array(kept);
     }
     Ok(out)

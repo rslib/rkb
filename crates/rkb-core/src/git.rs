@@ -41,9 +41,20 @@ pub fn check_identity(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The agent that made a commit, from `RKB_AGENT`, as git's own `--trailer` argument. A name is
+/// never concatenated into the message, so a newline cannot break out of the trailer line.
+fn agent_trailer() -> Option<String> {
+    crate::usage::agent().map(|name| format!("Rkb-Agent: {name}"))
+}
+
 /// Commits the index. rkb lints in process before it commits, so the hook is skipped.
 pub fn commit(dir: &Path, message: &str) -> Result<()> {
-    run(dir, &["-c", "user.useConfigOnly=true", "commit", "--no-verify", "-q", "-m", message]).map(|_| ())
+    let trailer = agent_trailer();
+    let mut args = vec!["-c", "user.useConfigOnly=true", "commit", "--no-verify", "-q", "-m", message];
+    if let Some(trailer) = &trailer {
+        args.extend_from_slice(&["--trailer", trailer]);
+    }
+    run(dir, &args).map(|_| ())
 }
 
 static AUTO_CONFIRMED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -59,7 +70,12 @@ pub fn commit_paths(dir: &Path, message: &str, paths: &[&str]) -> Result<()> {
         Some(o) => format!("{message}\n\nAuto-confirmed: {o}"),
         None => message.to_string(),
     };
-    let mut args = vec!["-c", "user.useConfigOnly=true", "commit", "--no-verify", "-q", "-m", &message, "--"];
+    let trailer = agent_trailer();
+    let mut args = vec!["-c", "user.useConfigOnly=true", "commit", "--no-verify", "-q", "-m", &message];
+    if let Some(trailer) = &trailer {
+        args.extend_from_slice(&["--trailer", trailer]);
+    }
+    args.push("--");
     args.extend_from_slice(paths);
     run(dir, &args).map(|_| ())
 }

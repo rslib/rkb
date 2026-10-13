@@ -10,9 +10,21 @@ use crate::output::{CliError, Output, paint};
 use crate::rerankers;
 use crate::writes::Env;
 
-fn lesson_json(g: &Graph, i: usize) -> Value {
+fn lesson_json_at(g: &Graph, i: usize, kb: Option<&str>) -> Value {
     let l = &g.lessons[i];
-    json!({ "id": l.frontmatter.id, "title": graph::title(l), "path": l.path })
+    let mut row = json!({
+        "id": rkb_core::search::qualified(kb, &l.frontmatter.id),
+        "title": graph::title(l),
+        "path": l.path,
+    });
+    if let Some(name) = kb {
+        row["kb"] = json!(name);
+    }
+    row
+}
+
+fn lesson_json(g: &Graph, i: usize) -> Value {
+    lesson_json_at(g, i, None)
 }
 
 fn edge_text(e: &Edge) -> String {
@@ -32,7 +44,7 @@ fn edge_json(e: &Edge) -> Value {
 }
 
 /// The first `limit` related lessons of `i` as JSON rows and human lines.
-pub fn related_of(g: &Graph, i: usize, limit: usize, colored: bool) -> (Vec<Value>, String) {
+pub fn related_of(g: &Graph, i: usize, limit: usize, colored: bool, kb: Option<&str>) -> (Vec<Value>, String) {
     let m = marks();
     let w = width();
     let mut rows = vec![];
@@ -40,13 +52,17 @@ pub fn related_of(g: &Graph, i: usize, limit: usize, colored: bool) -> (Vec<Valu
     for r in g.related(i).into_iter().take(limit) {
         let l = &g.lessons[r.lesson];
         let edges: Vec<String> = r.edges.iter().map(edge_text).collect();
-        let mut row = lesson_json(g, r.lesson);
+        let mut row = lesson_json_at(g, r.lesson, kb);
         row["edges"] = r.edges.iter().map(edge_json).collect();
         rows.push(row);
         human.push_str(&format!(
             "\n  {}\n    {}\n",
             cut(&graph::title(l), w.saturating_sub(4), m),
-            paint(colored, "2", &format!("{} {} {} {} {}", l.frontmatter.id, m.sep, l.path, m.sep, edges.join(", ")))
+            paint(
+                colored,
+                "2",
+                &format!("{} {} {} {} {}", rkb_core::search::qualified(kb, &l.frontmatter.id), m.sep, l.path, m.sep, edges.join(", "))
+            )
         ));
     }
     (rows, human)
@@ -153,9 +169,11 @@ pub fn dupes(env: &Env, min: Option<f64>, check: bool, all: bool) -> Result<Outp
 }
 
 pub fn related(env: &Env, id: &str, limit: usize) -> Result<Output, CliError> {
-    let g = load(env)?;
-    let i = find(&g, id)?;
-    let (rows, lines) = related_of(&g, i, limit, env.colored);
+    let roots = rkb_core::kb::Roots::load(&env.root, &rkb_core::paths::config_dir())?;
+    let (origin, lesson, _) = roots.find(id)?;
+    let g = Graph::load(roots.root_of(origin.as_deref()))?;
+    let i = find(&g, &lesson.frontmatter.id)?;
+    let (rows, lines) = related_of(&g, i, limit, env.colored, origin.as_deref());
     let m = marks();
     let mut human = format!(
         "{} {} {} {} {}\n",

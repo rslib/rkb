@@ -120,7 +120,7 @@ fn session_start(p: &Value, state: &Path) -> Result<Option<String>> {
     let mut text = crate::session::context(&s).human;
     // A sink that fails closed leaves the digest out; the context lines still go out.
     if hooks_config(&root).get("digest").and_then(toml::Value::as_bool) == Some(true)
-        && let Ok(keep) = agent_keep(&root)
+        && let Ok(keep) = agent_keep_paths(&root)
         && let Ok(lines) = rkb_core::review::digest(&root, &keep)
         && !lines.is_empty()
     {
@@ -239,9 +239,10 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
     let cfg = hooks_config(&root);
     let with = vec![("tool".to_string(), program.clone())];
     let (hits, ranked, place) = ranked_search(&root, p, state, &cfg, &query, "failure", &with)?;
+    let by_id: std::collections::HashMap<&str, &search::Hit> = hits.iter().map(|h| (h.id.as_str(), h)).collect();
     let chosen = hooks::would_inject(
         &hits,
-        |id| kb::find(&root, id).map(|(_, t)| t).unwrap_or_default(),
+        |id| by_id.get(id).map(|h| kb::find(&h.root, kb::unqualified(id)).map(|(_, t)| t).unwrap_or_default()).unwrap_or_default(),
         error,
         &hooks::Strength::from_config(&cfg, &ranked.backend),
     );
@@ -270,7 +271,7 @@ fn tool_failed(p: &Value, state: &Path, session: &str) -> Result<Option<String>>
         }
         return Ok(None);
     };
-    let (_, text) = kb::find(&root, &hit.id)?;
+    let (_, text) = kb::find(&hit.root, kb::unqualified(&hit.id))?;
     hooks::append(
         state,
         session,
@@ -325,16 +326,17 @@ fn ranked_search(
     let place = state::locate(root, &cwd(p), &Hints::default(), state)?;
     let facts = Facts::gather(root, &place, with);
     let settings = rerank::Settings::load(root);
+    let roots = kb::Roots::load(root, &paths::config_dir())?;
     let opts =
         Options { all: false, every_status: false, limit: settings.top.max(1), probes: rkb_core::search::ProbeMode::Cached, tier: None };
-    let mut found = search::search(root, &place, &facts, &Mode::Ranked(query.to_string()), &opts)?;
+    let mut found = search::search_with(root, &roots.extras, &place, &facts, &Mode::Ranked(query.to_string()), &opts)?;
     let timeout = cfg.get("hook_timeout_ms").and_then(toml::Value::as_integer).map_or(DEFAULT_HOOK_TIMEOUT_MS, |v| v.max(0) as u64);
     let start = std::time::Instant::now();
     let ranked = crate::rerankers::run(root, &settings, None, query, &found.hits, std::time::Duration::from_millis(timeout))?;
     if let Some(scores) = &ranked.scores {
         search::apply_relevance(&mut found.hits, scores, ranked.order.as_deref());
     }
-    let hits = sink_filter(root, std::mem::take(&mut found.hits))?;
+    let hits = sink_filter(&roots, std::mem::take(&mut found.hits))?;
     if settings.chain.iter().any(|b| b != rerank::BM25) && !hits.is_empty() {
         hooks::log_ranking(state, hook, &ranked, &hits, start.elapsed().as_millis() as u64);
     }
@@ -344,16 +346,29 @@ fn ranked_search(
 /// Drops the lessons the agent sink hides before any injection choice, cap or log sees them, so a
 /// hidden lesson never takes a slot and the replay log never records its id. A machine config that
 /// fails closed injects nothing: the error travels up to the hook error log.
-fn sink_filter(root: &Path, hits: Vec<search::Hit>) -> Result<Vec<search::Hit>> {
-    let keep = agent_keep(root)?;
-    Ok(hits.into_iter().filter(|h| keep(&h.path)).collect())
+fn sink_filter(roots: &kb::Roots, hits: Vec<search::Hit>) -> Result<Vec<search::Hit>> {
+    let keep = agent_keep_hits(roots)?;
+    Ok(hits.into_iter().filter(|h| keep(h)).collect())
 }
 
-/// Whether the agent sink lets the lesson at a path through.
-type Keep = Box<dyn Fn(&str) -> bool>;
+/// Whether the agent sink lets a hit through.
+type HitKeep = Box<dyn Fn(&search::Hit) -> bool>;
 
-/// The agent sink as a path check; everything passes with no sink.
-fn agent_keep(root: &Path) -> Result<Keep> {
+/// The agent sink as a hit check, from the labels of the knowledge base the hit lives in; every hit
+/// passes with no sink.
+fn agent_keep_hits(roots: &kb::Roots) -> Result<HitKeep> {
+    let (sink, _) = config::agent_sink(&roots.main, &paths::config_dir())
+        .map_err(|m| format!("agent sink: {m}; fix [sinks.agent] in the machine config.toml"))?;
+    let Some(sink) = sink else { return Ok(Box::new(|_| true)) };
+    let snapshots = roots.snapshots().map_err(|e| format!("agent sink: the labels could not be read: {e}"))?;
+    Ok(Box::new(move |h| config::sink_allows(&sink.allow, &kb::labels(&snapshots, h.kb.as_deref(), &h.path))))
+}
+
+/// Whether the agent sink lets a path of the main knowledge base through; everything passes with no sink.
+type PathKeep = Box<dyn Fn(&str) -> bool>;
+
+/// The agent sink as a path check for the main knowledge base, for the review digest.
+fn agent_keep_paths(root: &Path) -> Result<PathKeep> {
     let (sink, _) = config::agent_sink(root, &paths::config_dir())
         .map_err(|m| format!("agent sink: {m}; fix [sinks.agent] in the machine config.toml"))?;
     let Some(sink) = sink else { return Ok(Box::new(|_| true)) };
@@ -419,7 +434,7 @@ fn recall(p: &Value, state: &Path, session: &str, text: &str) -> Result<Option<S
         )?;
         let reason = if *explore { format!("explore, {}", ranked.describe()) } else { format!("recall, {}", ranked.describe()) };
         record_use(&root, state, &h.id, "injected", session, Some(reason))?;
-        let text = kb::find(&root, &h.id).map(|(_, t)| t).unwrap_or_default();
+        let text = kb::find(&h.root, kb::unqualified(&h.id)).map(|(_, t)| t).unwrap_or_default();
         blocks.push(injected(h, missing_note(&place, &h.path, &text)));
     }
     Ok(Some(reply("UserPromptSubmit", "additionalContext", json!(hooks::render(&blocks)))))
