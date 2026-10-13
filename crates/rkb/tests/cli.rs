@@ -6960,6 +6960,62 @@ fn extra_kb_search_and_refuse() {
     assert!(!out.contains("c000000002"), "a confidential extra lesson is hidden: {out}");
     let (out, _) = tool(&env, "rkb_search", &serde_json::json!({ "query": "shared cache tunnels" }));
     assert!(out.contains("shared:c000000001"), "an internal extra lesson passes the sink: {out}");
+
+    // A hook never injects a confidential extra lesson either; with no sink it does.
+    write_shared(
+        "general/secret/cipher.md",
+        "---\nschema: 1\nid: c000000005\ntype: pitfall\nstatus: active\nverified: 2026-09-25\nverified_how: ran\ntags:\n  - cachetunnel\n---\n\n# Tunnel cipher mismatch\n\n## Symptom\nThe run fails with `tunnel cipher mismatch at dawn cache` in the log.\n\n## Cause\nThe cipher rotated before the dawn cache.\n\n## Fix\nRotate the cipher after the dawn cache.\n\n## Evidence\nSeen with squirrel-cipher.\n",
+    );
+    assert!(extra_git(&["add", "-A"]).status.success());
+    assert!(extra_git(&["commit", "-q", "-m", "cipher"]).status.success());
+    let cipher = "squirrel-cipher: fatal: tunnel cipher mismatch at dawn cache\nsquirrel-cipher: failed: no usable tunnel remains\n";
+    let failed = |session: &str| {
+        let mut f = bash(session, &env.kb(), "squirrel-cipher --rotate");
+        f["error"] = cipher.into();
+        f
+    };
+    machine_config(&env, &format!("[[extra]]\nname = \"shared\"\npath = \"{}\"\n", shared.display()));
+    let out = hook(&env, "tool-failed", &failed("x0"));
+    assert!(out.contains("shared:c000000005"), "with no sink the hook injects the extra lesson: {out}");
+    machine_config(
+        &env,
+        &format!(
+            "[sinks.agent]\nallow = {{ sensitivity = [\"internal\"] }}\n\n[[extra]]\nname = \"shared\"\npath = \"{}\"\n",
+            shared.display()
+        ),
+    );
+    let out = hook(&env, "tool-failed", &failed("x1"));
+    assert!(!out.contains("c000000005") && !out.contains("dawn cache"), "no trace of the hidden extra lesson: {out}");
+
+    // Doctor warns about a skipped extra and names it.
+    machine_config(
+        &env,
+        &format!(
+            "[[extra]]\nname = \"shared\"\npath = \"{}\"\n\n[[extra]]\nname = \"plain\"\npath = \"{}\"\n",
+            shared.display(),
+            plain.display()
+        ),
+    );
+    let (v, _) = env.json(&["doctor"], "");
+    let extra = v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "extra knowledge bases").cloned().unwrap();
+    assert_eq!(extra["status"], "warn", "{extra}");
+    assert!(extra["detail"].as_str().unwrap().contains("plain"), "{extra}");
+    assert!(!extra["fix"].as_str().unwrap().is_empty(), "{extra}");
+
+    // Flag, archive and approve refuse an extra lesson and write nothing in either repo.
+    let counts = || (commit_count(&env), rev_count(&extra_git(&["rev-list", "--count", "HEAD"])));
+    let (before_counts, before_text) = (counts(), std::fs::read_to_string(&extra_file).unwrap());
+    for args in [
+        vec!["flag", "shared:c000000001", "--reason", "wrong"],
+        vec!["archive", "shared:c000000001", "--reason", "old"],
+        vec!["approve", "shared:c000000001", "check"],
+    ] {
+        let (v, code) = env.json(&args, "");
+        assert_eq!(code, Some(1), "{args:?}: {v}");
+        assert_eq!(v["error"]["code"], "refused", "{args:?}: {v}");
+    }
+    assert_eq!(counts(), before_counts, "no commit in either repo");
+    assert_eq!(std::fs::read_to_string(&extra_file).unwrap(), before_text, "the extra file is unchanged");
 }
 
 #[test]
