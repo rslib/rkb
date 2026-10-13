@@ -1004,6 +1004,7 @@ mod tests {
             relevance: None,
             verified: "2026-09-25".into(),
             verified_how: "ran".into(),
+            expired: None,
             tier: crate::tier::Tier::Candidate,
         };
         let hits: Vec<_> = ["a", "b", "c", "d", "e", "f"].iter().map(|i| hit(i)).collect();
@@ -1031,6 +1032,7 @@ mod tests {
             relevance: None,
             verified: "2026-09-25".into(),
             verified_how: "ran".into(),
+            expired: None,
             tier,
         };
         assert_eq!(may_push(&hit(crate::tier::Tier::Proven), false), Some(false), "a proven lesson is pushed");

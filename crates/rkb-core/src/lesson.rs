@@ -88,6 +88,9 @@ pub struct Frontmatter {
     #[serde(default, skip_serializing_if = "Mapping::is_empty")]
     pub when: Mapping,
     pub verified: Date,
+    /// The date the lesson stops being true; from that day on it acts as stale. Never rewritten when it passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<Date>,
     pub verified_how: VerifiedHow,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
@@ -108,6 +111,19 @@ pub struct Lesson {
     pub body: String,
     /// 1-based line in the file where the body starts.
     pub body_line: usize,
+}
+
+impl Lesson {
+    /// Whether `expires` has passed: `today` is at least `expires`, so the lesson expires at the
+    /// start of its own day. The one check every caller shares.
+    pub fn expired(&self, today: Date) -> bool {
+        self.frontmatter.expires.is_some_and(|e| today >= e)
+    }
+}
+
+/// Today in UTC: the day `expires` dates are compared with.
+pub fn today_utc() -> Date {
+    jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC).date()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +237,29 @@ Configure fails.
     fn invalid_type_lists_allowed() {
         let e = parse("a.md", &LESSON.replace("type: pitfall", "type: bug")).unwrap_err();
         assert!(e.message.contains("pitfall") && e.message.contains("preference"), "{}", e.message);
+    }
+
+    #[test]
+    fn expires_is_optional_and_written_after_verified() {
+        let gone = parse("a.md", &LESSON.replace("verified: 2026-09-25", "verified: 2026-09-25\nexpires: 2020-01-01")).unwrap();
+        assert_eq!(gone.frontmatter.expires, Some(jiff::civil::date(2020, 1, 1)));
+        let out = write(&gone.frontmatter, &gone.body);
+        let order = ["verified:", "expires:", "verified_how:"];
+        let at: Vec<usize> = order.iter().map(|k| out.find(k).unwrap()).collect();
+        assert!(at[0] < at[1] && at[1] < at[2], "expires sits after verified: {out}");
+        let live = parse("a.md", LESSON).unwrap();
+        assert_eq!(live.frontmatter.expires, None);
+        assert!(!write(&live.frontmatter, &live.body).contains("expires"), "unset expires is never written");
+    }
+
+    #[test]
+    fn a_lesson_expires_at_the_start_of_its_day() {
+        let with =
+            |d: &str| parse("a.md", &LESSON.replace("verified: 2026-09-25", &format!("verified: 2026-09-25\nexpires: {d}"))).unwrap();
+        assert!(with("2020-01-01").expired(jiff::civil::date(2020, 1, 1)), "today == expires is expired");
+        assert!(with("2020-01-01").expired(jiff::civil::date(2026, 9, 25)));
+        assert!(!with("2099-01-01").expired(jiff::civil::date(2026, 9, 25)), "a future date changes nothing");
+        assert!(!parse("a.md", LESSON).unwrap().expired(jiff::civil::date(2026, 9, 25)), "a lesson without expires never expires");
     }
 
     #[test]

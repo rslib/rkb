@@ -50,6 +50,7 @@ const IMAGE_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "svg"];
 
 static ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{10}$").unwrap());
 static FOLDER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-z0-9]+(-[a-z0-9]+)*$").unwrap());
+static EXPIRES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d{4}-\d{2}-\d{2}$").unwrap());
 
 struct Out(Vec<Finding>);
 
@@ -263,6 +264,9 @@ pub fn lint(snap: &Snapshot, env: &LintEnv, focus: Option<&BTreeSet<String>>) ->
                         "write frontmatter in block style; `rkb lint --fix` rewrites it".into(),
                     );
                 }
+                if kind == FileKind::Lesson {
+                    check_expires(&mut out, path, fm);
+                }
             }
         }
         if scan_text && in_focus(path) {
@@ -382,6 +386,22 @@ pub(crate) fn resolve(from: &str, target: &str) -> Option<Option<String>> {
 
 pub const MAX_QUERIES: usize = 8;
 pub const MAX_QUERY_CHARS: usize = 200;
+
+/// `expires` must be a `YYYY-MM-DD` date; a past date is fine, `rkb review` owns that. The raw text
+/// is checked because a value that is not a date also fails the whole frontmatter parse, and this
+/// rule names the field.
+fn check_expires(out: &mut Out, path: &str, fm: &str) {
+    let Ok(Value::Mapping(map)) = serde_norway::from_str(fm) else { return };
+    let Some(v) = map.get(Value::String("expires".into())) else { return };
+    if v.is_null() {
+        return;
+    }
+    let ok = v.as_str().is_some_and(|s| EXPIRES.is_match(s) && s.parse::<jiff::civil::Date>().is_ok());
+    if !ok {
+        let shown = v.as_str().map(str::to_string).unwrap_or_else(|| serde_norway::to_string(v).unwrap_or_default().trim().to_string());
+        out.error(path, None, "format/expires", format!("`expires: {shown}` is not a YYYY-MM-DD date"));
+    }
+}
 
 fn check_queries(out: &mut Out, path: &str, queries: &[String]) {
     let mut err = |message: String| out.error(path, None, "format/queries", message);
@@ -594,6 +614,41 @@ fn lint_folders(out: &mut Out, snap: &Snapshot, aliases: &BTreeMap<String, Vec<(
                     format!("`{alias}` is an alias of topic `{}`; move these lessons to `{}`", owners[0], owners[0]),
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A knowledge base with one lesson whose `expires` is `date`, in a lint-clean layout.
+    fn kb_with(date: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let lesson = format!(
+            "---\nschema: 1\nid: 0000000001\ntype: fact\nstatus: active\nverified: 2026-09-25\nexpires: {date}\nverified_how: ran\n---\n\n# A fact about the layout tool\n\n## Statement\nSomething is true.\n\n## Evidence\nSeen at /tmp/layout 1.\n"
+        );
+        let p = dir.path().join("general/layout/a.md");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, lesson).unwrap();
+        std::fs::write(dir.path().join("kb.toml"), "# kb\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn lint_checks_expires() {
+        // A valid date is never an error, past or not: review owns the past.
+        for date in ["2020-01-01", "2099-01-01"] {
+            let findings = lint_tree(kb_with(date).path(), &LintEnv::default()).unwrap();
+            assert!(!findings.iter().any(|f| f.rule == "format/expires"), "{date}: {findings:?}");
+        }
+        // A value that is not a YYYY-MM-DD date is an error that names the field and the lesson.
+        for bad in ["tomorrow", "2026-13-01", "2026-9-1", "20260101"] {
+            let findings = lint_tree(kb_with(bad).path(), &LintEnv::default()).unwrap();
+            let f = findings.iter().find(|f| f.rule == "format/expires").unwrap_or_else(|| panic!("{bad}: {findings:?}"));
+            assert_eq!(f.severity, Severity::Error);
+            assert_eq!(f.path, "general/layout/a.md");
+            assert!(f.message.contains("expires") && f.message.contains(bad), "{f:?}");
         }
     }
 }

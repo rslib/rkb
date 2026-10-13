@@ -6838,3 +6838,104 @@ fn agent_identity_recorded() {
     assert!(!message().contains("Rkb-Agent:"), "a value with a newline writes no trailer: {}", message());
     assert!(String::from_utf8_lossy(&o.stderr).contains("RKB_AGENT"), "{}", String::from_utf8_lossy(&o.stderr));
 }
+
+#[test]
+fn expired_lesson_is_stale() {
+    let env = kb_with_topics();
+    let with_expires = |text: &str, date: &str| text.replacen("verified_how:", &format!("expires: {date}\nverified_how:"), 1);
+
+    // Ranking and the search mark: an expired lesson acts as stale and ranks below an equal live one.
+    let pit = pitfall_with(
+        "Ninja cannot find the CMAKE_PREFIX_PATH package",
+        "Configure fails to find the package.",
+        "The prefix is not set.",
+        "Set CMAKE_PREFIX_PATH.",
+    );
+    let live = add_ok(&env, "cmake", &pit)["id"].as_str().unwrap().to_string();
+    let gone = add_ok(&env, "cpp", &with_expires(&pit, "2020-01-01"))["id"].as_str().unwrap().to_string();
+    let (v, code) = env.json(&["search", "package prefix configure fails"], "");
+    assert_eq!(code, Some(0), "{v}");
+    let ids: Vec<&str> = v["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [live.as_str(), gone.as_str()], "the expired one ranks below the equal live one: {v}");
+    let gone_row = &v["results"].as_array().unwrap()[1];
+    assert_eq!((gone_row["status"].as_str(), gone_row["expired"].as_str()), (Some("stale"), Some("2020-01-01")), "{v}");
+    let human = stdout(&env.rkb(&["search", "package prefix configure fails"]));
+    assert!(human.contains("expired 2020-01-01"), "the search line marks the reason: {human}");
+
+    // The digest and the session-start push leave the expired preference out; a future date outlives.
+    let pref_gone = add_ok(
+        &env,
+        "cmake",
+        &with_expires(&preference_with("Point the toolchain at the sdk root", "Point the toolchain at the sdk root."), "2020-01-01"),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pref_later = add_ok(
+        &env,
+        "cpp",
+        &with_expires(
+            &preference_with("Write the target name explicitly in makefiles", "Write the target name explicitly in makefiles."),
+            "2099-01-01",
+        ),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pref_live =
+        add_ok(&env, "cmake", &preference_with("Quote shell variables in every script", "Quote shell variables in every script."))["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    let (v, _) = env.json(&["digest"], "");
+    let ids: Vec<&str> = v["lines"].as_array().unwrap().iter().map(|l| l["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&pref_live.as_str()) && ids.contains(&pref_later.as_str()), "the live and the future preferences stand: {v}");
+    assert!(!ids.contains(&pref_gone.as_str()), "the expired preference is not in the digest: {v}");
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    env.write("kb.toml", &format!("{toml}\n[hooks]\ndigest = true\n"));
+    let out = hook(&env, "session-start", &serde_json::json!({ "session_id": "s", "cwd": env.dir.path(), "source": "startup" }));
+    assert!(
+        out.contains("Quote shell variables in every script.") && out.contains("Write the target name explicitly in makefiles."),
+        "the live preferences are pushed: {out}"
+    );
+    assert!(!out.contains("Point the toolchain at the sdk root."), "the expired one is not pushed: {out}");
+
+    // Review lists both expired lessons with the date and the fix, and nothing else.
+    let (v, _) = env.json(&["review"], "");
+    let candidates = v["candidates"].as_array().unwrap().clone();
+    let expired: Vec<String> = candidates
+        .iter()
+        .filter(|c| c["reasons"].as_array().unwrap().iter().any(|r| r["kind"] == "expired"))
+        .map(|c| c["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(expired, vec![pref_gone.clone(), gone.clone()], "review lists both expired lessons: {v}");
+    let detail = candidates.iter().find(|c| c["id"] == gone.as_str()).unwrap()["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["kind"] == "expired")
+        .unwrap()["detail"]
+        .as_str()
+        .unwrap();
+    assert!(detail.starts_with("expired 2020-01-01") && detail.contains("expires"), "the reason names the date and the fix: {detail}");
+    let human = stdout(&env.rkb(&["review"]));
+    assert!(human.contains("edit `expires`, supersede, or archive"), "the review entry carries the fix: {human}");
+}
+
+#[test]
+fn expired_lesson_is_not_pushed_on_a_failure() {
+    let env = search_kb();
+    let cwd = env.kb();
+    let linker = "Exit code 1\n/usr/bin/ld: main.o: in function `main':\nmain.cpp:(.text+0x1f): undefined reference to `vtable for Widget'\ncollect2: error: ld returned 1 exit status\n";
+    let failed = |session: &str| {
+        let mut f = bash(session, &cwd, "g++ main.o -o app");
+        f["error"] = linker.into();
+        f
+    };
+    assert!(hook(&env, "tool-failed", &failed("s1")).contains("1a00000012"), "a live lesson is pushed");
+    let path = "general/cpp/undefined-vtable-means-missing-virtual.md";
+    let text = std::fs::read_to_string(env.kb().join(path)).unwrap();
+    env.write(path, &text.replacen("verified_how:", "expires: 2020-01-01\nverified_how:", 1));
+    let out = hook(&env, "tool-failed", &failed("s2"));
+    assert!(!out.contains("1a00000012"), "an expired lesson is not pushed: {out}");
+}

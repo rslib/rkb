@@ -100,7 +100,9 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options, only: Option<
     for h in &r.hits {
         let mut right = vec![];
         right.push(paint(c, tier_color(h.tier), h.tier.as_str()));
-        if h.status != Status::Active {
+        if let Some(d) = h.expired {
+            right.push(paint(c, "33", &format!("expired {d}")));
+        } else if h.status != Status::Active {
             right.push(paint(c, "33", h.status.as_str()));
         }
         if let Some(rel) = h.relevance {
@@ -151,6 +153,9 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options, only: Option<
             });
             if let Some(kb) = &h.kb {
                 row["kb"] = json!(kb);
+            }
+            if let Some(d) = h.expired {
+                row["expired"] = json!(d.to_string());
             }
             if let Some(rel) = h.relevance {
                 row["relevance"] = json!(crate::output::score2(rel));

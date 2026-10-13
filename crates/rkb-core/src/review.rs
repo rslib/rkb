@@ -23,6 +23,7 @@ pub const OLD_VERIFIED_DAYS: i64 = 365;
 pub enum ReasonKind {
     Retired,
     Unsupported,
+    Expired,
     LongStale,
     MissingCommit,
     FailedRepeatedly,
@@ -282,6 +283,12 @@ pub fn review(root: &Path, state: &Path, folder: Option<&str>) -> Result<Vec<Can
                 reasons.push(Reason { kind: ReasonKind::Unsupported, detail: format!("{key} {} < {oldest_text}", ranges.join(", ")) });
             }
         }
+        if l.expired(crate::lesson::today_utc()) {
+            reasons.push(Reason {
+                kind: ReasonKind::Expired,
+                detail: format!("expired {}; edit `expires`, supersede, or archive", l.frontmatter.expires.unwrap_or_default()),
+            });
+        }
         if l.frontmatter.status == Status::Stale
             && let Some(days) = stale_days(root, &l.path, today)
             && days > stale_limit
@@ -414,16 +421,20 @@ pub struct DigestLine {
 }
 
 /// The standing preference lessons, one line each: the `Rule` section as one line, ordered by
-/// `worked` reports. Only active lessons: stale ones were flagged as wrong, and other lesson types
-/// and tombstones are never preferences the user stands by. `keep` drops a lesson by its path
-/// before the budget, so a dropped one never takes room. Reads only.
+/// `worked` reports. Only active lessons that have not expired: stale ones were flagged as wrong,
+/// an expired one stopped being true, and other lesson types and tombstones are never preferences
+/// the user stands by. `keep` drops a lesson by its path before the budget, so a dropped one never
+/// takes room. Reads only.
 pub fn digest(root: &Path, keep: &dyn Fn(&str) -> bool) -> Result<Vec<DigestLine>> {
     let snap = Snapshot::from_dir(root)?;
     let counts = usage::counts(root);
+    let today = crate::lesson::today_utc();
     let (lessons, _) = snap.lessons();
     let mut out: Vec<DigestLine> = lessons
         .iter()
-        .filter(|l| l.frontmatter.kind == crate::lesson::LessonType::Preference && l.frontmatter.status == Status::Active)
+        .filter(|l| {
+            l.frontmatter.kind == crate::lesson::LessonType::Preference && l.frontmatter.status == Status::Active && !l.expired(today)
+        })
         .filter(|l| keep(&l.path))
         .filter_map(|l| {
             let rule = crate::body::section_text(&l.body, "Rule")?;
@@ -473,15 +484,16 @@ pub struct SkillDraft {
     pub path: PathBuf,
 }
 
-/// The active recipe lessons whose `worked` reports come from 3 or more sessions, most sessions
-/// first and by id for a tie. Reads only.
+/// The active recipe lessons that have not expired, whose `worked` reports come from 3 or more
+/// sessions, most sessions first and by id for a tie. Reads only.
 pub fn skill_candidates(root: &Path) -> Result<Vec<SkillCandidate>> {
     let snap = Snapshot::from_dir(root)?;
     let records = usage::records(root);
+    let today = crate::lesson::today_utc();
     let (lessons, _) = snap.lessons();
     let mut out: Vec<SkillCandidate> = lessons
         .iter()
-        .filter(|l| l.frontmatter.kind == crate::lesson::LessonType::Recipe && l.frontmatter.status == Status::Active)
+        .filter(|l| l.frontmatter.kind == crate::lesson::LessonType::Recipe && l.frontmatter.status == Status::Active && !l.expired(today))
         .filter_map(|l| {
             let sessions = worked_sessions(&records, &l.frontmatter.id);
             (sessions >= SKILL_MIN_SESSIONS).then(|| SkillCandidate {

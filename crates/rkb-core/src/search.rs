@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use jiff::civil::Date;
 use regex::Regex;
 use serde_norway::Value;
 
@@ -20,6 +21,8 @@ const B: f64 = 0.75;
 const EXPANDED_WEIGHT: f64 = 0.5;
 /// Parts of a query token whose whole form is known, such as `use` in `H5_USE_18_API`.
 const PART_WEIGHT: f64 = 0.5;
+/// An expired lesson ranks below an equal live one; it acts as stale, and stale never outranks live.
+const EXPIRED_FACTOR: f64 = 0.9;
 /// Results below this share of the best score are noise from common words and are dropped.
 const MIN_RELATIVE_SCORE: f64 = 0.3;
 
@@ -152,6 +155,8 @@ pub struct Hit {
     /// The `verified` date (`YYYY-MM-DD`) and how (`ran`, `read`, `told` or `checked`).
     pub verified: String,
     pub verified_how: String,
+    /// The `expires` day that has passed, when search marks this lesson as expired; `None` otherwise.
+    pub expired: Option<Date>,
     /// The lesson's tier from its use counts: `candidate`, `proven` or `archive`.
     pub tier: Tier,
 }
@@ -226,6 +231,8 @@ fn hit(l: &Lesson, kb: Option<&str>, root: &Path, score: f64, line: Option<(usiz
         relevance: None,
         verified: fm.verified.to_string(),
         verified_how: serde_json::to_value(fm.verified_how).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default(),
+        // Filled in `search_with` for the lessons whose `expires` day has passed.
+        expired: None,
         // Filled from the use counts in `search`; the other callers do not use the tier.
         tier: Tier::Candidate,
     }
@@ -351,7 +358,8 @@ fn pieces(query: &str) -> Vec<Vec<String>> {
     query.split_whitespace().map(tokens).filter(|t| !t.is_empty()).collect()
 }
 
-/// BM25 scores, times the place boost and each lesson's usage factor (0.9–1.1).
+/// BM25 scores, times the place boost and each lesson's usage factor (0.9–1.1). An expired lesson
+/// also takes `EXPIRED_FACTOR`, so it ranks below an equal live one.
 /// `ids` are the lessons' ids as rkb shows them (`<name>:<id>` for an extra), the keys of `usage`.
 fn rank(
     lessons: &[&Lesson],
@@ -359,6 +367,7 @@ fn rank(
     place: &Place,
     query: &str,
     usage: &std::collections::BTreeMap<String, crate::usage::Counts>,
+    today: Date,
 ) -> Vec<(usize, f64)> {
     let titles: Vec<String> = lessons.iter().map(|l| title(l)).collect();
     let pieces = pieces(query);
@@ -450,7 +459,8 @@ fn rank(
                 })
                 .sum();
             let used = usage.get(&ids[d]).map_or(1.0, crate::usage::Counts::factor);
-            (s > 0.0).then(|| (d, s * boost(&lessons[d].path, place) * used))
+            let expired = lessons[d].expired(today);
+            (s > 0.0).then(|| (d, s * boost(&lessons[d].path, place) * used * if expired { EXPIRED_FACTOR } else { 1.0 }))
         })
         .collect();
     scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| titles[a.0].cmp(&titles[b.0])));
@@ -504,8 +514,9 @@ pub fn search_with(root: &Path, extras: &[Extra], place: &Place, facts: &Facts, 
     let ids: Vec<String> = current.iter().map(|&i| qualified(loaded[i].kb.as_deref(), &loaded[i].lesson.frontmatter.id)).collect();
 
     let counts = crate::usage::counts(root);
+    let today = crate::lesson::today_utc();
     let ordered: Vec<Hit> = match mode {
-        Mode::Ranked(q) => rank(&lessons, &ids, place, q, &counts)
+        Mode::Ranked(q) => rank(&lessons, &ids, place, q, &counts, today)
             .into_iter()
             .map(|(i, s)| {
                 let d = &loaded[current[i]];
@@ -537,7 +548,13 @@ pub fn search_with(root: &Path, extras: &[Extra], place: &Place, facts: &Facts, 
         .into_iter()
         .map(|mut h| {
             let d = by_id[&h.id];
-            h.tier = crate::tier::of(d.lesson.frontmatter.status, counts.get(&h.id));
+            // An expired lesson acts as stale: the hooks that push only an active lesson skip it,
+            // and search shows why. The tier then follows the status it acts as.
+            if d.lesson.expired(today) && h.status == Status::Active {
+                h.status = Status::Stale;
+                h.expired = d.lesson.frontmatter.expires;
+            }
+            h.tier = crate::tier::of(h.status, counts.get(&h.id));
             let a = evaluate(&d.lesson.frontmatter.when, facts);
             (h, a)
         })
@@ -718,6 +735,28 @@ mod tests {
     }
 
     #[test]
+    fn an_expired_lesson_acts_as_stale_in_search() {
+        let kb = tempfile::tempdir().unwrap();
+        let r = kb.path();
+        write(r, "general/a/g.md", "0000000001", "Striping large files", "expires: 2020-01-01\n", "Words.");
+        write(r, "general/a/x.md", "0000000002", "Striping large files", "", "Words.");
+        write(r, "general/a/f.md", "0000000003", "Striping large files", "expires: 2099-01-01\n", "Words.");
+        let facts = Facts { values: Default::default(), ancestry: None };
+        let q = Mode::Ranked("striping".into());
+        let res = search(r, &place(None), &facts, &q, &opts()).unwrap();
+        assert_eq!(res.hits.len(), 3);
+        let by = |id: &str| res.hits.iter().find(|h| h.id == id).unwrap();
+        assert!(by("0000000002").status == Status::Active && by("0000000003").status == Status::Active, "a future date changes nothing");
+        let expired = by("0000000001");
+        assert_eq!(expired.status, Status::Stale, "a passed date acts as stale");
+        assert_eq!(expired.expired, Some(jiff::civil::date(2020, 1, 1)));
+        assert!(
+            res.hits.iter().position(|h| h.id == "0000000002") < res.hits.iter().position(|h| h.id == "0000000001"),
+            "the expired one ranks below the equal live one"
+        );
+    }
+
+    #[test]
     fn the_cache_warm_up_covers_stale_lessons_but_not_archived_ones() {
         let kb = tempfile::tempdir().unwrap();
         let r = kb.path();
@@ -812,6 +851,7 @@ mod tests {
             relevance: None,
             verified: String::new(),
             verified_how: String::new(),
+            expired: None,
             tier: Tier::Candidate,
         };
         let mut hits = vec![h("a"), h("b"), h("c"), h("d")];
