@@ -16,6 +16,13 @@ Run `rkb <command> --help` for flags.
 Run `rkb --help` for the commands this skill does not name.
 Run `rkb doctor` when something looks wrong, and run or show each `fix` line.
 
+## Which store owns which know-how
+
+- rkb owns checked fixes that apply across projects.
+- Hindsight owns chat facts.
+- Hermes skills own steps that work only on that machine.
+- MEMORY.md repeats nothing rkb has.
+
 ## Search first
 
 - Run `rkb search "<words from the problem or the error>"` before you fix an error, before a web search and before a guess.

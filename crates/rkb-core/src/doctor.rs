@@ -154,11 +154,14 @@ pub fn hook_checks(home: &Path, state_dir: &Path) -> Vec<Check> {
             Harness::Claude => "hooks: claude",
             Harness::Pi => "hooks: pi",
             Harness::Omp => "hooks: omp",
+            // Hermes runs no rkb hooks, so it has no hook check.
+            Harness::Hermes => continue,
         };
         let session = match h {
             Harness::Claude => "Claude Code",
             Harness::Pi => "pi",
             Harness::Omp => "omp",
+            Harness::Hermes => continue,
         };
         if h == Harness::Claude && crate::install::hooks_installed(home) {
             out.push(check(
@@ -227,6 +230,7 @@ pub fn skill_checks(home: &Path) -> Vec<Check> {
                 Harness::Claude => "plugin: claude",
                 Harness::Pi => "skill: pi",
                 Harness::Omp => "skill: omp",
+                Harness::Hermes => "skill: hermes",
             };
             let fix = Some(format!("run `rkb install {}` in a terminal", h.name()));
             match crate::install::status(h, home) {

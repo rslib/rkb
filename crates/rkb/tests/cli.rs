@@ -40,6 +40,7 @@ impl Env {
             .env("FAKE_CLAUDE_HOME", self.dir.path())
             .env("RKB_TTY", self.dir.path().join("no-tty"))
             .env_remove("CLAUDECODE")
+            .env_remove("HERMES_HOME")
             .env_remove("RKB_TEST_HOME")
             .env_remove("RKB_FORMAT")
             .env_remove("RKB_AGENT")
@@ -2457,7 +2458,7 @@ fn install_from_an_agent_needs_the_user() {
     let rows = v["harnesses"].as_array().unwrap();
     assert_eq!(
         rows.iter().map(|r| (r["harness"].as_str().unwrap(), r["detected"].as_bool().unwrap())).collect::<Vec<_>>(),
-        [("claude", true), ("pi", true), ("omp", false)]
+        [("claude", true), ("pi", true), ("omp", false), ("hermes", false)]
     );
 
     let (v, code) = env.json(&["install"], "");
@@ -2489,7 +2490,157 @@ fn install_from_an_agent_needs_the_user() {
 
     let (v, code) = env.json(&["install", "vscode"], "");
     assert_eq!((v["error"]["code"].as_str(), code), (Some("usage"), Some(2)));
-    assert!(v["error"]["fix"].as_str().unwrap().contains("claude, pi, omp"));
+    assert!(v["error"]["fix"].as_str().unwrap().contains("claude, pi, omp, hermes"));
+}
+
+/// Runs `rkb install hermes` (or `--uninstall`) in a throwaway `HERMES_HOME` and answers the confirm
+/// request the way `rkb install claude` is answered. The real `~/.hermes` is never touched.
+fn hermes_install(env: &Env, hermes: &Path, uninstall: bool) -> serde_json::Value {
+    let mut args = vec!["install", "hermes", "--format", "json"];
+    if uninstall {
+        args.push("--uninstall");
+    }
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("HERMES_HOME", hermes);
+    let o = rkb_with(c, &args, "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("not json: {}", stdout(&o)));
+    assert_eq!((v["status"].as_str(), o.status.code()), (Some("needs_user"), Some(3)), "{v}");
+
+    let tty = env.dir.path().join("tty");
+    std::fs::write(&tty, "yes\n").unwrap();
+    let choice = if uninstall { "uninstall" } else { "install" };
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("HERMES_HOME", hermes).env("RKB_TTY", &tty);
+    let o = rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", choice, "--format", "json"], "");
+    serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("not json: {}", stdout(&o)))
+}
+
+fn hermes_config_yaml(hermes: &Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(hermes.join("config.yaml")).unwrap();
+    serde_norway::from_str(&text).unwrap()
+}
+
+#[test]
+fn install_hermes_into_an_empty_home() {
+    let env = Env::new();
+    let hermes = env.dir.path().join("hermes-home");
+    let v = hermes_install(&env, &hermes, false);
+    assert_eq!(v["status"], "done", "{v}");
+
+    let doc = hermes_config_yaml(&hermes);
+    let entry = &doc["mcp_servers"]["rkb"];
+    let command = entry["command"].as_str().unwrap();
+    assert!(Path::new(command).is_absolute() && command.ends_with("rkb"), "the running rkb: {command}");
+    assert_eq!(entry["args"], serde_json::json!(["mcp", "--tools", "propose"]));
+    assert_eq!(entry["env"]["RKB_AGENT"], "hermes");
+    let config = std::fs::read_to_string(hermes.join("config.yaml")).unwrap();
+    assert!(!config.to_lowercase().contains("token"), "no secret is written: {config}");
+
+    let skill = std::fs::read_to_string(hermes.join("skills/rkb/SKILL.md")).unwrap();
+    assert!(skill.contains("rkb owns checked fixes that apply across projects"), "{skill}");
+    assert!(skill.len() < 2000, "the Hermes skill stays short: {} characters", skill.len());
+    assert!(!env.dir.path().join(".hermes").exists(), "HERMES_HOME wins over ~/.hermes");
+}
+
+#[test]
+fn install_hermes_uses_home_by_default() {
+    let env = Env::new();
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_AUTO_CONFIRM", "install");
+    let o = rkb_with(c, &["install", "hermes", "--format", "json"], "");
+    assert!(o.status.success(), "{}", stdout(&o));
+    assert!(env.dir.path().join(".hermes/config.yaml").exists(), "Hermes' own default is ~/.hermes");
+    assert!(env.dir.path().join(".hermes/skills/rkb/SKILL.md").exists());
+}
+
+#[test]
+fn install_hermes_passes_the_rkb_variables() {
+    // Hermes gives a stdio server only PATH, HOME, XDG_* and a few more, so the entry carries them.
+    let env = Env::new();
+    let kb = env.dir.path().join("server-kb");
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_AUTO_CONFIRM", "install").env("RKB_HOME", &kb).env("RKB_OFFLINE", "1").env("RKB_NTFY_TOKEN", "sekrit");
+    let o = rkb_with(c, &["install", "hermes", "--format", "json"], "");
+    assert!(o.status.success(), "{}", stdout(&o));
+    let hermes = env.dir.path().join(".hermes");
+    let entry = hermes_config_yaml(&hermes)["mcp_servers"]["rkb"]["env"].clone();
+    assert_eq!(entry["RKB_HOME"].as_str(), Some(kb.to_str().unwrap()), "{entry}");
+    assert_eq!(entry["RKB_OFFLINE"], "1", "{entry}");
+    assert_eq!(entry["RKB_NTFY_TOKEN"], "${RKB_NTFY_TOKEN}", "only a reference: {entry}");
+    let config = std::fs::read_to_string(hermes.join("config.yaml")).unwrap();
+    assert!(!config.contains("sekrit"), "the token value is never written: {config}");
+}
+
+#[test]
+fn install_hermes_keeps_comments_and_other_servers() {
+    let env = Env::new();
+    let hermes = env.dir.path().join("hermes-home");
+    std::fs::create_dir_all(&hermes).unwrap();
+    let original = "# my Hermes config\nmodel: claude\n\nmcp_servers:\n  fence:            # keep the fence\n    command: \"fence-cli\"\n    args: [\"serve\"]\n\nlogging:\n  level: info\n";
+    std::fs::write(hermes.join("config.yaml"), original).unwrap();
+
+    let v = hermes_install(&env, &hermes, false);
+    assert_eq!(v["status"], "done", "{v}");
+    let after = std::fs::read_to_string(hermes.join("config.yaml")).unwrap();
+    assert!(after.contains("# my Hermes config") && after.contains("# keep the fence"), "comments stay: {after}");
+    for line in original.lines().filter(|l| !l.is_empty()) {
+        assert!(after.contains(line), "lost {line:?}: {after}");
+    }
+    assert_eq!(hermes_config_yaml(&hermes)["mcp_servers"]["fence"]["command"], "fence-cli");
+    assert_eq!(std::fs::read_to_string(hermes.join("config.yaml.rkb-backup")).unwrap(), original);
+
+    let v = hermes_install(&env, &hermes, true);
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(std::fs::read_to_string(hermes.join("config.yaml")).unwrap(), original, "the rest is byte for byte");
+}
+
+#[test]
+fn install_hermes_twice_is_a_no_op() {
+    let env = Env::new();
+    let hermes = env.dir.path().join("hermes-home");
+    hermes_install(&env, &hermes, false);
+    let first = std::fs::read_to_string(hermes.join("config.yaml")).unwrap();
+
+    let v = hermes_install(&env, &hermes, false);
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(std::fs::read_to_string(hermes.join("config.yaml")).unwrap(), first);
+    let message = v["message"].as_str().unwrap();
+    assert!(message.contains("unchanged") && !message.contains("written"), "{message}");
+}
+
+#[test]
+fn install_hermes_refuses_a_different_entry() {
+    let env = Env::new();
+    let hermes = env.dir.path().join("hermes-home");
+    std::fs::create_dir_all(&hermes).unwrap();
+    let original = "mcp_servers:\n  rkb:\n    command: \"/usr/local/bin/other\"\n    args: [\"mcp\"]\n";
+    std::fs::write(hermes.join("config.yaml"), original).unwrap();
+
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("HERMES_HOME", &hermes);
+    let o = rkb_with(c, &["install", "hermes", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("not json: {}", stdout(&o)));
+    assert_eq!((v["error"]["code"].as_str(), o.status.code()), (Some("refused"), Some(1)), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("by hand"), "{v}");
+    assert_eq!(std::fs::read_to_string(hermes.join("config.yaml")).unwrap(), original, "the user's entry is untouched");
+}
+
+#[test]
+fn install_hermes_uninstall_keeps_an_edited_skill() {
+    let env = Env::new();
+    let hermes = env.dir.path().join("hermes-home");
+    hermes_install(&env, &hermes, false);
+    let skill = hermes.join("skills/rkb/SKILL.md");
+    let edited = format!("{}mine\n", std::fs::read_to_string(&skill).unwrap());
+    std::fs::write(&skill, &edited).unwrap();
+
+    let v = hermes_install(&env, &hermes, true);
+    assert_eq!(v["status"], "done", "{v}");
+    assert_eq!(std::fs::read_to_string(&skill).unwrap(), edited, "an edited skill stays");
+    let message = v["message"].as_str().unwrap();
+    assert!(message.contains("kept") && message.contains("edited"), "{message}");
+    let config = std::fs::read_to_string(hermes.join("config.yaml")).unwrap_or_default();
+    assert!(!config.contains("rkb"), "the server entry goes: {config}");
 }
 
 #[test]
@@ -4713,6 +4864,16 @@ fn note_posts_to_ntfy() {
         }
     }
     let _ = &v2;
+    // A `${RKB_NTFY_TOKEN}` that a launcher left unfilled sends no header.
+    let o3 = env
+        .cmd(env!("CARGO_BIN_EXE_rkb"))
+        .env("RKB_NTFY_TOKEN", "${RKB_NTFY_TOKEN}")
+        .args(["note", "an unfilled token reference", "--format", "json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(o3.status.code(), Some(0));
+    assert_eq!(log.0.lock().unwrap()[2].1, "", "an unfilled reference is not a token");
 }
 
 #[test]

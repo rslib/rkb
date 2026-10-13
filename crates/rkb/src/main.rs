@@ -199,10 +199,10 @@ enum Cmd {
         #[arg(long, requires = "reviewed", conflicts_with_all = ["rerank", "recall_sweep", "pick"])]
         first_stage: bool,
     },
-    /// Put the rkb skill, hooks and confirm gate into Claude Code, pi and omp.
-    #[command(after_help = "Example:\n  rkb install\n  rkb install --list\n  rkb install claude --uninstall")]
+    /// Put the rkb skill, hooks and confirm gate into Claude Code, pi, omp and Hermes.
+    #[command(after_help = "Example:\n  rkb install\n  rkb install --list\n  rkb install claude --uninstall\n  rkb install hermes")]
     Install {
-        /// claude, pi or omp. Default: every detected harness.
+        /// claude, pi, omp or hermes. Default: every detected harness.
         harnesses: Vec<String>,
         /// Show what is installed and whether it matches this rkb.
         #[arg(long, conflicts_with = "uninstall")]

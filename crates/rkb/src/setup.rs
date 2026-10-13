@@ -20,8 +20,8 @@ fn harnesses(names: &[String], home: &std::path::Path) -> Result<Vec<Harness>, C
         if found.is_empty() {
             return Err(CliError::new(
                 ErrorCode::NotFound,
-                "no supported harness found (~/.claude, ~/.pi or ~/.omp)",
-                "install Claude Code, pi or omp, or name one: rkb install claude",
+                "no supported harness found (~/.claude, ~/.pi, ~/.omp or ~/.hermes)",
+                "install Claude Code, pi, omp or Hermes, or name one: rkb install claude",
             ));
         }
         return Ok(found);

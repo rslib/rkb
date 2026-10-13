@@ -441,7 +441,7 @@ fn ntfy_post(env: &Env, url: &str, id: &str, text: &str) -> NtfyOutcome {
             }
         }
     }
-    let token = std::env::var("RKB_NTFY_TOKEN").ok().filter(|v| !v.is_empty());
+    let token = ntfy_token();
     let client: ureq::Agent =
         ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(std::time::Duration::from_secs(3))).build().into();
     let mut req = client.post(url).header("Content-Type", "application/json");
@@ -460,6 +460,12 @@ fn ntfy_post(env: &Env, url: &str, id: &str, text: &str) -> NtfyOutcome {
         return NtfyOutcome::Failed(format!("reading ntfy's reply failed: {e}"));
     }
     NtfyOutcome::Posted
+}
+
+/// `RKB_NTFY_TOKEN`, unless it is empty or still the `${RKB_NTFY_TOKEN}` reference a launcher such
+/// as Hermes leaves in place when its own secrets lack the token.
+fn ntfy_token() -> Option<String> {
+    std::env::var("RKB_NTFY_TOKEN").ok().filter(|v| !v.is_empty() && !v.starts_with("${"))
 }
 
 /// The JSON post body for a note; `cut` says the text was shortened to fit 4096 bytes.
@@ -497,7 +503,7 @@ pub fn pull(env: &Env, url: &str) -> Result<Output, CliError> {
     let client: ureq::Agent =
         ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(std::time::Duration::from_secs(10))).build().into();
     let mut req = client.get(&req_url);
-    if let Some(t) = std::env::var("RKB_NTFY_TOKEN").ok().filter(|v| !v.is_empty()) {
+    if let Some(t) = ntfy_token() {
         req = req.header("Authorization", &format!("Bearer {t}"));
     }
     let mut resp = req.call().map_err(|e| {
