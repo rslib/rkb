@@ -231,6 +231,46 @@ fn valid_extra_name(name: &str) -> bool {
     (1..=32).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// `[proposals] ntfy` from the machine `config.toml`: the ntfy topic URL notes are posted to, or `None`
+/// when the table or the key is absent. The value must be an http(s) URL with a topic path and no query
+/// string; anything else is a named error with a fix, so a typo can never silently stop a proposal from
+/// reaching the owner.
+pub fn proposals_ntfy(config_dir: &std::path::Path) -> Result<Option<String>, String> {
+    let (path, table) = machine(config_dir)?;
+    let Some(proposals) = table.get("proposals") else { return Ok(None) };
+    let proposals = proposals.as_table().ok_or_else(|| format!("{}: [proposals] must be a table", path.display()))?;
+    let Some(ntfy) = proposals.get("ntfy") else { return Ok(None) };
+    let url = ntfy.as_str().ok_or_else(|| format!("{}: [proposals] ntfy must be a URL string", path.display()))?;
+    if !valid_ntfy_url(url) {
+        return Err(format!("{}: [proposals] ntfy `{url}` is not an https topic URL", path.display()));
+    }
+    Ok(Some(url.to_string()))
+}
+
+/// An http(s) URL with a host and a non-empty topic path and no query or fragment, such as
+/// `https://ntfy.sh/mytopic`. ntfy manages the `?poll=1&since=...` query itself, so a configured URL with
+/// its own query or fragment is rejected.
+pub fn valid_ntfy_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else { return false };
+    if scheme != "http" && scheme != "https" {
+        return false;
+    }
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host = &rest[..host_end];
+    if host.is_empty() || host.contains(['@', ' ']) {
+        return false;
+    }
+    if host_end == rest.len() {
+        return false; // no topic path after the host
+    }
+    let path = &rest[host_end..];
+    // A topic path with no query, fragment or whitespace, and at least one non-empty segment.
+    if path.contains(['?', '#', ' ', '\\']) {
+        return false;
+    }
+    !path.trim_start_matches('/').is_empty()
+}
+
 /// Where the `[sinks.agent]` in force came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentSinkSource {
@@ -454,6 +494,33 @@ mod tests {
         assert!(off.chains.is_empty());
         let bad: toml::Table = toml::from_str("[observer]\ncmd = \"claude -p\"\n").unwrap();
         assert!(ObserverConfig::from_table(&bad).unwrap_err().contains("cmd"));
+    }
+
+    #[test]
+    fn proposals_ntfy_parses() {
+        let d = tempfile::tempdir().unwrap();
+        let config = d.path().join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        assert_eq!(proposals_ntfy(&config).unwrap(), None, "absent table is fine");
+        std::fs::write(config.join("config.toml"), "[proposals]\nntfy = \"https://ntfy.sh/kl\"\n").unwrap();
+        assert_eq!(proposals_ntfy(&config).unwrap().as_deref(), Some("https://ntfy.sh/kl"));
+        for bad in [
+            "ftp://ntfy.sh/kl",
+            "https://ntfy.sh",
+            "https://ntfy.sh/?a=1",
+            "https://ntfy.sh/topic?a=1",
+            "not a url",
+            "https://ntfy.sh/#frag",
+            "http://",
+            "user@ntfy.sh/topic",
+            "https://ntfy.sh/ ",
+        ] {
+            std::fs::write(config.join("config.toml"), format!("[proposals]\nntfy = \"{bad}\"\n")).unwrap();
+            let e = proposals_ntfy(&config).unwrap_err();
+            assert!(e.contains("[proposals] ntfy"), "{bad}: {e}");
+        }
+        std::fs::write(config.join("config.toml"), "[proposals]\nntfy = 7\n").unwrap();
+        assert!(proposals_ntfy(&config).unwrap_err().contains("URL string"));
     }
 
     #[test]

@@ -4405,6 +4405,217 @@ fn fake_jev(reply: impl Fn(&serde_json::Value) -> (u16, String) + Send + 'static
     (url, log)
 }
 
+/// A fake ntfy server on 127.0.0.1. `reply(method, path, body) -> (status, response)` answers each
+/// request; `log` records `(method, authorization, body)` of every request. The topic is `/topic`.
+#[derive(Default, Clone)]
+struct NtfyLog(std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>);
+
+fn fake_ntfy(reply: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static) -> (String, NtfyLog) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/topic", listener.local_addr().unwrap());
+    let log = NtfyLog::default();
+    let seen = log.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut r = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            if r.read_line(&mut request_line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or("").to_string();
+            let path = parts.next().unwrap_or("").to_string();
+            let (mut auth, mut len) = (String::new(), 0usize);
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.split_once(':').unwrap_or((&line, ""));
+                match name.to_ascii_lowercase().as_str() {
+                    "authorization" => auth = value.trim().to_string(),
+                    "content-length" => len = value.trim().parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+            let mut body = vec![0u8; len];
+            r.read_exact(&mut body).unwrap();
+            let body = String::from_utf8_lossy(&body).into_owned();
+            let (status, text) = reply(&method, &path, &body);
+            seen.0.lock().unwrap().push((method, auth, body));
+            let mut w = stream;
+            let _ = write!(
+                w,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                text.len()
+            );
+        }
+    });
+    (url, log)
+}
+
+fn set_proposals_ntfy(env: &Env, url: &str) {
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), &format!("[proposals]\nntfy = \"{url}\"\n"));
+}
+
+#[test]
+fn note_posts_to_ntfy() {
+    let env = search_kb();
+    let (url, log) = fake_ntfy(|_m, _p, _b| (200, "{}".to_string()));
+    set_proposals_ntfy(&env, &url);
+
+    // An agent's note becomes one POST whose body has the text and the agent name.
+    let o1 = env
+        .cmd(env!("CARGO_BIN_EXE_rkb"))
+        .env("RKB_AGENT", "worker-1")
+        .args(["note", "hdf5 needs -lz after -lhdf5", "--format", "json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(o1.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&o1.stdout).unwrap();
+    let reqs = log.0.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 1, "exactly one post");
+    let (method, auth, body) = &reqs[0];
+    assert_eq!(method, "POST");
+    assert_eq!(auth, "", "no token set; empty auth header");
+    let posted: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(posted["v"], 1);
+    assert_eq!(posted["agent"], "worker-1");
+    assert_eq!(posted["text"], "hdf5 needs -lz after -lhdf5");
+    assert_eq!(posted["id"], v["id"].as_str().unwrap());
+    assert!(posted["time"].as_u64().is_some(), "a post time is set");
+    assert!(posted.get("cut").is_none(), "a short note is not cut");
+    assert_eq!(v["id"].as_str().unwrap().len(), 10, "the note got an inbox id");
+
+    // A note that the leak scan flags is not posted; the note stays local and the result says why.
+    let o = env.rkb(&["note", "mail alice@example.org about the fix", "--toon"]);
+    assert_eq!(o.status.code(), Some(0), "a leak-flagged note still succeeds locally");
+    let human = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(human.contains("leak"), "the result says why it was not posted: {human}");
+    assert_eq!(log.0.lock().unwrap().len(), 1, "the leak-flagged note was not posted");
+    let (vinbox, _) = env.json(&["inbox"], "");
+    assert_eq!(vinbox["items"].as_array().unwrap().len(), 2, "both notes are in the local inbox");
+
+    // The token from the environment goes as Authorization: Bearer, and only there.
+    let o2 = env
+        .cmd(env!("CARGO_BIN_EXE_rkb"))
+        .env("RKB_AGENT", "worker-2")
+        .env("RKB_NTFY_TOKEN", "sekrit")
+        .args(["note", "the token must reach the server", "--format", "json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(o2.status.code(), Some(0));
+    let v2: serde_json::Value = serde_json::from_slice(&o2.stdout).unwrap();
+    let reqs = log.0.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[1].1, "Bearer sekrit");
+    // The token is never written to a state or config file.
+    for entry in walkdir_files(env.dir.path()) {
+        let text = std::fs::read_to_string(&entry).unwrap_or_default();
+        if text.contains("sekrit") {
+            panic!("the token leaked into {}: {text}", entry.display());
+        }
+    }
+    let _ = &v2;
+}
+
+#[test]
+fn note_stays_when_ntfy_is_down() {
+    // Port 1 refuses connections fast, so the post fails without hanging the note.
+    let env = search_kb();
+    set_proposals_ntfy(&env, "http://127.0.0.1:1/topic");
+    let o = env.rkb(&["note", "a note that must survive a dead ntfy", "--toon"]);
+    assert_eq!(o.status.code(), Some(0), "a failed post is not a note error");
+    let human = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(human.contains("the ntfy post failed"), "{human}");
+    let (vinbox, _) = env.json(&["inbox"], "");
+    assert_eq!(vinbox["items"].as_array().unwrap().len(), 1, "the note stays in the inbox");
+}
+
+fn walkdir_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = vec![];
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn inbox_pull_adds_once() {
+    use serde_json::json;
+    let env = search_kb();
+    // ntfy's poll reply: one JSON event per line, oldest first, with string message ids.
+    let events = [
+        json!({"id": "kOpen1", "event": "open", "topic": "topic", "time": 50}),
+        json!({"id": "sPs71M8A2T", "event": "message", "topic": "topic", "time": 100,
+               "message": json!({"v": 1, "agent": "worker-1", "id": "a", "time": 100, "text": "first note"}).to_string()}),
+        json!({"id": "Q2b9xLm0Kd", "event": "message", "topic": "topic", "time": 200,
+               "message": json!({"v": 1, "agent": "worker-2", "id": "b", "time": 200, "text": "second \u{1b}[31mnote"}).to_string()}),
+        json!({"id": "Zz3", "event": "message", "topic": "topic", "time": 300, "message": "this is not the JSON body"}),
+        json!({"id": "Ab4", "event": "message", "topic": "topic", "time": 400,
+               "message": json!({"v": 1, "agent": "Bad Agent!", "id": "d", "time": 400, "text": "from a bad agent"}).to_string()}),
+    ];
+    let lines: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+    let ids: Vec<String> = events.iter().map(|e| e["id"].as_str().unwrap().to_string()).collect();
+    let reset = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ignore_since = reset.clone();
+    let (url, log) = fake_ntfy(move |_m, path, _b| {
+        let Some(since) = path.strip_prefix("/topic/json?poll=1&since=") else { return (404, String::new()) };
+        // A server that lost its place answers everything again.
+        let from = match ids.iter().position(|i| i == since) {
+            Some(i) if !ignore_since.load(std::sync::atomic::Ordering::SeqCst) => i + 1,
+            _ => 0,
+        };
+        (200, lines[from..].iter().map(|l| format!("{l}\n")).collect())
+    });
+
+    let (v, code) = env.json(&["inbox", "pull", &url], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(v["added"], 3, "two valid and one bad-agent message are added: {v}");
+    assert_eq!(v["skipped"], 1, "a malformed message is skipped and counted: {v}");
+
+    let (v, code) = env.json(&["inbox", "pull", &url], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(v["added"], 0, "a second pull adds nothing: {v}");
+    reset.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (v, _) = env.json(&["inbox", "pull", &url], "");
+    assert_eq!(v["added"], 0, "a since reset adds nothing: {v}");
+    assert_eq!(log.0.lock().unwrap().len(), 3, "each pull is one GET");
+
+    // The inbox has the messages once: 2 valid + 1 bad-agent (as unknown), not duplicated.
+    let (vinbox, _) = env.json(&["inbox"], "");
+    let items = vinbox["items"].as_array().unwrap().clone();
+    assert_eq!(items.len(), 3, "{vinbox}");
+    let id = items.iter().find(|i| i["preview"] == "first note").map(|i| i["id"].as_str().unwrap().to_string()).unwrap();
+    let (shown, _) = env.json(&["inbox", "show", &id], "");
+    assert_eq!(shown["meta"]["source"], "ntfy:worker-1", "{shown}");
+    assert!(items.iter().any(|i| i["preview"] == "second [31mnote"), "control characters are stripped: {vinbox}");
+    let bad = items.iter().find(|i| i["preview"] == "from a bad agent").map(|i| i["id"].as_str().unwrap().to_string()).unwrap();
+    let (shown, _) = env.json(&["inbox", "show", &bad], "");
+    assert_eq!(shown["meta"]["source"], "ntfy:unknown", "a bad agent name becomes unknown: {shown}");
+    // Nothing pulled is promoted, approved or run automatically: the kb is untouched.
+    assert_eq!(stdout(&env.git(&["status", "--porcelain"])), "", "pulling writes nothing to the knowledge base");
+
+    // A bad [proposals] ntfy refuses the note before it is written.
+    set_proposals_ntfy(&env, "ftp://example.invalid/topic");
+    let o = env.rkb(&["note", "refused before the add", "--toon"]);
+    assert_ne!(o.status.code(), Some(0));
+    let (vinbox, _) = env.json(&["inbox"], "");
+    assert_eq!(vinbox["items"].as_array().unwrap().len(), 3, "a refused note is not written: {vinbox}");
+}
+
 /// Answers every question, rating later candidates higher, so a Jev ranking reverses BM25's.
 fn jev_answers(body: &serde_json::Value) -> (u16, String) {
     let keys: Vec<String> = body["questions"].as_object().unwrap().keys().cloned().collect();

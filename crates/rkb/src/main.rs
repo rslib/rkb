@@ -545,6 +545,12 @@ enum InboxCmd {
         #[arg(long, value_name = "INDEX=OP[:ID]")]
         outcome: Vec<String>,
     },
+    /// Read the proposals a server published since the last pull and add them to the inbox, once.
+    #[command(after_help = "Example:\n  rkb inbox pull https://ntfy.sh/mytopic")]
+    Pull {
+        /// The ntfy topic URL, the same one [proposals] ntfy sets.
+        url: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -939,6 +945,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Inbox { action: Some(InboxCmd::Show { id }) } => inbox::show(&env, &id),
         Cmd::Inbox { action: Some(InboxCmd::Triage { ask }) } => inbox::triage(&env, ask.as_deref()),
         Cmd::Inbox { action: Some(InboxCmd::Done { ids, outcome }) } => inbox::done(&env, &ids, &outcome),
+        Cmd::Inbox { action: Some(InboxCmd::Pull { url }) } => inbox::pull(&env, &url),
         Cmd::Models { action: ModelsCmd::Fetch } => models_fetch(env.colored),
         Cmd::Models { action: ModelsCmd::Warm } => {
             kb::open(&root)?;
