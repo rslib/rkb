@@ -445,16 +445,20 @@ fn digest_ranks_and_caps() {
     assert!(human.contains("module prefix"), "{human}");
     assert!(!human.contains(&pitfall) && !human.contains("local build") && !human.contains("std regex"), "{human}");
 
+    // Written as files in one commit: 100 `rkb add` calls make 100 commits and take most of the suite's time.
     for i in 0..100 {
-        add_ok(
-            &env,
-            if i % 2 == 0 { "cmake" } else { "cpp" },
-            &preference_with(
-                &format!("Standing preference number {i} for daily work"),
-                &format!("Follow standing preference number {i} in daily work."),
-            ),
-        );
+        let text = preference_with(
+            &format!("Standing preference number {i} for daily work"),
+            &format!("Follow standing preference number {i} in daily work."),
+        )
+        .replacen("---\n", &format!("---\nschema: 1\nid: e{i:09}\nstatus: active\nverified: 2026-09-25\n"), 1);
+        env.write(&format!("general/{}/standing-{i}.md", if i % 2 == 0 { "cmake" } else { "cpp" }), &text);
     }
+    assert!(env.git(&["add", "-A"]).status.success());
+    let o = env.git(&["commit", "-q", "-m", "standing preferences"]);
+    assert!(o.status.success(), "{}{}", stdout(&o), String::from_utf8_lossy(&o.stderr));
+    let (v, _) = env.json(&["list", "general/cmake"], "");
+    assert!(v.to_string().contains("e000000098"), "the written lessons are in the knowledge base: {v}");
     let human = stdout(&env.rkb(&["digest"]));
     assert!(human.chars().count() <= 1200, "{} chars: {human}", human.chars().count());
     let (v, _) = env.json(&["digest"], "");
