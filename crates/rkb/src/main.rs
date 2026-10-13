@@ -5,6 +5,7 @@ mod graphing;
 mod hook;
 mod inbox;
 mod list;
+mod maintain;
 mod mcp;
 mod output;
 mod promote;
@@ -210,6 +211,13 @@ enum Cmd {
         /// Remove what `rkb install` added.
         #[arg(long)]
         uninstall: bool,
+    },
+    /// Install or remove the OS job that runs `rkb maintain` twice a day: a launchd agent on macOS,
+    /// a catch-up systemd user timer on Linux.
+    #[command(after_help = "Example:\n  rkb schedule install\n  rkb schedule install --uninstall")]
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleCmd,
     },
     /// Print the current project, system and lesson counts in at most 5 lines, for a session hook.
     #[command(after_help = "Example:\n  rkb context")]
@@ -469,6 +477,14 @@ enum Cmd {
         #[arg(long, default_value = "claude-code")]
         harness: String,
     },
+    /// Run one upkeep pass on the inbox under a lock: pull proposals, rule triage, expire
+    /// transcripts, fade unused automatic lessons, then promote within the daily model cap.
+    #[command(after_help = "Example:\n  rkb maintain\n  rkb maintain --harness pi")]
+    Maintain {
+        /// claude-code, pi or omp.
+        #[arg(long, default_value = "claude-code")]
+        harness: String,
+    },
     /// Run a model step through another runner, such as the Claude Code mod: `prepare` prints a prompt and
     /// the models to ask, `finish` reads the model's answer and does what rkb would do with it.
     #[command(
@@ -518,6 +534,17 @@ enum Cmd {
         /// Set by the Claude Code mod. Without it, a hook of the session in `RKB_MOD` does nothing.
         #[arg(long = "mod")]
         from_mod: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScheduleCmd {
+    /// Install the job, or remove the files rkb wrote with --uninstall. Asks the user first.
+    #[command(after_help = "Example:\n  rkb schedule install\n  rkb schedule install --uninstall")]
+    Install {
+        /// Remove the job files rkb wrote, after unloading the job.
+        #[arg(long)]
+        uninstall: bool,
     },
 }
 
@@ -835,6 +862,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             graphing::graph(&env, view)
         }
         Cmd::Install { harnesses, list, uninstall } => setup::install(&env, harnesses, list, uninstall),
+        Cmd::Schedule { action: ScheduleCmd::Install { uninstall } } => setup::schedule(&env, uninstall),
         Cmd::Context => {
             kb::open(&root)?;
             let s = rkb_core::state::build(&root, env.place.clone().unwrap_or_default(), &env.state)?;
@@ -952,6 +980,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Tools => Ok(agent::list()),
         Cmd::Tool { .. } | Cmd::Mcp { .. } => unreachable!("main runs tools and the MCP server first"),
         Cmd::Promote { max, harness } => promote::run(&env, max, &harness),
+        Cmd::Maintain { harness } => maintain::run(&env, &harness),
         Cmd::Job { action: JobCmd::Prepare { kind: PrepareCmd::Triage { harness, model } } } => {
             inbox::prepare_triage(&env, &harness, model.as_deref())
         }

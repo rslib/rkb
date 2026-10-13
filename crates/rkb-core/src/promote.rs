@@ -170,6 +170,26 @@ pub fn log_call(state: &Path, id: &str, model: &str, input_tokens: u64, output_t
     let _ = crate::lock::append_line(&log_file(state), &line.to_string());
 }
 
+/// Records the lesson a promotion wrote, with its time. `rkb maintain` reads these back to know which
+/// lessons the fade may archive, without a new frontmatter field.
+pub fn log_lesson(state: &Path, item: &str, lesson: &str) {
+    let line = serde_json::json!({ "time": crate::request::now(), "item": item, "lesson": lesson }).to_string();
+    let _ = crate::lock::append_line(&log_file(state), &line);
+}
+
+/// The lessons promotion wrote from the log, each with the time of its latest write: `(lesson id, epoch secs)`.
+pub fn promoted(state: &Path) -> Vec<(String, u64)> {
+    let Ok(text) = std::fs::read_to_string(log_file(state)) else { return vec![] };
+    let mut out: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let Some(lesson) = v["lesson"].as_str().filter(|l| !l.is_empty()) else { continue };
+        let time = v["time"].as_u64().unwrap_or(0);
+        out.entry(lesson.to_string()).and_modify(|t| *t = (*t).max(time)).or_insert(time);
+    }
+    out.into_iter().collect()
+}
+
 /// The reason a promotion log line gives when the answer quoted text the item does not hold.
 pub const BAD_QUOTE: &str = "the quote is not in the item";
 
@@ -319,6 +339,20 @@ mod tests {
         log_call(s, "a", "haiku", 4000, 200, "add", None);
         log_call(s, "b", "haiku", 1000, 50, "noop", Some("one off"));
         assert_eq!(cost(s), (1, 5250));
+    }
+
+    #[test]
+    fn promoted_lessons_keep_the_latest_write_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = dir.path();
+        assert!(promoted(s).is_empty());
+        log_lesson(s, "a", "0000000001");
+        log_call(s, "b", "haiku", 1, 1, "noop", None);
+        log_lesson(s, "c", "0000000001");
+        log_lesson(s, "d", "0000000002");
+        let by_id: std::collections::BTreeMap<String, u64> = promoted(s).into_iter().collect();
+        assert_eq!(by_id.len(), 2, "two lessons written");
+        assert!(by_id["0000000001"] >= by_id["0000000002"], "the latest write of the first lesson is kept");
     }
 
     #[test]

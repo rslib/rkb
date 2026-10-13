@@ -283,25 +283,78 @@ impl Harness {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
-    WriteSkill { dir: PathBuf },
-    RemoveSkill { dir: PathBuf },
-    WriteHermesConfig { file: PathBuf, bin: String },
-    RemoveHermesConfig { file: PathBuf },
-    WriteHermesSkill { dir: PathBuf },
-    RemoveHermesSkill { dir: PathBuf },
-    AddAskRule { settings: PathBuf },
-    RemoveAskRule { settings: PathBuf },
-    AddHooks { settings: PathBuf, bin: String },
-    RemoveHooks { settings: PathBuf },
-    WriteExtension { file: PathBuf, text: String },
-    RemoveExtension { file: PathBuf },
-    WriteCommand { file: PathBuf, text: &'static str },
-    RemoveCommand { file: PathBuf },
-    WritePlugin { dir: PathBuf, bin: String },
-    ClaudePlugin { dir: PathBuf, program: String, bin: String },
-    RemovePlugin { dir: PathBuf, program: String },
-    Trust { file: PathBuf, name: &'static str },
-    Untrust { file: PathBuf, name: &'static str },
+    WriteSkill {
+        dir: PathBuf,
+    },
+    RemoveSkill {
+        dir: PathBuf,
+    },
+    WriteHermesConfig {
+        file: PathBuf,
+        bin: String,
+    },
+    RemoveHermesConfig {
+        file: PathBuf,
+    },
+    WriteHermesSkill {
+        dir: PathBuf,
+    },
+    RemoveHermesSkill {
+        dir: PathBuf,
+    },
+    AddAskRule {
+        settings: PathBuf,
+    },
+    RemoveAskRule {
+        settings: PathBuf,
+    },
+    AddHooks {
+        settings: PathBuf,
+        bin: String,
+    },
+    RemoveHooks {
+        settings: PathBuf,
+    },
+    WriteExtension {
+        file: PathBuf,
+        text: String,
+    },
+    RemoveExtension {
+        file: PathBuf,
+    },
+    WriteCommand {
+        file: PathBuf,
+        text: &'static str,
+    },
+    RemoveCommand {
+        file: PathBuf,
+    },
+    WritePlugin {
+        dir: PathBuf,
+        bin: String,
+    },
+    ClaudePlugin {
+        dir: PathBuf,
+        program: String,
+        bin: String,
+    },
+    RemovePlugin {
+        dir: PathBuf,
+        program: String,
+    },
+    Trust {
+        file: PathBuf,
+        name: &'static str,
+    },
+    Untrust {
+        file: PathBuf,
+        name: &'static str,
+    },
+    /// The OS timer that runs `rkb maintain`: the whole schedule plan, in one step.
+    Schedule {
+        uninstall: bool,
+        path: PathBuf,
+    },
 }
 
 impl Step {
@@ -320,6 +373,7 @@ impl Step {
             Step::WritePlugin { dir, .. } | Step::RemovePlugin { dir, .. } => dir.clone(),
             Step::ClaudePlugin { .. } => PathBuf::from(format!("claude plugin {PLUGIN}")),
             Step::Trust { file, .. } | Step::Untrust { file, .. } => file.clone(),
+            Step::Schedule { path, .. } => path.clone(),
         }
     }
 }
@@ -338,8 +392,12 @@ pub struct Change {
     pub effect: Effect,
 }
 
-/// The steps for `harnesses`. Reads nothing and writes nothing.
+/// The steps for `harnesses`. Reads nothing and writes nothing. An empty harness list asks for the
+/// OS schedule instead: `rkb schedule install` stores that request, and nothing else builds one.
 pub fn plan(home: &Path, config_dir: &Path, harnesses: &[Harness], uninstall: bool) -> Vec<Step> {
+    if harnesses.is_empty() {
+        return vec![Step::Schedule { uninstall, path: crate::schedule::primary_path(home) }];
+    }
     let mut steps = vec![];
     for h in harnesses {
         if *h == Harness::Hermes {
@@ -942,9 +1000,18 @@ pub fn preflight(steps: &[Step]) -> Result<()> {
 /// Runs the steps after `preflight`, so a missing `claude` or an invalid settings file stops it before any write.
 pub fn apply(steps: &[Step], skill: &str) -> Result<Vec<Change>> {
     preflight(steps)?;
-    let mut out = vec![];
+    let mut out: Vec<Change> = vec![];
     for s in steps {
         let effect = match s {
+            Step::Schedule { uninstall, .. } => {
+                for c in crate::schedule::install(*uninstall)? {
+                    match out.iter_mut().find(|x: &&mut Change| x.path == c.path) {
+                        Some(x) => x.effect = c.effect,
+                        None => out.push(c),
+                    }
+                }
+                continue;
+            }
             Step::WriteSkill { dir } => changed(write_skill(dir, skill)?, Effect::Written),
             Step::RemoveSkill { dir } => changed(remove_skill(dir)?, Effect::Removed),
             Step::WriteHermesConfig { file, bin } => changed(hermes_config(file, Some(bin))?, Effect::Written),

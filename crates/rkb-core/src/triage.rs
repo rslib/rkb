@@ -59,6 +59,11 @@ pub fn text<'a>(item: &'a Item, c: &Candidate) -> &'a str {
     c.line.and_then(|n| item.body.lines().nth(n)).map_or(item.body.as_str(), str::trim)
 }
 
+/// Whether the rule triage marked any candidate of `item` drop, so the upkeep pass removes it.
+pub fn dropped(item: &Item) -> bool {
+    item.meta.candidates.iter().any(|c| c.verdict == Verdict::Drop)
+}
+
 /// The rule pass: a verdict for what needs no model, else `None`.
 pub fn rule(item: &Item, c: &Candidate) -> Option<(Verdict, &'static str)> {
     let signals = &item.meta.signals;

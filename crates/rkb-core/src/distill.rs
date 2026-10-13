@@ -323,6 +323,17 @@ pub fn max_items(config_dir: &Path) -> usize {
         .map_or(DEFAULT_MAX_ITEMS, |n| n.max(1) as usize)
 }
 
+/// Days a transcript inbox item may wait before `rkb maintain` removes it.
+pub const DEFAULT_TRANSCRIPT_DAYS: u64 = 14;
+
+/// The `[inbox] transcript_days` age for transcript items, from 0 to 3650 days.
+pub fn transcript_days(config_dir: &Path) -> u64 {
+    crate::config::machine(config_dir)
+        .ok()
+        .and_then(|(_, t)| t.get("inbox")?.get("transcript_days")?.as_integer())
+        .map_or(DEFAULT_TRANSCRIPT_DAYS, |n| n.clamp(0, 3650) as u64)
+}
+
 /// Lines of one extract at most; the most recent part is kept.
 pub const MAX_LINES: usize = 400;
 /// Error lines kept per failed command.
@@ -1161,6 +1172,16 @@ mod tests {
         assert_eq!(batch(d.path()), 8);
         std::fs::write(d.path().join("config.toml"), "[distill]\nbatch = 99\n").unwrap();
         assert_eq!(batch(d.path()), 20);
+    }
+
+    #[test]
+    fn transcript_days_from_config() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(transcript_days(d.path()), DEFAULT_TRANSCRIPT_DAYS);
+        std::fs::write(d.path().join("config.toml"), "[inbox]\ntranscript_days = 3\n").unwrap();
+        assert_eq!(transcript_days(d.path()), 3);
+        std::fs::write(d.path().join("config.toml"), "[inbox]\ntranscript_days = 99999\n").unwrap();
+        assert_eq!(transcript_days(d.path()), 3650);
     }
 
     #[test]

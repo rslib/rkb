@@ -10,6 +10,53 @@ use crate::output::tilde;
 use crate::output::{CliError, ErrorCode, Output, paint};
 use crate::writes::{Env, needs_user_output};
 
+/// `rkb schedule install [--uninstall]`: install or remove the OS job that runs `rkb maintain` twice
+/// a day. It reuses the install request: an agent gets the question, a person at a terminal gets the job.
+pub fn schedule(env: &Env, uninstall: bool) -> Result<Output, CliError> {
+    let home = home();
+    let steps = install::plan(&home, &paths::config_dir(), &[], uninstall);
+    install::preflight(&steps)?;
+    let person = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !person {
+        let file = tilde(&rkb_core::schedule::primary_path(&home));
+        let (verb, choice) = if uninstall { ("Remove", "uninstall") } else { ("Install", "install") };
+        let req = Request {
+            id: request::new_id(),
+            created: request::now(),
+            action: Action::Install { harnesses: vec![], uninstall },
+            approved: vec![],
+            question: format!(
+                "{verb} the OS job that runs `rkb maintain` at 09:00 and 21:00? It writes {file} and loads it into the OS scheduler, with RKB_HOME and PATH."
+            ),
+            choices: vec![
+                Choice { text: choice.into(), decision: Some(Decision::Install) },
+                Choice { text: "cancel".into(), decision: None },
+            ],
+            session: None,
+        };
+        request::save(&env.state.join("requests"), &req)?;
+        return needs_user_output(env, &req);
+    }
+    let changes = install::apply(&steps, install::SKILL)?;
+    let home_text = home.display().to_string();
+    let mut human = String::new();
+    for line in install::report(&steps, &changes) {
+        let color = if line.starts_with("written") {
+            "32"
+        } else if line.starts_with("removed") {
+            "33"
+        } else {
+            "2"
+        };
+        human.push_str(&format!("{}\n", paint(env.colored, color, &line.replace(&home_text, "~"))));
+    }
+    if changes.iter().all(|c| c.effect == Effect::Unchanged) {
+        human.push_str("Nothing changed; the job was already in place.\n");
+    }
+    let rows: Vec<serde_json::Value> = changes.iter().map(|c| json!({ "path": tilde(&c.path), "effect": c.effect })).collect();
+    Ok(Output { data: json!({ "status": "done", "changes": rows }), human, exit: 0, raw: false })
+}
+
 fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
 }

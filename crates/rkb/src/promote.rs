@@ -94,26 +94,48 @@ fn lesson_text(answer: &promote::Answer) -> String {
     format!("{fm}# {title}\n\n{text}")
 }
 
-/// Promotes up to `max` repeated items with one model call each. `max` defaults to
-/// `[promote] max_per_pass` (3). One pass runs at a time, and one item stands for each signature.
+/// Promotes up to `max` repeated items with one model call each, under the upkeep lock. `max` defaults
+/// to `[promote] max_per_pass` (3). `rkb maintain` calls `run_locked` instead, because it holds that lock.
 pub fn run(env: &Env, max: Option<usize>, harness: &str) -> Result<Output, CliError> {
+    let Ok(_guard) = rkb_core::lock::acquire(&rkb_core::maintain::lock_path(&env.state), 3600, Duration::ZERO) else {
+        return Ok(busy());
+    };
+    run_locked(env, max, harness, false, || true)
+}
+
+/// A second pass that found the upkeep lock held: exit 0, no step run.
+fn busy() -> Output {
+    let human = format!("{}; nothing promoted", rkb_core::maintain::BUSY);
+    Output { data: json!({ "promoted": 0, "reason": rkb_core::maintain::BUSY }), human, exit: 0, raw: false }
+}
+
+/// Promotes up to `max` repeated items with one model call each. With `stop_on_failure` the model step
+/// ends on the first failed or timed-out run and leaves its item for a later pass. `next_call` says
+/// whether the daily cap still allows a call and counts it when it does.
+pub fn run_locked<F: FnMut() -> bool>(
+    env: &Env,
+    max: Option<usize>,
+    harness: &str,
+    stop_on_failure: bool,
+    mut next_call: F,
+) -> Result<Output, CliError> {
     let config = rkb_core::paths::config_dir();
     let Some(cfg) = observer::ready(&config, harness) else {
         let human = "no approved model chain; nothing promoted".to_string();
         return Ok(Output { data: json!({ "promoted": 0, "reason": "no approved model chain" }), human, exit: 0, raw: false });
-    };
-    // Two session ends can overlap, so one pass at a time.
-    let Ok(_guard) = rkb_core::lock::acquire(&env.state.join("promote.lock"), 3600, Duration::ZERO) else {
-        let human = "another promotion pass is running; nothing promoted".to_string();
-        return Ok(Output { data: json!({ "promoted": 0, "reason": "another promotion pass is running" }), human, exit: 0, raw: false });
     };
     let items = promote::ready_items(&env.state);
     // One item per signature: the others are the same failure, and one lesson covers them all.
     let reps = promote::representatives(&items);
     let cap = max.unwrap_or_else(|| promote::max_per_pass(&config));
     let (mut promoted, mut left) = (0usize, 0usize);
+    let mut skip: Option<String> = None;
     let mut results = vec![];
     for item in reps.iter().take(cap) {
+        if !next_call() {
+            skip = Some("the daily cap is reached".to_string());
+            break;
+        }
         // The duplicates go before the model call, so a failed write leaves none behind.
         if !item.meta.signatures.is_empty() {
             distill::remove_signatures(&env.state, &item.meta.signatures, &item.id);
@@ -130,12 +152,22 @@ pub fn run(env: &Env, max: Option<usize>, harness: &str) -> Result<Output, CliEr
             Ran::Ok { text, usage } => (text, usage.unwrap_or((0, 0))),
             Ran::Failed(reason) => {
                 promote::log_call(&env.state, &item.id, &model, 0, 0, "failed", None);
+                if stop_on_failure {
+                    skip = Some(format!("the model program failed: {reason}"));
+                    results.push(json!({ "id": item.id, "action": "failed", "reason": reason }));
+                    break;
+                }
                 distill::remove(&env.state, &item.id);
                 results.push(json!({ "id": item.id, "action": "failed", "reason": reason }));
                 continue;
             }
             Ran::Timeout => {
                 promote::log_call(&env.state, &item.id, &model, 0, 0, "timeout", None);
+                if stop_on_failure {
+                    skip = Some("the model program timed out".to_string());
+                    results.push(json!({ "id": item.id, "action": "timeout" }));
+                    break;
+                }
                 distill::remove(&env.state, &item.id);
                 results.push(json!({ "id": item.id, "action": "timeout" }));
                 continue;
@@ -263,7 +295,13 @@ pub fn run(env: &Env, max: Option<usize>, harness: &str) -> Result<Output, CliEr
                 continue;
             }
         };
+        let lesson = written.data["id"].as_str().map(str::to_string);
         promote::log_call(&env.state, &item.id, &model, input, output, &answer.action, None);
+        if matches!(answer.action.as_str(), "add" | "update")
+            && let Some(lesson) = &lesson
+        {
+            promote::log_lesson(&env.state, &item.id, lesson);
+        }
         if written.exit == 3 {
             // The request holds the write, so the item goes and no pass pays for the same call again.
             for sig in &item.meta.signatures {
@@ -283,16 +321,16 @@ pub fn run(env: &Env, max: Option<usize>, harness: &str) -> Result<Output, CliEr
         results.push(json!({ "id": item.id, "action": answer.action }));
     }
     let (accepted, total_tokens) = promote::cost(&env.state);
-    let human = format!(
-        "promoted {promoted} of {} repeated items ({left} left for the user); {accepted} accepted lessons cost {total_tokens} tokens",
-        reps.len()
-    );
-    Ok(Output {
-        data: json!({ "promoted": promoted, "left": left, "ready": reps.len(), "results": results, "accepted": accepted, "tokens": total_tokens }),
-        human,
-        exit: 0,
-        raw: false,
-    })
+    let human = match &skip {
+        Some(reason) => format!("promoted {promoted} of {} repeated items; skipped the model step: {reason}", reps.len()),
+        None => format!("promoted {promoted} of {} repeated items ({left} left for the user)", reps.len()),
+    };
+    let human = format!("{human}; {accepted} accepted lessons cost {total_tokens} tokens");
+    let mut data = json!({ "promoted": promoted, "left": left, "ready": reps.len(), "results": results, "accepted": accepted, "tokens": total_tokens });
+    if let Some(reason) = skip {
+        data["skip"] = reason.into();
+    }
+    Ok(Output { data, human, exit: 0, raw: false })
 }
 
 /// The first checked quote, kept for `rkb show --why` only when it cannot carry a path, an email

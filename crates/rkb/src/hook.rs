@@ -78,11 +78,7 @@ fn handle(event: &str, p: &Value, state: &Path, harness: &str) -> Result<Option<
         "prompt" => prompt(p, state, session),
         "stop" => stop(p, state, session, harness),
         "pre-compact" => capture(p, state, session, harness),
-        "session-end" => {
-            let captured = capture(p, state, session, harness);
-            start_promotion(p, state, harness)?;
-            captured
-        }
+        "session-end" => capture(p, state, session, harness),
         _ => Err(format!("unknown hook event `{event}`").into()),
     }
 }
@@ -291,25 +287,6 @@ fn capture(p: &Value, state: &Path, session: &str, harness: &str) -> Result<Opti
     let transcript = p["transcript_path"].as_str().ok_or("the payload has no transcript_path")?;
     rkb_core::distill::capture(state, &paths::config_dir(), harness, session, Path::new(transcript), p["cwd"].as_str())?;
     Ok(None)
-}
-
-/// Starts `rkb promote` in the background when an approved chain exists and an item repeats in two
-/// or more sessions, and returns at once.
-fn start_promotion(p: &Value, state: &Path, harness: &str) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
-    let config = paths::config_dir();
-    if rkb_core::observer::ready(&config, harness).is_none() || rkb_core::promote::ready_items(state).is_empty() {
-        return Ok(());
-    }
-    let max = rkb_core::promote::max_per_pass(&config);
-    let mut c = Command::new(std::env::current_exe()?);
-    c.args(["promote", "--max", &max.to_string(), "--harness", harness]);
-    if let Some(cwd) = p["cwd"].as_str() {
-        c.current_dir(cwd);
-    }
-    c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0).spawn()?;
-    Ok(())
 }
 
 /// The hits for `query` from the current place, reranked by the chain within the hook time limit.

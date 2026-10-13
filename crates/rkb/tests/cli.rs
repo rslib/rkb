@@ -321,8 +321,8 @@ fn show_prints_the_whole_lesson() {
 fn every_command_help_has_an_example() {
     let env = Env::new();
     for cmd in [
-        "", "init", "lint", "show", "list", "context", "doctor", "search", "find", "eval", "install", "add", "edit", "flag", "used", "log",
-        "confirm",
+        "", "init", "lint", "show", "list", "context", "doctor", "search", "find", "eval", "install", "schedule", "add", "edit", "flag",
+        "used", "log", "confirm",
     ] {
         let cmd: Vec<&str> = if cmd.is_empty() { vec!["--help"] } else { vec![cmd, "--help"] };
         let o = env.rkb(&cmd);
@@ -7159,4 +7159,507 @@ fn expired_lesson_is_not_pushed_on_a_failure() {
     env.write(path, &text.replacen("verified_how:", "expires: 2020-01-01\nverified_how:", 1));
     let out = hook(&env, "tool-failed", &failed("s2"));
     assert!(!out.contains("1a00000012"), "an expired lesson is not pushed: {out}");
+}
+
+fn maintain_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
+fn maintain_config(env: &Env, extra: &str) {
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), &format!("[observer]\npi = \"session\"\n{extra}"));
+}
+
+fn maintain_item(env: &Env, id: &str, kind: &str, age_days: u64, sig: Option<&str>, body: &str) {
+    maintain_item_full(env, id, kind, age_days, &[], sig, body)
+}
+
+fn maintain_item_full(env: &Env, id: &str, kind: &str, age_days: u64, signals: &[&str], sig: Option<&str>, body: &str) {
+    let time = maintain_now() - age_days * 86400;
+    let dir = env.dir.path().join("state/rkb/inbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sigs = sig.map(|s| format!("signatures:\n  - {s}\n")).unwrap_or_default();
+    let signals = if signals.is_empty() {
+        String::new()
+    } else {
+        format!("signals:\n{}", signals.iter().map(|s| format!("  - {s}\n")).collect::<String>())
+    };
+    std::fs::write(dir.join(format!("{id}.md")), format!("---\nkind: {kind}\ntime: {time}\n{signals}{sigs}---\n\n{body}\n")).unwrap();
+}
+
+fn maintain_seen(env: &Env, sig: &str) {
+    let now = maintain_now();
+    let p = env.dir.path().join("state/rkb/signatures.jsonl");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let mut text = std::fs::read_to_string(&p).unwrap_or_default();
+    for session in ["s1", "s2"] {
+        text.push_str(&format!("{{\"time\":{now},\"sig\":\"{sig}\",\"session\":\"{session}\"}}\n"));
+    }
+    std::fs::write(&p, text).unwrap();
+}
+
+fn maintain_fake_pi(env: &Env, answer: &str) {
+    let fake = env.dir.path().join("fake/pi");
+    env.write_abs(
+        &fake,
+        &format!("#!/bin/sh\nD=$(dirname \"$0\")\necho called >> \"$D/calls\"\ncat > /dev/null\nprintf '%s' '{answer}'\n"),
+    );
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+}
+
+fn maintain_calls(env: &Env, calls: u64) {
+    let today = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC).date().to_string();
+    env.write_abs(&env.dir.path().join("state/rkb/maintain.json"), &serde_json::json!({ "date": today, "calls": calls }).to_string());
+}
+
+const MAINTAIN_ANSWER: &str = r#"{"action":"add","topic":"cmake","type":"pitfall","title":"Cmake needs the prefix","queries":["cmake could not find HDF5","HDF5 prefix fix"],"sections":{"Symptom":"cmake could not find HDF5 on this machine","Cause":"Not known yet.","Fix":"Set the prefix.","Evidence":"saw it"},"quotes":["cmake could not find HDF5"]}"#;
+
+#[test]
+fn maintain_pass_full() {
+    let env = Env::new();
+    env.init();
+    maintain_config(&env, "");
+    approve_as_claude(&env);
+    let events: Vec<String> = (1..=2)
+        .map(|i| {
+            serde_json::json!({
+                "id": format!("msg{i}"),
+                "event": "message",
+                "time": i,
+                "message": serde_json::json!({"v":1,"agent":"worker","id":format!("m{i}"),"time":i,"text":format!("proposal {i}")}).to_string(),
+            })
+            .to_string()
+        })
+        .collect();
+    let (url, _log) = fake_ntfy(move |_m, _p, _b| (200, events.join("\n")));
+    maintain_config(&env, &format!("[proposals]\nntfy = \"{url}\"\n"));
+    maintain_item(&env, "0000000001", "transcript", 20, None, "[user] an old extracted session");
+    maintain_item(&env, "0000000002", "note", 0, Some("aaabbbcccddd"), "cmake could not find HDF5 on this machine");
+    maintain_seen(&env, "aaabbbcccddd");
+    maintain_fake_pi(&env, MAINTAIN_ANSWER);
+    let o = rkb_with(with_pi(&env), &["maintain", "--harness", "pi"], "");
+    let human = stdout(&o);
+    assert_eq!(o.status.code(), Some(0), "{human}");
+    assert!(human.contains("2 pulled") && human.contains("1 expired") && human.contains("1 promoted"), "{human}");
+    let (found, _) = env.json(&["search", "cmake could not find HDF5"], "");
+    assert_eq!(found["results"].as_array().unwrap().len(), 1, "the promoted lesson landed: {found}");
+    let last = std::fs::read_to_string(env.dir.path().join("state/rkb/maintain.json")).unwrap();
+    assert!(last.contains("\"promoted\":1"), "the pass is recorded: {last}");
+}
+
+#[test]
+fn maintain_pass_survives_a_failed_pull() {
+    let env = Env::new();
+    env.init();
+    maintain_config(&env, "");
+    approve_as_claude(&env);
+    let (url, _log) = fake_ntfy(|_m, _p, _b| (500, String::new()));
+    maintain_config(&env, &format!("[proposals]\nntfy = \"{url}\"\n"));
+    maintain_item(&env, "0000000002", "note", 0, Some("aaabbbcccddd"), "cmake could not find HDF5 on this machine");
+    maintain_seen(&env, "aaabbbcccddd");
+    maintain_fake_pi(&env, MAINTAIN_ANSWER);
+    let o = rkb_with(with_pi(&env), &["maintain", "--harness", "pi"], "");
+    let human = stdout(&o);
+    assert_eq!(o.status.code(), Some(0), "{human}");
+    assert!(human.contains("1 promoted") && human.contains("the pull failed: ntfy pull failed: HTTP 500"), "{human}");
+    let (doctor, _) = env.json(&["doctor"], "");
+    assert!(doctor.to_string().contains("the pull failed"), "doctor names the failed pull: {doctor}");
+}
+
+#[test]
+fn maintain_pass_nothing_to_do() {
+    let env = Env::new();
+    env.init();
+    let o = env.rkb(&["maintain", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(o.status.code(), Some(0), "{v}");
+    let zeros = ["pulled", "triaged", "expired", "faded", "promoted"];
+    for k in zeros {
+        assert_eq!(v[k], 0, "{v}");
+    }
+    assert_eq!(v["skip"], "no approved model chain", "{v}");
+    assert!(!env.dir.path().join("state/rkb/promotions.jsonl").exists(), "no model call: {v}");
+    assert!(env.dir.path().join("state/rkb/maintain.json").exists(), "the last pass is recorded");
+}
+
+#[test]
+fn maintain_pass_is_one_at_a_time() {
+    let env = Env::new();
+    env.init();
+    let host = String::from_utf8_lossy(&env.cmd("hostname").output().unwrap().stdout).trim().to_string();
+    let lock = env.dir.path().join("state/rkb/pass.lock");
+    env.write_abs(&lock, &format!("{host} {} {}\n", std::process::id(), maintain_now()));
+    for cmd in [vec!["maintain", "--toon"], vec!["promote", "--toon"]] {
+        let o = env.rkb(&cmd);
+        let out = stdout(&o);
+        assert_eq!(o.status.code(), Some(0), "{out}");
+        assert!(out.contains("a pass is already running"), "{out}");
+    }
+    std::fs::remove_file(&lock).unwrap();
+
+    // Three passes start together: exactly one runs the steps.
+    let (url, _log) = fake_ntfy(|_m, _p, _b| {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        (200, String::new())
+    });
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), &format!("[proposals]\nntfy = \"{url}\"\n"));
+    let kids: Vec<std::process::Child> = (0..3)
+        .map(|_| {
+            env.cmd(env!("CARGO_BIN_EXE_rkb"))
+                .args(["maintain"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let outs: Vec<Output> = kids.into_iter().map(|c| c.wait_with_output().unwrap()).collect();
+    let busy = outs.iter().filter(|o| String::from_utf8_lossy(&o.stdout).contains("a pass is already running")).count();
+    let ran = outs.iter().filter(|o| String::from_utf8_lossy(&o.stdout).contains("rkb maintain:")).count();
+    assert_eq!((busy, ran), (2, 1), "{}", outs.iter().map(stdout).collect::<String>());
+}
+
+#[test]
+fn maintain_pass_daily_cap() {
+    let env = Env::new();
+    env.init();
+    maintain_config(&env, "[maintain]\nmax_calls_per_day = 3\n");
+    approve_as_claude(&env);
+    maintain_item(&env, "0000000001", "note", 0, Some("aaabbbcccddd"), "cmake could not find HDF5 on this machine");
+    maintain_item(&env, "0000000002", "note", 0, Some("eeefff000111"), "ninja is faster for this build");
+    maintain_seen(&env, "aaabbbcccddd");
+    maintain_seen(&env, "eeefff000111");
+    maintain_fake_pi(&env, MAINTAIN_ANSWER);
+    maintain_calls(&env, 3);
+    let o = rkb_with(with_pi(&env), &["maintain", "--harness", "pi", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(o.status.code(), Some(0), "{v}");
+    assert_eq!(v["promoted"], 0, "{v}");
+    assert!(v["skip"].as_str().unwrap().contains("daily cap"), "the summary names the cap: {v}");
+    assert!(!env.dir.path().join("fake/calls").exists(), "no model call when the cap is reached");
+    assert_eq!(inbox_items(&env).len(), 2, "the items wait for a later day");
+
+    // A cap of 0 makes no call either.
+    maintain_config(&env, "[maintain]\nmax_calls_per_day = 0\n");
+    maintain_calls(&env, 0);
+    let o = rkb_with(with_pi(&env), &["maintain", "--harness", "pi", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(v["promoted"], 0, "{v}");
+    assert!(v["skip"].as_str().unwrap().contains("daily cap"), "{v}");
+    assert!(!env.dir.path().join("fake/calls").exists(), "no model call with a cap of 0");
+}
+
+#[test]
+fn maintain_pass_counts_a_failed_call() {
+    let env = Env::new();
+    env.init();
+    maintain_config(&env, "[maintain]\nmax_calls_per_day = 3\n");
+    approve_as_claude(&env);
+    maintain_item(&env, "0000000001", "note", 0, Some("aaabbbcccddd"), "cmake could not find HDF5 on this machine");
+    maintain_seen(&env, "aaabbbcccddd");
+    let fake = env.dir.path().join("fake/pi");
+    env.write_abs(&fake, "#!/bin/sh\ncat > /dev/null\nexit 1\n");
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let o = rkb_with(with_pi(&env), &["maintain", "--harness", "pi", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(o.status.code(), Some(0), "a failed model still exits 0: {v}");
+    assert!(v["skip"].as_str().unwrap().contains("model program failed"), "the summary names the failure: {v}");
+    let state = std::fs::read_to_string(env.dir.path().join("state/rkb/maintain.json")).unwrap();
+    assert!(state.contains("\"calls\":1"), "a failed call is counted: {state}");
+    assert_eq!(inbox_items(&env).len(), 1, "the item stays for a later pass");
+}
+
+#[test]
+fn maintain_expires_transcripts() {
+    let env = Env::new();
+    env.init();
+    // An old transcript with no signal: the rule drops it and the pass removes it.
+    maintain_item(&env, "0000000001", "transcript", 15, None, "[user] an old extracted session");
+    // An old note never expires by age.
+    maintain_item(&env, "0000000002", "note", 400, None, "an old note that stays");
+    // An old transcript with a signal and an eligible signature waits for a later pass.
+    maintain_item_full(
+        &env,
+        "0000000003",
+        "transcript",
+        20,
+        &["fixed cmake"],
+        Some("aaabbbcccddd"),
+        "[user] build\n[command failed, exit 1] cmake\n[tool output]\n  error: could not find HDF5\n[command worked] cmake -DHDF5_ROOT=/opt",
+    );
+    maintain_seen(&env, "aaabbbcccddd");
+    // The daily cap is reached, so the pass promotes nothing and the eligible item stays.
+    maintain_calls(&env, 3);
+    let o = env.rkb(&["maintain", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(o.status.code(), Some(0), "{v}");
+    assert_eq!(v["expired"], 1, "one old transcript expired: {v}");
+    let ids: Vec<String> = inbox_items(&env).iter().map(|i| i["id"].as_str().unwrap().to_string()).collect();
+    assert!(!ids.contains(&"0000000001".to_string()), "the old transcript is gone: {ids:?}");
+    assert!(ids.contains(&"0000000002".to_string()), "the old note stays: {ids:?}");
+    assert!(ids.contains(&"0000000003".to_string()), "the eligible transcript stays: {ids:?}");
+}
+
+#[test]
+fn maintain_pass_search_does_not_touch_the_inbox() {
+    let env = search_kb();
+    for id in ["0000000001", "0000000002", "0000000003"] {
+        maintain_item(&env, id, "note", 0, None, "zebra quokka inbox only text");
+    }
+    let dir = env.dir.path().join("state/rkb/inbox");
+    let count = std::fs::read_dir(&dir).unwrap().count();
+    let (v, _) = env.json(&["search", "--literal", "zebra quokka inbox only text"], "");
+    assert!(v["results"].as_array().unwrap().is_empty(), "the inbox is never searched: {v}");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), count, "search writes nothing");
+    let _ = env.rkb(&["inbox"]);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), count, "listing writes nothing");
+}
+
+fn fade_lesson(env: &Env, id: &str, kind: &str, title: &str) {
+    let headings = match kind {
+        "preference" => "## Rule\nDo the thing.\n\n## Why\nBecause.\n\n## How to apply\nAlways.\n",
+        "decision" => "## Context\nC.\n\n## Decision\nD.\n\n## Why\nW.\n\n## Rejected options\nR.\n",
+        _ => "## Symptom\nS.\n\n## Cause\nC.\n\n## Fix\nF.\n\n## Evidence\nE.\n",
+    };
+    env.write_abs(
+        &env.kb().join(format!("general/cmake/{id}.md")),
+        &format!(
+            "---\nschema: 1\nid: {id}\ntype: {kind}\nstatus: active\nverified: 2020-01-01\nverified_how: ran\n---\n\n# {title}\n\n{headings}\n"
+        ),
+    );
+}
+
+fn fade_promoted(env: &Env, id: &str, days: u64) {
+    let time = maintain_now() - days * 86400;
+    let p = env.dir.path().join("state/rkb/promotions.jsonl");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let mut text = std::fs::read_to_string(&p).unwrap_or_default();
+    text.push_str(&format!("{{\"time\":{time},\"item\":\"x\",\"lesson\":\"{id}\"}}\n"));
+    std::fs::write(&p, text).unwrap();
+}
+
+fn fade_used(env: &Env, id: &str) {
+    let dir = env.kb().join(".rkb/usage");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("m-0000.jsonl"), format!("{{\"time\":\"2026-01-01T00:00:00Z\",\"id\":\"{id}\",\"event\":\"worked\"}}\n"))
+        .unwrap();
+}
+
+fn lesson_status(env: &Env, id: &str) -> String {
+    let text = std::fs::read_to_string(env.kb().join(format!("general/cmake/{id}.md"))).unwrap();
+    text.lines().find_map(|l| l.strip_prefix("status: ")).unwrap().trim().to_string()
+}
+
+#[test]
+fn maintain_fades_unused() {
+    let env = Env::new();
+    env.init();
+    fade_lesson(&env, "0000000001", "pitfall", "Unused promoted pitfall");
+    fade_lesson(&env, "0000000002", "pitfall", "Used promoted pitfall");
+    fade_lesson(&env, "0000000003", "preference", "Pinned preference");
+    fade_lesson(&env, "0000000004", "pitfall", "Hand written pitfall");
+    for id in ["0000000001", "0000000002", "0000000003"] {
+        fade_promoted(&env, id, 31);
+    }
+    fade_used(&env, "0000000002");
+    let o = env.rkb(&["maintain", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(o.status.code(), Some(0), "{v}");
+    assert_eq!(v["faded"], 1, "{v}");
+    assert_eq!(lesson_status(&env, "0000000001"), "archived", "the unused promoted pitfall fades");
+    assert_eq!(lesson_status(&env, "0000000002"), "active", "a used pitfall stays");
+    assert_eq!(lesson_status(&env, "0000000003"), "active", "a preference never fades");
+    assert_eq!(lesson_status(&env, "0000000004"), "active", "a hand-written lesson never fades");
+    let text = std::fs::read_to_string(env.kb().join("general/cmake/0000000001.md")).unwrap();
+    assert!(text.contains("unused for 30 days after promotion"), "the reason is recorded: {text}");
+}
+
+#[test]
+fn session_end_starts_no_promotion() {
+    let env = search_kb();
+    env.write_abs(&env.dir.path().join("config/rkb/config.toml"), "[observer]\npi = \"session\"\n");
+    approve_as_claude(&env);
+    // An item whose signature repeats in two sessions used to start a promotion pass here.
+    maintain_item(&env, "0000000001", "note", 0, Some("aaabbbcccddd"), "cmake could not find HDF5 on this machine");
+    maintain_seen(&env, "aaabbbcccddd");
+    maintain_fake_pi(&env, MAINTAIN_ANSWER);
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/transcripts/pi.jsonl");
+    signal(&env, "end1", r#"{"kind":"remember"}"#);
+    let payload = serde_json::json!({ "session_id": "end1", "transcript_path": fixture, "cwd": env.dir.path() });
+    let o = rkb_with(with_pi(&env), &["hook", "session-end", "--harness", "pi"], &payload.to_string());
+    assert_eq!((o.status.code(), o.stdout.is_empty()), (Some(0), true), "the hook prints nothing");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(!env.dir.path().join("fake/calls").exists(), "no model call from the hook");
+    assert!(!env.dir.path().join("state/rkb/promotions.jsonl").exists(), "no promotion started");
+    assert_eq!(inbox_items(&env).len(), 2, "the session was captured, the promotion item stayed");
+}
+
+fn fake_schedule_commands(env: &Env) -> PathBuf {
+    let dir = env.dir.path().join("fake/schedule-bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = env.dir.path().join("fake/schedule.log");
+    for name in ["launchctl", "systemctl"] {
+        let p = dir.join(name);
+        env.write_abs(&p, &format!("#!/bin/sh\necho \"{name} $*\" >> \"{}\"\nexit 0\n", log.display()));
+        std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn schedule_install() {
+    let env = Env::new();
+    let bin = fake_schedule_commands(&env);
+    let log = env.dir.path().join("fake/schedule.log");
+    let path = || format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let run = |args: &[&str], claude: bool| {
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.env("PATH", path());
+        if claude {
+            c.env("CLAUDECODE", "1");
+        }
+        rkb_with(c, args, "")
+    };
+    // The request flow: an agent gets the question, the user confirms it.
+    let o = run(&["schedule", "install", "--format", "json"], false);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!((v["status"].as_str(), o.status.code()), (Some("needs_user"), Some(3)), "{v}");
+    let request = v["request"].as_str().unwrap().to_string();
+    env.trust_claude();
+    let confirmed = run(&["confirm", &request, "--choice", "install", "--format", "json"], true);
+    assert_eq!(confirmed.status.code(), Some(0), "{}", stdout(&confirmed));
+    let uid = String::from_utf8_lossy(&env.cmd("id").args(["-u"]).output().unwrap().stdout).trim().to_string();
+    let ours = if cfg!(target_os = "macos") {
+        env.dir.path().join("Library/LaunchAgents/rkb.maintain.plist")
+    } else {
+        env.dir.path().join(".config/systemd/user/rkb-maintain.service")
+    };
+    assert!(ours.is_file(), "the job file was written");
+    if cfg!(target_os = "macos") {
+        let text = std::fs::read_to_string(&ours).unwrap();
+        assert!(text.contains("<string>maintain</string>") && text.contains("<key>RKB_HOME</key>"), "{text}");
+        assert!(text.contains(&env.kb().display().to_string()) && text.contains(&bin.display().to_string()), "{text}");
+        assert!(text.contains("<integer>9</integer>") && text.contains("<integer>21</integer>"), "{text}");
+        assert!(text.contains(&env.dir.path().join("state/rkb/maintain.log").display().to_string()), "{text}");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(calls.contains(&format!("launchctl bootstrap gui/{uid} {}", ours.display())), "{calls}");
+    } else {
+        let timer = env.dir.path().join(".config/systemd/user/rkb-maintain.timer");
+        assert!(timer.is_file(), "the timer was written");
+        let t = std::fs::read_to_string(&timer).unwrap();
+        assert!(t.contains("OnCalendar=*-*-* 09,21:00:00") && t.contains("Persistent=true"), "{t}");
+        let s = std::fs::read_to_string(&ours).unwrap();
+        assert!(s.contains("maintain") && s.contains(&env.kb().display().to_string()), "{s}");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls.contains("systemctl --user daemon-reload") && calls.contains("systemctl --user enable --now rkb-maintain.timer"),
+            "{calls}"
+        );
+    }
+
+    // Install twice changes nothing and runs no command again.
+    let before = std::fs::read_to_string(&log).unwrap_or_default().lines().count();
+    let o = run(&["schedule", "install", "--format", "json"], false);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let again = run(&["confirm", v["request"].as_str().unwrap(), "--choice", "install"], true);
+    assert!(stdout(&again).contains("unchanged"), "the second install changed nothing: {}", stdout(&again));
+    assert_eq!(std::fs::read_to_string(&log).unwrap_or_default().lines().count(), before, "no command ran again");
+
+    // A changed job file reloads the loaded job: unload it first, since bootstrap refuses a loaded label.
+    if cfg!(target_os = "macos") {
+        let moved = env.dir.path().join("fake/other-bin");
+        std::fs::create_dir_all(&moved).unwrap();
+        let other_path = format!("{}:{}", moved.display(), path());
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.env("PATH", &other_path);
+        let o = rkb_with(c, &["schedule", "install", "--format", "json"], "");
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        c.env("PATH", &other_path).env("CLAUDECODE", "1");
+        let again = rkb_with(c, &["confirm", v["request"].as_str().unwrap(), "--choice", "install"], "");
+        assert_eq!(again.status.code(), Some(0), "{}", stdout(&again));
+        let calls: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().skip(before).map(str::to_string).collect();
+        assert_eq!(
+            calls,
+            [format!("launchctl bootout gui/{uid}/rkb.maintain"), format!("launchctl bootstrap gui/{uid} {}", ours.display())],
+            "unload, then load the new file"
+        );
+    }
+
+    // Uninstall removes rkb's file after unloading the job, and leaves another agent alone.
+    let other = if cfg!(target_os = "macos") {
+        env.dir.path().join("Library/LaunchAgents/other.plist")
+    } else {
+        env.dir.path().join(".config/systemd/user/other.timer")
+    };
+    env.write_abs(&other, "another agent\n");
+    let o = run(&["schedule", "install", "--uninstall", "--format", "json"], false);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let gone = run(&["confirm", v["request"].as_str().unwrap(), "--choice", "uninstall", "--format", "json"], true);
+    assert_eq!(gone.status.code(), Some(0), "{}", stdout(&gone));
+    assert!(!ours.exists(), "rkb's job file is gone");
+    assert!(other.is_file(), "another agent stays");
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    if cfg!(target_os = "macos") {
+        assert!(calls.contains(&format!("launchctl bootout gui/{uid}/rkb.maintain")), "{calls}");
+    } else {
+        assert!(calls.contains("systemctl --user disable --now rkb-maintain.timer"), "{calls}");
+    }
+    if cfg!(target_os = "linux") {
+        assert!(!env.dir.path().join(".config/systemd/user/rkb-maintain.timer").exists(), "the timer is gone");
+    }
+}
+
+#[test]
+fn doctor_reports_maintain() {
+    let env = Env::new();
+    env.init();
+    let schedule = |v: &serde_json::Value| {
+        v["checks"].as_array().unwrap().iter().find(|c| c["check"] == "schedule").cloned().expect("the schedule check")
+    };
+    let (d, _) = env.json(&["doctor"], "");
+    let c = schedule(&d);
+    assert_eq!(c["status"], "ok", "{c}");
+    assert!(c["detail"].as_str().unwrap().contains("not installed"), "{c}");
+
+    // Install the job through the request flow, with fake launchd/systemd commands.
+    let bin = fake_schedule_commands(&env);
+    env.trust_claude();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let run = |args: &[&str]| {
+        let mut cmd = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+        cmd.env("PATH", &path).env("CLAUDECODE", "1");
+        rkb_with(cmd, args, "")
+    };
+    let o = run(&["schedule", "install", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    let o = run(&["confirm", v["request"].as_str().unwrap(), "--choice", "install"]);
+    assert!(o.status.success(), "{}", stdout(&o));
+
+    // A pass 40 hours old is a warning that names the time, its counts and the skipped model step.
+    let at = maintain_now() - 40 * 3600;
+    env.write_abs(
+        &env.dir.path().join("state/rkb/maintain.json"),
+        &format!(
+            "{{\"date\":\"2000-01-01\",\"calls\":0,\"last\":{{\"time\":{at},\"pulled\":2,\"triaged\":4,\"expired\":1,\"faded\":0,\"promoted\":1,\"skip\":\"the model program failed: exit 1\"}}}}"
+        ),
+    );
+    let (d, _) = env.json(&["doctor"], "");
+    let c = schedule(&d);
+    assert_eq!(c["status"], "warn", "a stale pass warns: {c}");
+    let detail = c["detail"].as_str().unwrap();
+    assert!(detail.contains("40 h ago") && detail.contains("2 pulled") && detail.contains("1 promoted"), "{detail}");
+    assert!(detail.contains("the model program failed: exit 1"), "the skip reason is named: {detail}");
+    assert!(!c["fix"].as_str().unwrap().is_empty(), "the warning carries a fix: {c}");
+
+    // A fresh pass is ok and still carries the counts.
+    let fresh = maintain_now();
+    env.write_abs(
+        &env.dir.path().join("state/rkb/maintain.json"),
+        &format!("{{\"date\":\"2000-01-01\",\"calls\":0,\"last\":{{\"time\":{fresh},\"pulled\":0,\"triaged\":0,\"expired\":0,\"faded\":0,\"promoted\":0}}}}"),
+    );
+    let (d, _) = env.json(&["doctor"], "");
+    let c = schedule(&d);
+    assert_eq!(c["status"], "ok", "{c}");
+    assert!(c["detail"].as_str().unwrap().contains("last pass"), "{c}");
 }

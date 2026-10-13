@@ -101,6 +101,7 @@ pub fn run(root: &Path, place: &Place, state_dir: &Path, config_dir: &Path, env:
     out.push(extra_kbs_check(root, config_dir));
     out.push(observer_check(config_dir, state_dir));
     out.extend(triage_check(state_dir));
+    out.push(schedule_check(state_dir));
     out.extend(recall_check(root, state_dir));
     for (session, g) in crate::write::graces(state_dir) {
         let until =
@@ -556,6 +557,54 @@ fn trust_check(config_dir: &Path) -> Check {
     }
 }
 
+/// The OS schedule and the last `rkb maintain` pass: whether the job is installed, when the pass ran,
+/// its counts and the reason the model step was skipped. A warning when the job is installed and the
+/// last pass is more than 36 hours old.
+pub fn schedule_check(state_dir: &Path) -> Check {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+    schedule_check_at(&home, state_dir)
+}
+
+fn schedule_check_at(home: &Path, state_dir: &Path) -> Check {
+    use crate::schedule::{self, Os};
+    let kind = if schedule::current_os() == Os::Macos { "launchd" } else { "systemd" };
+    let times = schedule::HOURS.map(|h| format!("{h:02}:00")).join(" and ");
+    let installed = std::fs::read_to_string(schedule::primary_path(home)).is_ok_and(|t| t.contains(schedule::MARK));
+    let Some(last) = crate::maintain::last(state_dir) else {
+        return if installed {
+            check(
+                "schedule",
+                Level::Warn,
+                format!("installed ({kind}, {times}); no pass has run yet"),
+                Some("wait for the next run, or run `rkb maintain` once".into()),
+            )
+        } else {
+            check("schedule", Level::Ok, "not installed; run `rkb schedule install`", None)
+        };
+    };
+    let age = crate::request::now().saturating_sub(last.time);
+    let at = jiff::Timestamp::from_second(last.time as i64)
+        .map(|t| t.to_zoned(jiff::tz::TimeZone::UTC).strftime("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default();
+    let counts = format!(
+        "{} pulled, {} triaged, {} expired, {} faded, {} promoted",
+        last.pulled, last.triaged, last.expired, last.faded, last.promoted
+    );
+    let pull = last.pull_error.as_ref().map(|r| format!("; the pull failed: {r}")).unwrap_or_default();
+    let skip = last.skip.as_ref().map(|r| format!("; skipped the model step: {r}")).unwrap_or_default();
+    let where_ = if installed { format!("installed ({kind}, {times})") } else { "not installed".to_string() };
+    let detail = format!("{where_}; last pass {at} ({} h ago): {counts}{pull}{skip}", age / 3600);
+    if installed && age > 36 * 3600 {
+        let fix = if schedule::current_os() == Os::Macos {
+            "run `rkb maintain`, or check the job with `launchctl print gui/$(id -u)/rkb.maintain`".to_string()
+        } else {
+            "run `rkb maintain`, or check the job with `systemctl --user status rkb-maintain.timer`".to_string()
+        };
+        return check("schedule", Level::Warn, detail, Some(fix));
+    }
+    check("schedule", Level::Ok, detail, None)
+}
+
 /// A request to remove the write lock, or `None` when there is no lock.
 pub fn break_lock_request(root: &Path, state_dir: &Path) -> Result<Option<Request>> {
     let Some(lock) = lock_path(root) else { return Ok(None) };
@@ -638,6 +687,39 @@ mod tests {
         fine.extend((10..100).map(|i| line(i, "drop")));
         std::fs::write(state.join(crate::triage::LOG), &fine).unwrap();
         assert_eq!(triage_check(state).unwrap().level, Level::Ok);
+    }
+
+    #[test]
+    fn schedule_check_names_the_last_pass_and_a_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, state) = (dir.path().join("home"), dir.path().join("state"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let c = schedule_check_at(&home, &state);
+        assert_eq!((c.level, c.detail.as_str()), (Level::Ok, "not installed; run `rkb schedule install`"));
+        let path = crate::schedule::primary_path(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{}\n", crate::schedule::MARK)).unwrap();
+        let now = crate::request::now();
+        crate::maintain::record(
+            &state,
+            crate::maintain::Last {
+                time: now - 40 * 3600,
+                pulled: 2,
+                triaged: 4,
+                expired: 1,
+                faded: 0,
+                promoted: 1,
+                pull_error: None,
+                skip: Some("the model program failed: exit 1".into()),
+            },
+        );
+        let c = schedule_check_at(&home, &state);
+        assert_eq!(c.level, Level::Warn, "{c:?}");
+        assert!(c.detail.contains("40 h ago") && c.detail.contains("2 pulled"), "{}", c.detail);
+        assert!(c.detail.contains("the model program failed: exit 1"), "{}", c.detail);
+        crate::maintain::record(&state, crate::maintain::Last { time: now, ..Default::default() });
+        assert_eq!(schedule_check_at(&home, &state).level, Level::Ok, "a fresh pass is not a warning");
     }
 
     #[test]
