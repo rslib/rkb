@@ -1,6 +1,4 @@
 mod agent;
-#[cfg(feature = "bert")]
-mod embedding;
 mod graphing;
 mod hook;
 mod inbox;
@@ -108,7 +106,7 @@ enum Cmd {
         tier: Option<String>,
         #[arg(long, default_value_t = 10)]
         limit: usize,
-        /// Rerank with this backend for this call instead of the chain in kb.toml: jev, bm25-bert or bm25.
+        /// Rerank with this backend for this call instead of the chain in kb.toml: jev or bm25.
         #[arg(long, conflicts_with = "no_model")]
         rerank: Option<String>,
         /// Rank with BM25 only; the same as --rerank bm25.
@@ -494,12 +492,6 @@ enum Cmd {
         #[command(subcommand)]
         action: JobCmd,
     },
-    /// Download the local rerank model, embed the lessons ahead of searches, or print the model folder.
-    #[command(after_help = "Example:\n  rkb models fetch\n  rkb models warm\n  rkb models path")]
-    Models {
-        #[command(subcommand)]
-        action: ModelsCmd,
-    },
     /// Write the lessons the `web` sink allows and the knowledge base's rs-web template to a folder for rs-web to build.
     #[command(after_help = "Example:\n  rkb publish ~/site\n  rkb publish out --no-ask\n  rkb publish --check out")]
     Publish {
@@ -615,16 +607,6 @@ enum PrepareCmd {
         #[arg(long)]
         model: Option<String>,
     },
-}
-
-#[derive(Subcommand)]
-enum ModelsCmd {
-    /// Download the pinned `bm25-bert` model (596 MB) and check each file against its SHA-256. Skips files already present.
-    Fetch,
-    /// Embed every active lesson into the cache, so a search embeds only its query. Needs no network.
-    Warm,
-    /// Print the model folder, and each file with its SHA-256 and whether it is present.
-    Path,
 }
 
 /// Turns a clap error into rkb's error record on stdout, so an agent can correct the call in one step.
@@ -992,12 +974,6 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Inbox { action: Some(InboxCmd::Triage { ask }) } => inbox::triage(&env, ask.as_deref()),
         Cmd::Inbox { action: Some(InboxCmd::Done { ids, outcome }) } => inbox::done(&env, &ids, &outcome),
         Cmd::Inbox { action: Some(InboxCmd::Pull { url }) } => inbox::pull(&env, &url),
-        Cmd::Models { action: ModelsCmd::Fetch } => models_fetch(env.colored),
-        Cmd::Models { action: ModelsCmd::Warm } => {
-            kb::open(&root)?;
-            models_warm(&root)
-        }
-        Cmd::Models { action: ModelsCmd::Path } => models_path(),
         Cmd::Publish { dir, check, no_ask } => {
             if check {
                 site::check(&env, &dir)
@@ -1151,40 +1127,6 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             Ok(Output { data, human, exit: 0, raw: false })
         }
     }
-}
-
-#[cfg(feature = "bert")]
-fn models_fetch(colored: bool) -> Result<Output, CliError> {
-    embedding::models_fetch(colored)
-}
-
-#[cfg(feature = "bert")]
-fn models_warm(root: &std::path::Path) -> Result<Output, CliError> {
-    embedding::models_warm(root)
-}
-
-#[cfg(feature = "bert")]
-fn models_path() -> Result<Output, CliError> {
-    embedding::models_path()
-}
-
-#[cfg(not(feature = "bert"))]
-fn models_path() -> Result<Output, CliError> {
-    models_fetch(false)
-}
-
-#[cfg(not(feature = "bert"))]
-fn models_fetch(_: bool) -> Result<Output, CliError> {
-    Err(CliError::new(
-        output::ErrorCode::Usage,
-        "this rkb was built without the bert feature",
-        "install an rkb built with the default features",
-    ))
-}
-
-#[cfg(not(feature = "bert"))]
-fn models_warm(_: &std::path::Path) -> Result<Output, CliError> {
-    models_fetch(false)
 }
 
 fn commit_rows(label: &str, commits: &[rkb_core::sync::Commit], colored: bool) -> String {

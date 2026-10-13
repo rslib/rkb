@@ -781,11 +781,6 @@ fn hermes_env() -> Vec<(&'static str, String)> {
     if set("RKB_HOME").is_some() {
         env.push(("RKB_HOME", crate::kb::home().display().to_string()));
     }
-    for k in ["RKB_OFFLINE", "HF_HUB_OFFLINE"] {
-        if set(k).as_deref() == Some("1") {
-            env.push((k, "1".to_string()));
-        }
-    }
     if set("RKB_NTFY_TOKEN").is_some() {
         env.push(("RKB_NTFY_TOKEN", "${RKB_NTFY_TOKEN}".to_string()));
     }

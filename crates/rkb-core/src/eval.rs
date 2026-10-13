@@ -680,7 +680,7 @@ mod tests {
                 top: vec!["answer".into()],
                 scores: vec![Some(0.9)],
                 decision: ReviewedDecision::Injected,
-                backend: Some("bm25-bert".into()),
+                backend: Some("jev".into()),
                 ranked_available: true,
                 curve: vec![(0.55, 0.08, ReviewedDecision::Injected)],
             },
@@ -690,7 +690,7 @@ mod tests {
                 top: vec!["near-miss".into()],
                 scores: vec![Some(0.9)],
                 decision: ReviewedDecision::Injected,
-                backend: Some("bm25-bert".into()),
+                backend: Some("jev".into()),
                 ranked_available: true,
                 curve: vec![(0.55, 0.08, ReviewedDecision::Injected)],
             },
@@ -710,7 +710,7 @@ mod tests {
                 top: vec!["answer".into()],
                 scores: vec![Some(0.9)],
                 decision: ReviewedDecision::Unavailable,
-                backend: Some("bm25-bert".into()),
+                backend: Some("jev".into()),
                 ranked_available: true,
                 curve: vec![(0.55, 0.08, ReviewedDecision::Unavailable)],
             },
@@ -742,14 +742,14 @@ mod tests {
                 top: vec!["wrong".into()],
                 scores: vec![],
                 decision: ReviewedDecision::Injected,
-                backend: Some("bm25-bert".into()),
+                backend: Some("jev".into()),
                 ranked_available: true,
                 curve: vec![],
             },
         ];
         let bm25 = reviewed_metrics_for(&rows, Some("bm25"), None);
         assert_eq!((bm25.samples, bm25.correct, bm25.wrong), (1, 1, 0));
-        assert_eq!(reviewed_metrics_for(&rows, Some("bm25-bert"), None).wrong, 1);
+        assert_eq!(reviewed_metrics_for(&rows, Some("jev"), None).wrong, 1);
     }
 
     #[test]
@@ -771,7 +771,7 @@ mod tests {
                 top: vec!["answer".into()],
                 scores: vec![],
                 decision: ReviewedDecision::Unavailable,
-                backend: Some("bm25-bert".into()),
+                backend: Some("jev".into()),
                 ranked_available: true,
                 curve: vec![],
             },

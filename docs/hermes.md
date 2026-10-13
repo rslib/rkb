@@ -50,8 +50,7 @@ read at these files and lines.
 
   Hermes starts a stdio server with only `PATH`, `HOME`, `USER`, `LANG`, `XDG_*` and a few more
   (`_build_safe_env` in `tools/mcp_tool_config.py`), so other variables never reach rkb.
-  The install copies the ones set in its own shell into `env`: `RKB_HOME` (as an absolute path),
-  `RKB_OFFLINE=1` and `HF_HUB_OFFLINE=1`.
+  The install copies `RKB_HOME` (as an absolute path) into `env` when it is set in its own shell.
   Run `rkb install hermes` in the same environment the server uses.
 
   When `RKB_NTFY_TOKEN` is set, the entry gets only the reference `"${RKB_NTFY_TOKEN}"`, never the

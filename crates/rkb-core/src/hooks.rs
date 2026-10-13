@@ -356,14 +356,13 @@ impl Strength {
         let flat = |k: &str| cfg.get(k).and_then(toml::Value::as_float);
         let (min, margin) = match backend {
             "jev" => (JEV_MIN_RELEVANCE, JEV_MIN_MARGIN),
-            "bm25-bert" => (BERT_MIN_RELEVANCE, BERT_MIN_MARGIN),
             _ => (DEFAULT_MIN_RELEVANCE, DEFAULT_MIN_MARGIN),
         };
         Strength {
             min_relevance: table.map(|t| t.0).or_else(|| flat("min_relevance")).unwrap_or(min),
             min_margin: table.map(|t| t.1).or_else(|| flat("min_margin")).unwrap_or(margin),
             min_coverage: flat("min_coverage").unwrap_or(DEFAULT_MIN_COVERAGE),
-            literal_gate: cfg.get("literal_gate").and_then(toml::Value::as_bool).unwrap_or(backend == "bm25-bert"),
+            literal_gate: cfg.get("literal_gate").and_then(toml::Value::as_bool).unwrap_or(false),
         }
     }
 }
@@ -516,18 +515,10 @@ pub const RECALL_MIN_MARGIN: f64 = 0.10;
 pub const JEV_MIN_RELEVANCE: f64 = 0.75;
 pub const JEV_MIN_MARGIN: f64 = 0.05;
 
-/// `bm25-bert` reports a raw cosine, which sits lower than a rating. On 184 real failures (33 with a
-/// matching lesson) 0.55 with a 0.08 lead injected 13 right lessons and 6 wrong ones out of 148 with none.
-/// Prompt recall uses these; the failed-command hook uses `Strength::literal_gate` instead, which on the
-/// same failures injected 16 right and 1 wrong (2026-10-01).
-pub const BERT_MIN_RELEVANCE: f64 = 0.55;
-pub const BERT_MIN_MARGIN: f64 = 0.08;
-
 /// Prompt recall's default `(min_relevance, margin)` for the backend that ranked.
 pub fn recall_defaults(backend: &str) -> (f64, f64) {
     match backend {
         "jev" => (JEV_MIN_RELEVANCE, JEV_MIN_MARGIN),
-        "bm25-bert" => (BERT_MIN_RELEVANCE, BERT_MIN_MARGIN),
         _ => (RECALL_MIN_RELEVANCE, RECALL_MIN_MARGIN),
     }
 }
@@ -931,10 +922,7 @@ mod tests {
         let set: toml::Table = toml::from_str("min_relevance = 0.9").unwrap();
         assert_eq!(Strength::from_config(&set, "jev").min_relevance, 0.9, "kb.toml wins");
         assert_eq!(recall_defaults("bm25"), (RECALL_MIN_RELEVANCE, RECALL_MIN_MARGIN));
-        assert_eq!(recall_defaults("bm25-bert"), (0.55, 0.08));
-        let bert = Strength::from_config(&toml::Table::new(), "bm25-bert");
-        assert_eq!((bert.min_relevance, bert.min_margin), (0.55, 0.08));
-        assert_eq!(Strength::from_config(&set, "bm25-bert").min_relevance, 0.9, "kb.toml wins");
+        assert_eq!(recall_defaults("jev"), (JEV_MIN_RELEVANCE, JEV_MIN_MARGIN));
         assert!(clear_winner(0.60, 0.50, 0.55, 0.08) && !clear_winner(0.60, 0.55, 0.55, 0.08) && !clear_winner(0.50, 0.0, 0.55, 0.08));
         assert!(!strong_enough(Some(0.62), 0.0, || 1.0, &t));
         assert!(strong_enough(Some(0.91), 0.0, || 0.0, &t));
@@ -953,13 +941,14 @@ mod tests {
         assert!(!quotes_error("undefined reference to `foo'", lesson), "a different error");
         assert!(!quotes_error("ld: command not found", lesson), "a one-word quote is too common to mean anything");
         assert!(!quotes_error("xundefined reference to vtable", lesson), "whole words only");
-        assert!(Strength::from_config(&toml::Table::new(), "bm25-bert").literal_gate);
         assert!(
             !Strength::from_config(&toml::Table::new(), "jev").literal_gate
                 && !Strength::from_config(&toml::Table::new(), "bm25").literal_gate
         );
+        let on: toml::Table = toml::from_str("literal_gate = true").unwrap();
+        assert!(Strength::from_config(&on, "bm25").literal_gate, "kb.toml sets it");
         let off: toml::Table = toml::from_str("literal_gate = false").unwrap();
-        assert!(!Strength::from_config(&off, "bm25-bert").literal_gate, "kb.toml wins");
+        assert!(!Strength::from_config(&off, "jev").literal_gate, "kb.toml wins");
     }
 
     #[test]

@@ -158,8 +158,8 @@ pub fn lint(snap: &Snapshot, env: &LintEnv, focus: Option<&BTreeSet<String>>) ->
             None => bad("[hooks.thresholds] must be a table of backend names".into()),
             Some(backends) => {
                 for (backend, paths) in backends {
-                    if !["jev", "bm25-bert", "bm25"].contains(&backend.as_str()) {
-                        bad(format!("[hooks.thresholds] has an unknown backend `{backend}`; the backends are jev, bm25-bert and bm25"));
+                    if !["jev", "bm25"].contains(&backend.as_str()) {
+                        bad(format!("[hooks.thresholds] has an unknown backend `{backend}`; the backends are jev and bm25"));
                         continue;
                     }
                     let Some(paths) = paths.as_table() else {

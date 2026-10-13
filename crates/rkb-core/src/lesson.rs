@@ -94,7 +94,7 @@ pub struct Frontmatter {
     pub verified_how: VerifiedHow,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-    /// Example queries someone would type before they know the lesson exists; only the `bm25-bert` index reads them.
+    /// Example queries someone would type before they know the lesson exists; no index reads them yet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queries: Vec<String>,
     #[serde(default, skip_serializing_if = "Mapping::is_empty")]

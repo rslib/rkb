@@ -17,40 +17,8 @@ use rkb_core::search::{self, Hit};
 pub fn opener() -> Opener {
     Arc::new(|name: &str| match name {
         JEV => jev(),
-        BERT => bert(),
-        other => Err(format!("unknown backend `{other}`; this build knows jev, bm25-bert and bm25")),
+        other => Err(format!("unknown backend `{other}`; this build knows jev and bm25")),
     })
-}
-
-const BERT: &str = "bm25-bert";
-
-#[cfg(feature = "bert")]
-fn bert() -> Result<Box<dyn Reranker>, String> {
-    crate::embedding::open()
-}
-
-#[cfg(not(feature = "bert"))]
-fn bert() -> Result<Box<dyn Reranker>, String> {
-    Err("not in this build".into())
-}
-
-/// The doctor checks for the `bm25-bert` backend, when the chain has it: the model files and the vector cache.
-pub fn bert_checks(root: &Path, settings: &Settings) -> Vec<Check> {
-    if !settings.chain.iter().any(|b| b == BERT) {
-        return vec![];
-    }
-    #[cfg(feature = "bert")]
-    return crate::embedding::checks(root);
-    #[cfg(not(feature = "bert"))]
-    {
-        let _ = root;
-        vec![Check {
-            name: BERT,
-            level: Level::Warn,
-            detail: "not in this build".into(),
-            fix: Some("install an rkb built with the default features".into()),
-        }]
-    }
 }
 
 const JEV_URL: &str = "https://api.typesafe.ai/v1/systemone";

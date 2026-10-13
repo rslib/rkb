@@ -1717,7 +1717,7 @@ fn search_falls_back_to_bm25_without_a_model() {
     set_chain(&env, "chain = [\"missing\", \"bm25\"]");
     let (v, _) = env.json(&["search", "git rebase"], "");
     let by = v["ranked_by"].as_str().unwrap();
-    assert!(by.starts_with("bm25 (missing: unknown backend `missing`; this build knows jev, bm25-bert and bm25)"), "{v}");
+    assert!(by.starts_with("bm25 (missing: unknown backend `missing`; this build knows jev and bm25)"), "{v}");
     assert_eq!(ids(&v), ids(&plain));
     assert!(v["results"][0].get("relevance").is_none(), "{v}");
     let human = stdout(&env.rkb(&["search", "git rebase", "--format", "human"]));
@@ -1734,26 +1734,6 @@ fn search_falls_back_to_bm25_without_a_model() {
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!((v["ranked_by"].as_str(), o.status.code()), (Some("bm25"), Some(0)), "{v}");
 
-    set_chain(&env, "chain = [\"bm25-bert\", \"bm25\"]");
-    let o = env
-        .cmd(env!("CARGO_BIN_EXE_rkb"))
-        .args(["search", "git rebase", "--format", "json"])
-        .env("XDG_DATA_HOME", env.dir.path().join("empty-data"))
-        .output()
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    let by = v["ranked_by"].as_str().unwrap();
-    assert!(by.starts_with("bm25 (bm25-bert: not configured") && by.contains("rkb models fetch"), "{v}");
-    assert_eq!(ids(&v), ids(&plain));
-    let o = env
-        .cmd(env!("CARGO_BIN_EXE_rkb"))
-        .args(["doctor", "--format", "json"])
-        .env("XDG_DATA_HOME", env.dir.path().join("empty-data"))
-        .output()
-        .unwrap();
-    let d: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    let check = d["checks"].as_array().unwrap().iter().find(|c| c["check"] == "bm25-bert").unwrap_or_else(|| panic!("{d}"));
-    assert_eq!((check["status"].as_str(), check["fix"].as_str()), (Some("warn"), Some("rkb models fetch")), "{d}");
     set_chain(&env, "chain = [\"missing\", \"bm25\"]");
 
     let q = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/search/queries.toml");
@@ -1763,6 +1743,25 @@ fn search_falls_back_to_bm25_without_a_model() {
     let (v, code) = env.json(&["eval", "--queries", q, "--rerank", "missing"], "");
     assert_eq!(code, Some(1), "a skipped backend fails the eval: {v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("missing"), "{v}");
+}
+
+#[test]
+fn old_backend_name_is_skipped() {
+    let env = search_kb();
+    let (plain, _) = env.json(&["search", "git rebase"], "");
+    set_chain(&env, "chain = [\"jev\", \"bm25-bert\", \"bm25\"]");
+    let o = env
+        .cmd(env!("CARGO_BIN_EXE_rkb"))
+        .args(["search", "git rebase", "--format", "json"])
+        .env_remove("RKB_JEV_API_KEY")
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(o.status.code(), Some(0), "{v}");
+    let by = v["ranked_by"].as_str().unwrap();
+    assert!(by.starts_with("bm25 ("), "{v}");
+    assert!(by.contains("bm25-bert: unknown backend `bm25-bert`; this build knows jev and bm25"), "{v}");
+    assert_eq!(ids(&v), ids(&plain), "BM25 results stay: {v}");
 }
 
 fn dir_tree(dir: &Path) -> Vec<String> {
@@ -1842,7 +1841,7 @@ fn doctor_reports_server_state() {
     let doctor = |lock: &str| {
         let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
         std::fs::write(env.kb().join(".git/rkb.lock"), lock).unwrap();
-        c.args(["doctor", "--format", "json"]).env("RKB_OFFLINE", "1");
+        c.args(["doctor", "--format", "json"]);
         let o = c.output().unwrap();
         serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap()
     };
@@ -1851,10 +1850,6 @@ fn doctor_reports_server_state() {
     };
 
     let v = doctor("other 4242 0");
-    assert!(find(&v, "offline")["detail"].as_str().unwrap().contains("on"), "{v}");
-    let files = find(&v, "model files");
-    assert!(files["detail"].as_str().unwrap().starts_with("0 present, 3 missing"), "{v}");
-    assert!(files["fix"].as_str().unwrap().contains("rkb models path"), "{v}");
     let lock = find(&v, "write lock")["detail"].as_str().unwrap().to_string();
     assert!(lock.contains("pid 4242") && lock.contains("other"), "names the pid and the host: {lock}");
 
@@ -1863,99 +1858,27 @@ fn doctor_reports_server_state() {
     assert!(lock.contains("pid 4242") && lock.contains("old lock"), "an old lock file still names the holder: {lock}");
 
     let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
-    c.args(["doctor", "--format", "human"]).env("RKB_OFFLINE", "1");
+    c.args(["doctor", "--format", "human"]);
     let human = stdout(&c.output().unwrap());
-    assert!(human.contains("offline") && human.contains("pid 4242"), "{human}");
-}
-
-const MODEL_SHAS: [&str; 3] = [
-    "69f22ccd1ee0971b6173678c4fcadd29a49a3f5b6b8a6927002418abe4bd5b9c",
-    "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30",
-    "dea4708ed1a6df7306b483037750464a96e77ccb0c7e88f4f61a0116944a71dd",
-];
-
-/// A local HTTP server that only counts connections, so a test proves an offline run connects nowhere.
-fn counting_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-    use std::io::Write;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let c = count.clone();
-    std::thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        }
-    });
-    (url, count)
+    assert!(human.contains("pid 4242"), "{human}");
 }
 
 #[test]
-fn offline_never_downloads_the_model() {
-    let env = search_kb();
-    set_chain(&env, "chain = [\"bm25-bert\", \"bm25\"]");
-    let (url, hits) = counting_server();
-    let model_dir = env.dir.path().join("data/rkb/models/modernbert-embed-base");
-    let plain = env.json(&["search", "git rebase"], "").0;
-    let run = |vars: &[(&str, &str)], args: &[&str]| {
-        let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
-        c.args(args).env("RKB_MODELS_URL", &url);
-        for (k, v) in vars {
-            c.env(k, v);
-        }
-        c.stdin(std::process::Stdio::null()).output().unwrap()
-    };
-
-    let offline_search = |var: &str| {
-        let o = run(&[(var, "1")], &["search", "git rebase", "--format", "json"]);
-        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-        assert_eq!(o.status.code(), Some(0), "{v}");
-        let by = v["ranked_by"].as_str().unwrap();
-        assert!(by.starts_with("bm25 (bm25-bert: offline mode is on"), "{v}");
-        assert!(by.contains(&model_dir.display().to_string()), "names the folder: {v}");
-        for sha in MODEL_SHAS {
-            assert!(by.contains(sha), "names each sha: {v}");
-        }
-        assert!(by.contains("copy them from a machine that has them") && by.contains("rkb models path"), "{v}");
-        assert_eq!(ids(&v), ids(&plain), "BM25 results stay: {v}");
-    };
-    offline_search("RKB_OFFLINE");
-    offline_search("HF_HUB_OFFLINE");
-
-    let o = run(&[("RKB_OFFLINE", "1")], &["search", "git rebase", "--format", "json", "--no-model"]);
-    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-    assert_eq!((v["ranked_by"].as_str(), o.status.code()), (Some("bm25"), Some(0)), "{v}");
-
-    for args in [["models", "warm"], ["models", "fetch"]] {
-        let o = run(&[("RKB_OFFLINE", "1")], &["--format", "json", args[0], args[1]]);
-        assert_eq!(o.status.code(), Some(1), "{}", stdout(&o));
-        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-        let msg = v["error"]["message"].as_str().unwrap();
-        assert!(msg.starts_with("offline mode is on"), "{v}");
-        assert!(msg.contains(&model_dir.display().to_string()) && msg.contains("copy them from a machine that has them"), "{v}");
-    }
-
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "offline made a network request");
-    assert!(!model_dir.exists(), "offline created the model folder");
-}
-
-#[test]
-fn models_path_prints_the_folder_and_the_files() {
+fn doctor_has_no_model_checks() {
     let env = Env::new();
-    let dir = env.dir.path().join("data/rkb/models/modernbert-embed-base");
-    let o = env.rkb(&["models", "path", "--format", "human"]);
-    assert!(o.status.success(), "{}", stdout(&o));
-    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), dir.display().to_string());
-
-    let (v, code) = env.json(&["models", "path"], "");
-    assert_eq!(code, Some(0));
-    assert_eq!(v["path"].as_str().unwrap(), dir.display().to_string());
-    let files = v["files"].as_array().unwrap();
-    for (i, name) in ["model.safetensors", "tokenizer.json", "config.json"].into_iter().enumerate() {
-        assert_eq!((files[i]["name"].as_str(), files[i]["sha256"].as_str()), (Some(name), Some(MODEL_SHAS[i])), "{v}");
-        assert_eq!(files[i]["present"], serde_json::json!(false), "{v}");
+    env.init();
+    let (v, code) = env.json(&["doctor"], "");
+    assert_eq!(code, Some(0), "{v}");
+    for c in v["checks"].as_array().unwrap() {
+        let name = c["check"].as_str().unwrap().to_lowercase();
+        let detail = c["detail"].as_str().unwrap_or_default();
+        assert!(!name.contains("model") && !name.contains("vector") && !name.contains("gpu"), "a model check is left: {c}");
+        assert!(!detail.contains("model file") && !detail.contains("vector") && !detail.contains("gpu"), "a model detail is left: {c}");
     }
-    assert_eq!(env.rkb(&["models", "path", "--toon"]).status.code(), Some(0));
+    let human = stdout(&env.rkb(&["doctor", "--format", "human"]));
+    for needle in ["model files", "model folder", "vector", "gpu", "HF_HUB_OFFLINE"] {
+        assert!(!human.contains(needle), "{needle} is still in doctor: {human}");
+    }
 }
 
 fn graph_kb() -> Env {
@@ -2569,7 +2492,7 @@ fn install_hermes_passes_the_rkb_variables() {
     let hermes = env.dir.path().join(".hermes");
     let entry = hermes_config_yaml(&hermes)["mcp_servers"]["rkb"]["env"].clone();
     assert_eq!(entry["RKB_HOME"].as_str(), Some(kb.to_str().unwrap()), "{entry}");
-    assert_eq!(entry["RKB_OFFLINE"], "1", "{entry}");
+    assert!(entry.get("RKB_OFFLINE").is_none(), "no reader is left for RKB_OFFLINE: {entry}");
     assert_eq!(entry["RKB_NTFY_TOKEN"], "${RKB_NTFY_TOKEN}", "only a reference: {entry}");
     let config = std::fs::read_to_string(hermes.join("config.yaml")).unwrap();
     assert!(!config.contains("sekrit"), "the token value is never written: {config}");

@@ -25,11 +25,6 @@ pub fn cache_dir() -> PathBuf {
     xdg(std::env::var_os("XDG_CACHE_HOME"), home_base(), ".cache")
 }
 
-/// The folder with the downloaded tools. rkb downloads no rs-web, so only the rerank model lives here.
-pub fn data_dir() -> PathBuf {
-    xdg(std::env::var_os("XDG_DATA_HOME"), home_base(), ".local/share")
-}
-
 /// Per-machine config such as `trust.toml`. Never synced.
 pub fn config_dir() -> PathBuf {
     xdg(std::env::var_os("XDG_CONFIG_HOME"), home_base(), ".config")
