@@ -288,10 +288,15 @@ pub fn run_locked<F: FnMut() -> bool>(
         let written = match written {
             Ok(written) => written,
             Err(e) => {
-                // The item goes, or every session end would pay for the same failed write again.
-                promote::log_call(&env.state, &item.id, &model, input, output, "failed", None);
-                distill::remove(&env.state, &item.id);
+                promote::log_call(&env.state, &item.id, &model, input, output, "failed", Some(&e.message));
                 results.push(json!({ "id": item.id, "action": "failed", "reason": e.message }));
+                // A write that fails in the background job is often the job's environment, so the
+                // pass keeps the item and stops. By hand the item goes, so no pass pays for it again.
+                if stop_on_failure {
+                    skip = Some(format!("the lesson write failed: {}", e.message));
+                    break;
+                }
+                distill::remove(&env.state, &item.id);
                 continue;
             }
         };

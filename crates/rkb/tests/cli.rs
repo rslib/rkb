@@ -7267,6 +7267,26 @@ fn maintain_pass_survives_a_failed_pull() {
 }
 
 #[test]
+fn maintain_pass_keeps_the_item_when_the_write_fails() {
+    let env = Env::new();
+    env.init();
+    maintain_config(&env, "");
+    approve_as_claude(&env);
+    maintain_item(&env, "0000000002", "note", 0, Some("aaabbbcccddd"), "cmake could not find HDF5 on this machine");
+    maintain_seen(&env, "aaabbbcccddd");
+    // The knowledge base refuses the commit after the model answered.
+    env.write_abs(&env.kb().join(".git/index.lock"), "");
+    maintain_fake_pi(&env, MAINTAIN_ANSWER);
+    let o = rkb_with(with_pi(&env), &["maintain", "--harness", "pi", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(o.status.code(), Some(0), "{v}");
+    assert!(v["skip"].as_str().is_some_and(|s| s.contains("the lesson write failed")), "{v}");
+    assert_eq!(inbox_items(&env).len(), 1, "the item stays for a later pass");
+    let log = std::fs::read_to_string(env.dir.path().join("state/rkb/promotions.jsonl")).unwrap();
+    assert!(log.contains("index.lock"), "the log keeps the reason: {log}");
+}
+
+#[test]
 fn maintain_pass_nothing_to_do() {
     let env = Env::new();
     env.init();
