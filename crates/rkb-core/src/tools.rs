@@ -121,7 +121,6 @@ fn inputs() -> Vec<Value> {
         "title": { "type": "string", "description": "What the lesson says, one short sentence" },
         "topic": { "type": "string", "description": "Topic folder, such as `cmake`" },
         "tags": { "type": "array", "items": { "type": "string" }, "description": "A few words to find it by" },
-        "queries": { "type": "array", "items": { "type": "string" }, "description": "3 to 4 queries someone types before they know the lesson, never the title: raw error text, the symptom in plain words, a how-do-I question" },
         "when": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Where it holds, such as {\"hdf5\": \"1.12:1.14.2\"}. {\"project\": \"<name>\"} only for a claim about one project; a general rule names the project only in evidence" },
         "verified_how": { "type": "string", "enum": ["ran", "read", "told"], "description": "ran (default): you saw it work; read: docs or code; told: the user said so" },
         "assets": { "type": "array", "items": { "type": "string" }, "description": "Image files to store; link each by file name, such as ![t](t.png)" },
@@ -247,9 +246,6 @@ pub fn lesson(args: &Value) -> Result<(String, String), String> {
     if let Some(tags) = args["tags"].as_array().filter(|a| !a.is_empty()) {
         fm.insert("tags".into(), tags.iter().filter_map(Value::as_str).map(serde_norway::Value::from).collect::<Vec<_>>().into());
     }
-    if let Some(queries) = args["queries"].as_array().filter(|a| !a.is_empty()) {
-        fm.insert("queries".into(), queries.iter().filter_map(Value::as_str).map(serde_norway::Value::from).collect::<Vec<_>>().into());
-    }
     if let Some(when) = args["when"].as_object().filter(|w| !w.is_empty()) {
         let mut m = serde_norway::Mapping::new();
         for (k, v) in when {
@@ -270,6 +266,13 @@ pub fn lesson(args: &Value) -> Result<(String, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rkb_add_schema_asks_for_no_queries() {
+        let defs = definitions();
+        let add = defs.iter().find(|d| d["name"] == "rkb_add").unwrap();
+        assert!(add["inputSchema"]["properties"].get("queries").is_none());
+    }
 
     #[test]
     fn definitions_and_checks() {

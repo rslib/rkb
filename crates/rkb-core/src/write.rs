@@ -996,6 +996,10 @@ fn edit(
         return Err(Error::Conflict(current));
     }
     let mut new = lesson::parse(&old.path, text).map_err(|e| refused(e.message))?;
+    // The shown text hides `queries`; an edit from it keeps the queries on disk.
+    if new.frontmatter.queries.is_empty() && !old.frontmatter.queries.is_empty() {
+        new.frontmatter.queries = old.frontmatter.queries.clone();
+    }
     let (o, n) = (&old.frontmatter, &mut new.frontmatter);
     if n.id != o.id {
         return Err(refused("`rkb edit` cannot change `id`"));

@@ -318,6 +318,30 @@ fn show_prints_the_whole_lesson() {
 }
 
 #[test]
+fn show_hides_queries_and_edit_keeps_them() {
+    let env = kb_with_topics();
+    let text = "---\nschema: 1\nid: 0a1b2c3d4e\ntype: pitfall\nstatus: active\nverified: 2026-09-25\nverified_how: ran\ntags:\n  - cmake\nqueries:\n  - undefined reference to H5Fopen\n  - cmake cannot find hdf5\n---\n\n# CMake cannot find HDF5 unless HDF5_ROOT is set\n\n## Symptom\nConfigure fails.\n\n## Cause\nThe module has no CMake config file.\n\n## Fix\nSet HDF5_ROOT.\n\n## Evidence\nConfigure passed with the flag.\n";
+    env.write("general/demo/a.md", text);
+    let id = "0a1b2c3d4e";
+    for format in ["human", "json", "toon"] {
+        let out = stdout(&env.rkb(&["show", id, "--format", format]));
+        assert!(!out.contains("queries"), "{format} shows the queries key: {out}");
+        assert!(!out.contains("H5Fopen"), "{format} shows a query: {out}");
+    }
+    let json: serde_json::Value = serde_json::from_slice(&env.rkb(&["show", id, "--format", "json"]).stdout).unwrap();
+    assert!(json["frontmatter"].get("queries").is_none());
+    let hash = json["hash"].as_str().unwrap().to_string();
+    let human = stdout(&env.rkb(&["show", id, "--format", "human"]));
+    let shown = human.lines().skip(5).collect::<Vec<_>>().join("\n") + "\n";
+    let edited = shown.replace("Set HDF5_ROOT.", "Set HDF5_ROOT to the install prefix.");
+    let (v, code) = env.json(&["edit", id, "--base", &hash], &edited);
+    assert_eq!(code, Some(0), "{v}");
+    let on_disk = std::fs::read_to_string(env.kb().join("general/demo/a.md")).unwrap();
+    assert!(on_disk.contains("Set HDF5_ROOT to the install prefix."));
+    assert!(on_disk.contains("queries:\n  - undefined reference to H5Fopen\n  - cmake cannot find hdf5\n"), "{on_disk}");
+}
+
+#[test]
 fn every_command_help_has_an_example() {
     let env = Env::new();
     for cmd in [
@@ -3891,7 +3915,13 @@ printf '%s' '{"action":"add","topic":"cmake","type":"pitfall","title":"Cmake nee
     assert!(human.contains("inbox: 3f2a1b4c5d") && human.contains("quote: cmake could not find HDF5"), "{human}");
     assert!(human.contains("session: s1") && human.contains("harness: pi") && human.contains(&format!("date: {today}")), "{human}");
     let plain = stdout(&env.rkb(&["show", &id, "--format", "human"]));
-    assert!(plain.contains(file.trim()), "plain show still prints the whole file");
+    let shown = std::fs::read_to_string(env.kb().join(&path)).unwrap();
+    let body_only = shown.split_once("\nqueries:\n").map(|(head, tail)| {
+        let queries_end = tail.lines().take_while(|l| l.starts_with("  - ")).map(|l| l.len() + 1).sum::<usize>();
+        format!("{}\n{}", head, &tail[queries_end..])
+    });
+    let shown = body_only.as_deref().unwrap_or(shown.as_str());
+    assert!(plain.contains(shown.trim()), "plain show still prints the whole file");
     let (v, _) = env.json(&["show", &id], "");
     assert!(v.get("source").is_none(), "no chain without --why: {v}");
 
@@ -6236,10 +6266,9 @@ fn worked_adds_the_failure_query() {
         p
     };
     let queries_of = |env: &Env| -> Vec<String> {
-        show(env, id)["frontmatter"]["queries"]
-            .as_array()
-            .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
-            .unwrap_or_default()
+        let path = show(env, id)["path"].as_str().unwrap().to_string();
+        let text = std::fs::read_to_string(env.kb().join(&path)).unwrap();
+        rkb_core::lesson::parse(&path, &text).unwrap().frontmatter.queries
     };
     let set_queries = |env: &Env, qs: &[&str]| {
         let (text, hash) = current(env, id);

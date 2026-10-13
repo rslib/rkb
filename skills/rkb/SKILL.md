@@ -105,10 +105,6 @@ Do not save these:
 - Write each heading as an H2, in this order, and leave no section empty.
 - `verified_how` is `ran`, `read` or `told`.
   Never write `checked`.
-- Write `queries` on every lesson.
-  Copy the real error text first, then the symptom in plain words and a how-do-I question.
-  Never copy the title.
-  Use at most 8.
 - Always quote versions in `when`, such as `hdf5: "1.12:1.14.2"`.
 - Write frontmatter in block style.
   Never write `[a, b]` or `{k: v}`.

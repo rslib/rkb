@@ -20,6 +20,7 @@ use std::process::ExitCode;
 use clap::{CommandFactory, Parser, Subcommand};
 use output::{CliError, Format, Output, color, cut, paint};
 use rkb_core::conditions::Verdict;
+use rkb_core::lesson::Frontmatter;
 use rkb_core::lint::{LintEnv, Severity};
 use rkb_core::{init, kb, lint, paths, usage};
 use serde_json::{Value, json};
@@ -1029,8 +1030,11 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
         Cmd::Show { id, why } => {
             kb::open(&root)?;
             let roots = rkb_core::kb::Roots::load(&root, &rkb_core::paths::config_dir())?;
-            let (origin, lesson, text) = roots.find(&id)?;
+            let (origin, lesson, raw) = roots.find(&id)?;
             let fm = &lesson.frontmatter;
+            let shown = Frontmatter { queries: Vec::new(), ..fm.clone() };
+            // Only a lesson with queries is rewritten, so every other lesson prints exactly as on disk.
+            let text = if fm.queries.is_empty() { raw.clone() } else { rkb_core::lesson::write(&shown, &lesson.body) };
             let out_id = rkb_core::search::qualified(origin.as_deref(), &fm.id);
             let title = rkb_core::body::scan(&lesson.body).h1.into_iter().next().map(|(_, t)| t).unwrap_or_default();
             let days = jiff::Zoned::now().date().since(fm.verified).map(|s| s.get_days()).unwrap_or(0);
@@ -1040,7 +1044,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
                 n if n < 0 => "in the future".to_string(),
                 n => format!("{n} days ago"),
             };
-            let hash = rkb_core::write::content_hash(text.as_bytes());
+            let hash = rkb_core::write::content_hash(raw.as_bytes());
             let counts = usage::counts(&root).remove(&out_id).unwrap_or_default();
             let (worked, failed) = (counts.last_worked.clone(), counts.last_failed.clone());
             let uses = format!(
@@ -1107,7 +1111,7 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
                         "reason": k.reason,
                     })).collect::<Vec<_>>(),
                 },
-                "frontmatter": serde_json::to_value(fm).unwrap_or(Value::Null),
+                "frontmatter": serde_json::to_value(&shown).unwrap_or(Value::Null),
                 "body": lesson.body,
                 "related": related,
             });

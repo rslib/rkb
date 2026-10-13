@@ -80,8 +80,8 @@ pub fn prompt(item: &Item, lessons: &[String]) -> String {
          The closest lessons:\n{list}\n\n\
          A lesson marked (archived tombstone) was retired. Do not add or update the same claim. Answer \"used\" or \"noop\" instead.\n\n\
          Choose exactly one action:\n\
-         - \"add\": no lesson covers it. Give \"topic\", \"type\" (pitfall, recipe, fact, decision or preference), \"title\", \"queries\" (2 to 4 search phrases), \"sections\" and \"quotes\" (exact substrings of the item text).\n\
-         - \"update\": a lesson covers part of it. Give \"id\", \"type\", \"title\", \"queries\", \"sections\" and \"quotes\".\n\
+         - \"add\": no lesson covers it. Give \"topic\", \"type\" (pitfall, recipe, fact, decision or preference), \"title\", \"sections\" and \"quotes\" (exact substrings of the item text).\n\
+         - \"update\": a lesson covers part of it. Give \"id\", \"type\", \"title\", \"sections\" and \"quotes\".\n\
          - \"used\": a lesson already says it. Give \"id\" and \"quotes\".\n\
          - \"noop\": not worth a lesson. Give \"reason\".\n\n\
          \"sections\" is an object whose keys are exactly these headings, in this order:\n\
@@ -238,6 +238,12 @@ mod tests {
             },
             body: body.into(),
         }
+    }
+
+    #[test]
+    fn promotion_prompt_asks_for_no_queries() {
+        let p = prompt(&item("cmake could not find HDF5 on this machine"), &[]);
+        assert!(!p.contains("queries"), "{p}");
     }
 
     #[test]
