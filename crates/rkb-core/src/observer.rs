@@ -67,8 +67,7 @@ pub fn approve_request(ctx: &Ctx) -> Result<Option<Request>> {
         return Ok(None);
     }
     let question = format!(
-        "Approve the observer on {system}? After each session with {} or more prompts ends, rkb runs that harness's own agent in print mode, with no tools, in the background, and sends it the session's text: your prompts, the agent's text, tool calls and error lines. It tries the models in order until one answers:\n{summary}\n(`session` is the model the session used.) sha256 {sha}",
-        cfg.min_prompts
+        "Approve the observer on {system}? `rkb maintain` (run by the OS timer, within [maintain] max_calls_per_day) and `rkb inbox triage --ask` run that harness's own agent in print mode, with no tools, and send it inbox items: extracts of your prompts, the agent's text, tool calls and error lines. It tries the models in order until one answers:\n{summary}\n(`session` is the harness's default model.) sha256 {sha}"
     );
     let req = Request {
         id: request::new_id(),

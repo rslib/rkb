@@ -5689,6 +5689,7 @@ fn inbox_triage_keeps_internal_notes_from_jev() {
 fn approve_as_claude(env: &Env) {
     let (v, code) = env.json(&["approve", "observer"], "");
     assert_eq!((v["status"].as_str(), code), (Some("needs_user"), Some(3)), "{v}");
+    assert!(v.to_string().contains("`rkb maintain`"), "the question names the pass that calls the model: {v}");
     env.trust_claude();
     let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
     c.env("CLAUDECODE", "1");
