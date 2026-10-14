@@ -656,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "rkb"
-version = "0.0.17"
+version = "0.0.18"
 dependencies = [
  "clap",
  "jiff",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "rkb-core"
-version = "0.0.17"
+version = "0.0.18"
 dependencies = [
  "getrandom 0.4.3",
  "globset",
