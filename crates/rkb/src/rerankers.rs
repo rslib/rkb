@@ -205,12 +205,13 @@ pub fn jev_worth(root: &Path, project: Option<&str>, texts: &[&str]) -> Option<(
     let kb: KbConfig = std::fs::read_to_string(root.join("kb.toml")).ok().and_then(|t| config::parse(&t).ok()).unwrap_or_default();
     let env = rkb_core::lint::LintEnv::from_process();
     let scanner = LeakScanner::new(&kb.leak, env.user.as_deref(), env.home.as_deref());
-    let sent: Vec<usize> = (0..texts.len()).filter(|&i| scanner.scan(texts[i]).is_empty()).collect();
+    let redacted: Vec<String> = texts.iter().map(|t| scanner.redact(t)).collect();
+    let sent: Vec<usize> = (0..texts.len()).filter(|&i| scanner.scan(&redacted[i]).is_empty()).collect();
     let mut state = String::from("Notes from coding sessions, each a possible entry in a knowledge base of lessons learned:");
     let mut questions = serde_json::Map::new();
     let criteria: serde_json::Map<String, serde_json::Value> = KINDS.iter().map(|(k, m)| (k.to_string(), serde_json::json!(m))).collect();
     for (n, &i) in sent.iter().enumerate() {
-        state.push_str(&format!("\n\n[{n}]\n{}", texts[i].chars().take(4000).collect::<String>()));
+        state.push_str(&format!("\n\n[{n}]\n{}", redacted[i].chars().take(4000).collect::<String>()));
         for (key, ask) in [
             ("durable", "Would note [N] still help in a different session months from now?"),
             ("general", "Does note [N] hold beyond the one file or task it came from?"),

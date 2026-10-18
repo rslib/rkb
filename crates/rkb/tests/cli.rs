@@ -5599,6 +5599,35 @@ fn inbox_triage_asks_jev_whether_a_note_is_worth_a_lesson() {
 }
 
 #[test]
+fn inbox_triage_sends_redacted_text_to_jev() {
+    let env = search_kb();
+    set_chain(&env, "chain = [\"jev\", \"bm25\"]");
+    let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();
+    if !toml.contains("[sinks.jev]") {
+        env.write("kb.toml", &format!("{toml}\n[sinks.jev]\nallow = {{ sensitivity = [\"public\", \"internal\"] }}\n"));
+    }
+    jev_config(&env, "[jev]\napi_key = \"k\"\n", 0o600);
+    let (url, log) = fake_jev(jev_answers);
+    let home = env.dir.path().display().to_string();
+    inbox_item(
+        &env,
+        "000000000c",
+        "note",
+        &[],
+        &format!("the build log at {home}/src/app/build.log shows the link order fails; ask ops@example.org"),
+    );
+    let mut c = env.cmd(env!("CARGO_BIN_EXE_rkb"));
+    c.env("RKB_JEV_URL", &url);
+    let o = rkb_with(c, &["inbox", "triage", "--format", "json"], "");
+    assert!(o.status.success(), "{}", stdout(&o));
+    let (show, _) = env.json(&["inbox", "show", "000000000c"], "");
+    assert_eq!(show["meta"]["candidates"][0]["reason"], "jev", "the redacted note went to Jev: {show}");
+    let sent: Vec<String> = log.lock().unwrap().iter().map(|(_, b)| b["state"].to_string()).collect();
+    assert!(sent.iter().any(|s| s.contains("~/src/app/build.log") && s.contains("<email>")), "{sent:?}");
+    assert!(sent.iter().all(|s| !s.contains(&home) && !s.contains("ops@example.org")), "{sent:?}");
+}
+
+#[test]
 fn inbox_triage_keeps_internal_notes_from_jev() {
     let env = search_kb();
     let toml = std::fs::read_to_string(env.kb().join("kb.toml")).unwrap();

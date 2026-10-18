@@ -40,6 +40,8 @@ pub struct LeakScanner {
     flux_ascii: Regex,
     allow: HashSet<String>,
     path_roots: Vec<String>,
+    /// `$HOME` with one trailing `/`, the root that `redact` turns into `~/`.
+    home: Option<String>,
 }
 
 impl LeakScanner {
@@ -60,12 +62,9 @@ impl LeakScanner {
 
         rules.push((LeakKind::Email, Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b").unwrap()));
 
-        let path_roots: Vec<String> = DEFAULT_PATH_ROOTS
-            .iter()
-            .map(|r| r.to_string())
-            .chain(home.filter(|h| h.len() > 1).map(|h| format!("{}/", h.trim_end_matches('/'))))
-            .chain(cfg.paths.iter().cloned())
-            .collect();
+        let home = home.filter(|h| h.len() > 1).map(|h| format!("{}/", h.trim_end_matches('/')));
+        let path_roots: Vec<String> =
+            DEFAULT_PATH_ROOTS.iter().map(|r| r.to_string()).chain(home.clone()).chain(cfg.paths.iter().cloned()).collect();
         let roots: Vec<String> = path_roots.iter().map(|r| regex::escape(r)).collect();
         rules.push((LeakKind::Path, Regex::new(&format!(r#"(?:^|[^A-Za-z0-9_$./~-])((?:{})[^\s"'`)\]>,;]+)"#, roots.join("|"))).unwrap()));
 
@@ -79,6 +78,7 @@ impl LeakScanner {
             path_roots,
             flux_ascii: Regex::new(&format!(r"\bf[{BASE58}]{{6,12}}\b")).unwrap(),
             allow: cfg.allow.iter().cloned().collect(),
+            home,
         }
     }
 
@@ -87,32 +87,88 @@ impl LeakScanner {
     }
 
     pub fn scan(&self, text: &str) -> Vec<LeakMatch> {
-        let mut out = vec![];
-        for (i, line) in text.lines().enumerate() {
-            let mut push = |kind, text: &str| {
-                if !self.allow.contains(text) {
-                    out.push(LeakMatch { kind, line: i + 1, text: text.to_string() });
-                }
-            };
-            for (kind, re) in &self.rules {
-                for cap in re.captures_iter(line) {
-                    let m = cap.get(1).unwrap_or_else(|| cap.get(0).unwrap()).as_str();
-                    if *kind == LeakKind::Email && m.split('@').next() == Some("git") {
-                        continue;
+        text.lines()
+            .enumerate()
+            .flat_map(|(i, line)| {
+                self.matches(line).into_iter().map(move |(kind, r)| LeakMatch { kind, line: i + 1, text: line[r].to_string() })
+            })
+            .collect()
+    }
+
+    /// `text` with each match replaced: a path under `$HOME` by `~/` and the rest of the path, any
+    /// other match by a placeholder for its kind. The result can still match when a match hides in
+    /// another one more than 4 levels deep, so a caller that must send clean text scans it again.
+    pub fn redact(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for _ in 0..4 {
+            let mut changed = false;
+            let lines: Vec<String> = out
+                .split('\n')
+                .map(|line| {
+                    let mut found = self.matches(line);
+                    found.sort_by_key(|(_, r)| (r.start, std::cmp::Reverse(r.end)));
+                    let (mut kept, mut end) = (vec![], 0);
+                    for (kind, r) in found {
+                        if r.start >= end {
+                            end = r.end;
+                            kept.push((kind, r));
+                        }
                     }
-                    // `/scratch/$USER/x` names no one: the part after the root is a variable.
-                    if *kind == LeakKind::Path && self.after_root_is_variable(m) {
-                        continue;
+                    let mut line = line.to_string();
+                    for (kind, r) in kept.into_iter().rev() {
+                        let with = self.replacement(kind, &line[r.clone()]);
+                        line.replace_range(r, &with);
+                        changed = true;
                     }
-                    push(*kind, m);
-                }
+                    line
+                })
+                .collect();
+            out = lines.join("\n");
+            if !changed {
+                break;
             }
-            // An ASCII Flux ID looks like a word or a hex hash unless it mixes digits and capitals.
-            for m in self.flux_ascii.find_iter(line) {
-                let tail = &m.as_str()[1..];
-                if tail.chars().any(|c| c.is_ascii_digit()) && tail.chars().any(|c| c.is_ascii_uppercase()) {
-                    push(LeakKind::JobId, m.as_str());
+        }
+        out
+    }
+
+    fn replacement(&self, kind: LeakKind, text: &str) -> String {
+        match kind {
+            LeakKind::Path => match self.home.as_deref().and_then(|h| text.strip_prefix(h)) {
+                Some(rest) => format!("~/{rest}"),
+                None => "<path>".to_string(),
+            },
+            LeakKind::Username => "<user>".to_string(),
+            LeakKind::Email => "<email>".to_string(),
+            LeakKind::JobId => "<job-id>".to_string(),
+        }
+    }
+
+    /// The matches in one line that the allow list does not cover, with their byte ranges.
+    fn matches(&self, line: &str) -> Vec<(LeakKind, std::ops::Range<usize>)> {
+        let mut out = vec![];
+        let mut push = |kind, m: regex::Match| {
+            if !self.allow.contains(m.as_str()) {
+                out.push((kind, m.range()));
+            }
+        };
+        for (kind, re) in &self.rules {
+            for cap in re.captures_iter(line) {
+                let m = cap.get(1).unwrap_or_else(|| cap.get(0).unwrap());
+                if *kind == LeakKind::Email && m.as_str().split('@').next() == Some("git") {
+                    continue;
                 }
+                // `/scratch/$USER/x` names no one: the part after the root is a variable.
+                if *kind == LeakKind::Path && self.after_root_is_variable(m.as_str()) {
+                    continue;
+                }
+                push(*kind, m);
+            }
+        }
+        // An ASCII Flux ID looks like a word or a hex hash unless it mixes digits and capitals.
+        for m in self.flux_ascii.find_iter(line) {
+            let tail = &m.as_str()[1..];
+            if tail.chars().any(|c| c.is_ascii_digit()) && tail.chars().any(|c| c.is_ascii_uppercase()) {
+                push(LeakKind::JobId, m);
             }
         }
         out
@@ -187,5 +243,38 @@ mod tests {
         let s = scanner(&["bob@example.org"]);
         assert!(s.scan("bob@example.org").is_empty());
         assert_eq!(s.scan("bob@example.com").len(), 1);
+    }
+
+    #[test]
+    fn redact_replaces_each_kind() {
+        let s = scanner(&[]);
+        assert_eq!(s.redact("cd /Users/ray/Code/x && ls"), "cd ~/Code/x && ls");
+        assert_eq!(s.redact("cd /Users/ann/Code/x"), "cd <path>");
+        assert_eq!(s.redact("mail bob@example.org now"), "mail <email> now");
+        assert_eq!(s.redact("alice ran it"), "<user> ran it");
+        assert_eq!(s.redact("Submitted batch job 4242"), "<job-id>");
+        assert_eq!(s.redact("flux job f2BZ6cM3B done"), "flux job <job-id> done");
+        assert_eq!(s.redact("a\n/Users/ray/x\nb"), "a\n~/x\nb", "keeps the lines");
+    }
+
+    #[test]
+    fn redact_leaves_clean_text() {
+        let s = scanner(&[]);
+        for text in ["no leak here", "/Users/ray/alice/run", "/Users/alice/run and ray@example.org", "x\n\n"] {
+            assert!(s.scan(&s.redact(text)).is_empty(), "{text} -> {}", s.redact(text));
+        }
+        assert_eq!(s.redact("x\n\n"), "x\n\n");
+        assert_eq!(s.redact("/Users/ray/alice/run"), "~/<user>/run", "a name inside a home path");
+    }
+
+    #[test]
+    fn redact_keeps_multibyte_text() {
+        let s = scanner(&[]);
+        assert_eq!(s.redact("é job ƒ2BZ6cM3B ü /Users/ray/é/x"), "é job <job-id> ü ~/é/x");
+    }
+
+    #[test]
+    fn redact_keeps_allowed_text() {
+        assert_eq!(scanner(&["bob@example.org"]).redact("mail bob@example.org"), "mail bob@example.org");
     }
 }
