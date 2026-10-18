@@ -5422,6 +5422,11 @@ fn matches_schema(schema: &serde_json::Value, value: &serde_json::Value) -> Resu
             return Err(format!("missing {k} in {value}"));
         }
     }
+    if let Some(any) = schema["anyOf"].as_array()
+        && !any.iter().any(|s| matches_schema(s, value).is_ok())
+    {
+        return Err(format!("{value} matches no anyOf branch"));
+    }
     for (k, sub) in schema["properties"].as_object().into_iter().flatten() {
         if let Some(v) = value.get(k) {
             matches_schema(sub, v)?;
@@ -5453,6 +5458,17 @@ fn tool_metadata_and_output_schemas() {
     let o = env.rkb_in(&["tool", "rkb_show", "--format", "json"], &serde_json::json!({ "id": id }).to_string());
     matches_schema(&def("rkb_show")["outputSchema"], &serde_json::from_slice(&o.stdout).unwrap()).unwrap();
     assert!(matches_schema(&def("rkb_show")["outputSchema"], &serde_json::json!({ "id": "x" })).is_err(), "the check can fail");
+
+    verdict_item(&env, "00000000b1", "keep", "undefined reference to vtable went away after the destructor got a body");
+    let o = env.rkb_in(&["tool", "rkb_search", "--format", "json"], &query.to_string());
+    let search: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(search["inbox"][0]["id"], "00000000b1", "{search}");
+    matches_schema(&def("rkb_search")["outputSchema"], &search).unwrap();
+    assert!(def("rkb_search")["outputSchema"]["properties"]["inbox"].is_object(), "the schema names the inbox rows");
+    assert!(def("rkb_search")["outputSchema"]["properties"]["inbox"]["items"]["properties"]["at"].is_object(), "names the line number");
+    let o = env.rkb_in(&["tool", "rkb_show", "--format", "json"], &serde_json::json!({ "id": "00000000b1", "line": 1 }).to_string());
+    let shown: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    matches_schema(&def("rkb_show")["outputSchema"], &shown).unwrap();
 
     let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
     let o = env.rkb_in(&["mcp"], &format!("{list}\n"));
@@ -7284,6 +7300,118 @@ fn maintain_pass_asks_nothing_at_the_daily_cap() {
     let o = rkb_with(with_pi(&env), &["maintain", "--harness", "pi"], "");
     assert!(stdout(&o).contains("0 asked"), "{}", stdout(&o));
     assert!(!env.dir.path().join("fake/calls").exists(), "no model call at the cap");
+}
+
+fn verdict_item(env: &Env, id: &str, verdict: &str, body: &str) {
+    let dir = env.dir.path().join("state/rkb/inbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let meta = format!("kind: note\ntime: {}\ncandidates:\n  - index: 0\n    verdict: {verdict}\n    reason: test\n", maintain_now());
+    std::fs::write(dir.join(format!("{id}.md")), format!("---\n{meta}---\n\n{body}\n")).unwrap();
+}
+
+#[test]
+fn search_lists_kept_inbox_items_after_the_lessons() {
+    let env = search_kb();
+    verdict_item(&env, "00000000a1", "keep", "first line\ncmake could not find HDF5 until HDF5_ROOT was set\nlast line");
+    verdict_item(&env, "00000000a2", "drop", "cmake could not find HDF5 here either");
+    let before = std::fs::read_dir(env.dir.path().join("state/rkb/inbox")).unwrap().count();
+    let (v, _) = env.json(&["search", "cmake hdf5"], "");
+    let inbox = v["inbox"].as_array().unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(inbox.len(), 1, "only the kept item: {v}");
+    assert_eq!(inbox[0]["id"], "00000000a1");
+    let line = inbox[0]["line"].as_str().unwrap();
+    assert!(line.contains("cmake") && line.chars().count() <= 160, "{line}");
+    assert_eq!(inbox[0]["at"], 2, "the number of the matching line: {v}");
+    let lesson = v["results"][0]["id"].as_str().unwrap().to_string();
+    let (refused, code) = env.json(&["show", &lesson, "--line", "3"], "");
+    assert_ne!(code, Some(0), "{refused}");
+    assert!(refused.to_string().contains("--line") && refused.to_string().contains("inbox"), "{refused}");
+    assert_eq!(std::fs::read_dir(env.dir.path().join("state/rkb/inbox")).unwrap().count(), before, "search changes no inbox file");
+
+    for n in 3..=7 {
+        verdict_item(&env, &format!("00000000a{n}"), "keep", &format!("cmake note {n}"));
+    }
+    let (v, _) = env.json(&["search", "cmake"], "");
+    assert_eq!(v["inbox"].as_array().unwrap().len(), 2, "at most 2: {v}");
+    let (v, _) = env.json(&["search", "zebra quokka"], "");
+    assert!(v.get("inbox").is_none(), "no match, no inbox key: {v}");
+}
+
+#[test]
+fn show_inbox_item_prints_its_focus_view() {
+    let env = Env::new();
+    env.init();
+    let body: String = (1..=400)
+        .map(|i| if i == 200 { "[command failed, exit 1] cmake ..".to_string() } else { format!("line {i}") })
+        .collect::<Vec<_>>()
+        .join("\n");
+    maintain_item(&env, "0000000003", "transcript", 0, None, &body);
+    let (v, code) = env.json(&["show", "0000000003"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!((v["id"].as_str(), v["inbox"].as_bool()), (Some("0000000003"), Some(true)), "{v}");
+    let view = v["focus"].as_str().unwrap();
+    assert!(view.lines().count() <= 40 && view.contains("[command failed, exit 1] cmake ..") && !view.contains("line 10\n"), "{view}");
+    assert!(v.to_string().contains("rkb used 0000000003 --worked"), "says how to report it: {v}");
+    let (v, _) = env.json(&["show", "0000000003", "--line", "50"], "");
+    let view = v["focus"].as_str().unwrap();
+    assert!(view.lines().count() <= 40 && view.contains("line 45\n") && view.contains("line 55\n"), "{view}");
+    assert!(!view.contains("line 44\n") && view.contains("[command failed, exit 1] cmake .."), "{view}");
+    let human = stdout(&rkb_with(env.cmd(env!("CARGO_BIN_EXE_rkb")), &["show", "0000000003", "--format", "human"], ""));
+    assert!(human.lines().count() <= 45, "{human}");
+}
+
+#[test]
+fn inbox_worked_item_stops_after_two_quote_misses() {
+    let env = Env::new();
+    env.init();
+    maintain_config(&env, "");
+    approve_as_claude(&env);
+    maintain_item(&env, "0000000002", "note", 0, None, "the linker wants -lz after -lhdf5 on this cluster");
+    env.json(&["used", "0000000002", "--worked"], "");
+    maintain_fake_pi(&env, MAINTAIN_ANSWER);
+    for _ in 0..3 {
+        let o = rkb_with(with_pi(&env), &["promote", "--max", "1", "--harness", "pi"], "");
+        assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    }
+    let calls = std::fs::read_to_string(env.dir.path().join("fake/calls")).unwrap();
+    assert_eq!(calls.lines().count(), 2, "two misses, then no more calls: {calls}");
+    assert_eq!(inbox_items(&env).len(), 1, "the item stays in the inbox");
+}
+
+#[test]
+fn inbox_worked_transcript_does_not_expire() {
+    let env = Env::new();
+    env.init();
+    maintain_item(&env, "0000000001", "transcript", 20, None, "[user] an old extracted session");
+    env.json(&["used", "0000000001", "--worked"], "");
+    let (v, _) = env.json(&["maintain"], "");
+    assert_eq!(v["expired"], 0, "{v}");
+    assert_eq!(inbox_items(&env).len(), 1);
+}
+
+#[test]
+fn inbox_worked_item_promotes_first() {
+    let env = Env::new();
+    env.init();
+    maintain_config(&env, "");
+    approve_as_claude(&env);
+    maintain_item(&env, "0000000001", "note", 2, Some("aaabbbcccddd"), "the linker wants -lz after -lhdf5 on this cluster");
+    maintain_seen(&env, "aaabbbcccddd");
+    maintain_item(&env, "0000000002", "note", 0, None, "cmake could not find HDF5 on this machine");
+
+    let (v, code) = env.json(&["used", "0000000002", "--failed", "--reason", "x"], "");
+    assert_ne!(code, Some(0), "{v}");
+    assert!(v.to_string().contains("--worked"), "names the only report for an inbox item: {v}");
+    let (v, code) = env.json(&["used", "0000000002", "--worked"], "");
+    assert_eq!(code, Some(0), "{v}");
+    assert!(!env.kb().join(".rkb/usage").exists(), "no usage record for an inbox item");
+
+    maintain_fake_pi(&env, MAINTAIN_ANSWER);
+    let o = rkb_with(with_pi(&env), &["promote", "--max", "1", "--harness", "pi", "--format", "json"], "");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", stdout(&o)));
+    assert_eq!(v["results"][0]["id"], "0000000002", "the worked note goes first: {v}");
+    let ids: Vec<String> = inbox_items(&env).iter().map(|i| i["id"].as_str().unwrap().to_string()).collect();
+    assert_eq!(ids, ["0000000001"], "the repeated item waits for the next pass");
 }
 
 #[test]

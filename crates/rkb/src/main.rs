@@ -83,6 +83,9 @@ enum Cmd {
         /// Also print where the lesson came from: harness, date, session, inbox item and quote.
         #[arg(long)]
         why: bool,
+        /// For an inbox id: keep this line (the `at` of a search row) and 5 lines around it.
+        #[arg(long)]
+        line: Option<usize>,
     },
     /// Find lessons that answer a question or an error, ranked, only those that can hold here.
     #[command(after_help = "Example:\n  rkb search \"cmake cannot find hdf5\"\n  rkb search --literal \"Could NOT find HDF5\"")]
@@ -1027,10 +1030,23 @@ fn run(cmd: Option<Cmd>, format: Format, hints: &rkb_core::matching::Hints, with
             }
             Ok(out)
         }
-        Cmd::Show { id, why } => {
+        Cmd::Show { id, why, line } => {
             kb::open(&root)?;
             let roots = rkb_core::kb::Roots::load(&root, &rkb_core::paths::config_dir())?;
-            let (origin, lesson, raw) = roots.find(&id)?;
+            let found = roots.find(&id);
+            if found.is_err()
+                && let Ok(item) = rkb_core::distill::get(&env.state, &id)
+            {
+                return Ok(inbox::focus_view(&item, line));
+            }
+            if line.is_some() && found.is_ok() {
+                return Err(CliError::new(
+                    crate::output::ErrorCode::Usage,
+                    format!("{id} is a lesson; --line is for inbox items"),
+                    format!("run `rkb show {id}` without --line"),
+                ));
+            }
+            let (origin, lesson, raw) = found?;
             let fm = &lesson.frontmatter;
             let shown = Frontmatter { queries: Vec::new(), ..fm.clone() };
             // Only a lesson with queries is rewritten, so every other lesson prints exactly as on disk.

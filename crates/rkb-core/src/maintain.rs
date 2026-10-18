@@ -130,9 +130,11 @@ pub fn record(state: &Path, last: Last) {
 }
 
 /// Removes each transcript item the rule triage marked `drop` or that is older than
-/// `[inbox] transcript_days` and not eligible for promotion. Never a note. Returns how many it removed.
+/// `[inbox] transcript_days`, not eligible for promotion and not reported as worked. Never a note.
+/// Returns how many it removed.
 pub fn expire(state: &Path, config_dir: &Path) -> usize {
     let days = distill::transcript_days(config_dir);
+    let worked = distill::worked(state);
     let now = request::now();
     let mut removed = 0;
     for item in distill::list(state) {
@@ -141,7 +143,8 @@ pub fn expire(state: &Path, config_dir: &Path) -> usize {
         }
         let dropped = crate::triage::dropped(&item);
         let old = now.saturating_sub(item.meta.time) > days.saturating_mul(86400);
-        let eligible = item.meta.signatures.iter().any(|sig| distill::eligible(state, sig) && !distill::is_done(state, sig));
+        let eligible = worked.contains(&item.id)
+            || item.meta.signatures.iter().any(|sig| distill::eligible(state, sig) && !distill::is_done(state, sig));
         if (dropped || old) && !eligible && distill::remove(state, &item.id) {
             removed += 1;
         }

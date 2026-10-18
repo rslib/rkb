@@ -91,6 +91,11 @@ fn output_schema(name: &str) -> Value {
                     "required": ["id", "type", "title", "path", "status", "applies", "summary"],
                 } },
                 "ranked_by": { "type": "string" },
+                "inbox": { "type": "array", "description": "Kept inbox items, not lessons yet; read one with rkb_show", "items": {
+                    "type": "object",
+                    "properties": { "id": { "type": "string" }, "line": { "type": "string" }, "at": { "type": "integer" } },
+                    "required": ["id", "line", "at"],
+                } },
             },
             "required": ["results"],
         }),
@@ -100,8 +105,14 @@ fn output_schema(name: &str) -> Value {
                 "id": { "type": "string" }, "path": { "type": "string" }, "title": { "type": "string" },
                 "hash": { "type": "string" }, "body": { "type": "string" }, "frontmatter": { "type": "object" },
                 "usage": { "type": "object" }, "applies": { "type": "object" }, "related": { "type": "array", "items": any },
+                "inbox": { "type": "boolean", "description": "true for an inbox item, which has `focus` instead of a lesson body" },
+                "kind": { "type": "string" }, "verdicts": { "type": "object" }, "lines": { "type": "integer" },
+                "focus": { "type": "string" }, "help": { "type": "array", "items": { "type": "string" } },
             },
-            "required": ["id", "path", "title", "hash", "body", "frontmatter"],
+            "anyOf": [
+                { "required": ["id", "path", "title", "hash", "body", "frontmatter"] },
+                { "required": ["id", "inbox", "focus"] },
+            ],
         }),
         _ => json!({
             "type": "object",
@@ -142,9 +153,10 @@ fn inputs() -> Vec<Value> {
         }),
         json!({
             "name": "rkb_show",
-            "description": "Read one lesson by id. Check `applies` and its Check section before you act on it. Its `hash` is the `base` for rkb_edit. Report the outcome with rkb_used.",
+            "description": "Read one lesson by id. Check `applies` and its Check section before you act on it. Its `hash` is the `base` for rkb_edit. Report the outcome with rkb_used. An inbox id from rkb_search gives a short view of that item.",
             "inputSchema": { "type": "object", "properties": {
-                "id": { "type": "string", "description": "The lesson id" },
+                "id": { "type": "string", "description": "The lesson id, or an inbox id from rkb_search" },
+                "line": { "type": "integer", "minimum": 1, "description": "For an inbox id: the `at` line from rkb_search, kept with 5 lines around it" },
             }, "required": ["id"], "additionalProperties": false },
         }),
         json!({

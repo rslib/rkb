@@ -48,6 +48,14 @@ Each time you act on a lesson, report the outcome with `rkb used` or `rkb_used`.
   This also flags the lesson.
 - `rkb used <id> --irrelevant --reason "<why>"` when the lesson does not fit the problem.
 
+Search can also list inbox items: notes and session parts that are not lessons yet.
+
+- `rkb show <id> --line <at>` prints a short view of an inbox item around the line that matched.
+  Take `at` from the search row.
+- When an inbox item fixed the problem, run `rkb used <id> --worked`.
+  Promotion then takes it first.
+- Do not report `--failed` or `--irrelevant` for an inbox item.
+
 A lesson is `candidate` until a `worked` report, then `proven`.
 Hooks push `proven` lessons, and at most one `candidate` per session.
 After 2 or more `irrelevant` or `failed` reports and no `worked`, a lesson moves to `archive`.
@@ -168,7 +176,7 @@ For `looks like <id> ...`, offer to merge the two lessons, but do not merge with
 - Never invent a fix that an inbox item does not show.
 - When the Stop hook asks you to record a lesson, do it with `rkb add`.
   Or say plainly that nothing here would help next time.
-- `rkb promote` turns an inbox item into a lesson when its signature repeats in 2 sessions.
+- `rkb promote` turns an inbox item into a lesson when its signature repeats in 2 sessions or an agent reported it worked.
   It runs only after `rkb approve observer` by the user.
 
 ## Publish

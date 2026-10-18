@@ -19,21 +19,26 @@ pub fn max_per_pass(config_dir: &Path) -> usize {
         .map_or(DEFAULT_MAX_PER_PASS, |n| n.clamp(1, 50) as usize)
 }
 
-/// The items that repeat in two or more sessions, oldest first, which no promotion has already
-/// answered.
+/// The items an agent reported as worked, then the items that repeat in two or more sessions, each
+/// group oldest first, which no promotion has already answered. A worked item whose answer missed
+/// its quotes twice leaves the first group, so it stops taking a call each pass.
 pub fn ready_items(state: &Path) -> Vec<Item> {
+    let worked: std::collections::HashSet<String> = distill::worked(state).into_iter().filter(|id| quote_failures(state, id) < 2).collect();
     let mut items: Vec<Item> = distill::list(state)
         .into_iter()
-        .filter(|i| i.meta.signatures.iter().any(|sig| distill::eligible(state, sig) && !distill::is_done(state, sig)))
+        .filter(|i| {
+            worked.contains(&i.id) || i.meta.signatures.iter().any(|sig| distill::eligible(state, sig) && !distill::is_done(state, sig))
+        })
         .collect();
-    items.sort_by(|a, b| a.meta.time.cmp(&b.meta.time).then(a.id.cmp(&b.id)));
+    items.sort_by_key(|i| (!worked.contains(&i.id), i.meta.time, i.id.clone()));
     items
 }
 
-/// One item per signature, oldest first: the others are the same failure, and one lesson covers them.
+/// One item per signature, in order: the others are the same failure, and one lesson covers them. An
+/// item with no signature stands for itself.
 pub fn representatives(items: &[Item]) -> Vec<Item> {
     let mut seen = std::collections::HashSet::new();
-    items.iter().filter(|i| i.meta.signatures.iter().any(|s| seen.insert(s.clone()))).cloned().collect()
+    items.iter().filter(|i| i.meta.signatures.is_empty() || i.meta.signatures.iter().any(|s| seen.insert(s.clone()))).cloned().collect()
 }
 
 /// The one model call's answer.
@@ -69,7 +74,11 @@ impl Answer {
     }
 }
 
-/// The promotion prompt: the item text as data and the closest lessons, and one JSON answer.
+/// Lines of an item the promotion prompt holds at most; a longer item is sent as its focus view.
+pub const PROMPT_LINES: usize = 120;
+
+/// The promotion prompt: the item text (its focus view when long) as data and the closest lessons,
+/// and one JSON answer.
 pub fn prompt(item: &Item, lessons: &[String]) -> String {
     let list =
         if lessons.is_empty() { "none".to_string() } else { lessons.iter().map(|l| format!("- {l}")).collect::<Vec<_>>().join("\n") };
@@ -94,7 +103,7 @@ pub fn prompt(item: &Item, lessons: &[String]) -> String {
          Answer \"changes_behavior\": false when the lesson would not change what an agent does in a different session; such an answer writes nothing.\n\
          Answer \"standing\": false when a preference is a one-off request for this session only; such an answer writes nothing.\n\
          Answer: {{\"action\": \"...\", ...}}",
-        item.body.trim(),
+        distill::focus(item.body.trim(), PROMPT_LINES),
     )
 }
 
@@ -280,6 +289,15 @@ mod tests {
         assert!(quotes_match(&across, &multi));
         let invented = parse(r#"{"action":"used","id":"a","quotes":["error: something else"]}"#).unwrap();
         assert!(!quotes_match(&invented, &multi));
+    }
+
+    #[test]
+    fn the_prompt_holds_the_focus_of_a_long_item() {
+        let long: String = (1..=400).map(|i| format!("line {i}\n")).collect();
+        let p = prompt(&item(&long), &[]);
+        assert_eq!(p.lines().filter(|l| l.starts_with("line ")).count(), PROMPT_LINES, "{p}");
+        let short: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        assert_eq!(prompt(&item(&short), &[]).lines().filter(|l| l.starts_with("line ")).count(), 30);
     }
 
     #[test]

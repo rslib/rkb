@@ -347,9 +347,30 @@ pub fn lifecycle(env: &Env, action: Action) -> Result<Output, CliError> {
     Ok(out)
 }
 
+/// A use report for an inbox item: only `worked`, which puts the item first in the promote queue.
+fn inbox_used(env: &Env, id: &str, result: &str) -> Result<Output, CliError> {
+    if result != "worked" {
+        return Err(CliError::new(
+            ErrorCode::Refused,
+            format!("{id} is an inbox item, not a lesson; it takes only a worked report"),
+            format!("run `rkb used {id} --worked` when it helped, and nothing otherwise"),
+        ));
+    }
+    rkb_core::distill::mark_worked(&env.state, id)?;
+    Ok(Output {
+        data: json!({ "id": id, "inbox": true, "result": "worked" }),
+        human: format!("{id}: inbox item marked worked; `rkb promote` takes it first"),
+        exit: 0,
+        raw: false,
+    })
+}
+
 /// `result` is `worked`, `failed` (also flags) or `irrelevant`.
 pub fn used(env: &Env, id: String, result: &str, reason: Option<String>, session: Option<String>) -> Result<Output, CliError> {
     kb::open(&env.root)?;
+    if extra_of(&id)?.is_none() && kb::find(&env.root, &id).is_err() && rkb_core::distill::get(&env.state, &id).is_ok() {
+        return inbox_used(env, &id, result);
+    }
     // The main usage file records a use of an extra lesson too, under its prefixed id. An extra
     // lesson is never flagged, archived or edited, so a failed report and a demote are refused.
     let extra = extra_of(&id)?.is_some();

@@ -121,7 +121,7 @@ fn agent_show(sink: &rkb_core::config::Sink, id: &str) -> Result<Output, CliErro
     if !allows(sink, &snapshots, origin.as_deref(), &lesson.path) {
         return Err(refused());
     }
-    let mut out = run(Some(Cmd::Show { id: id.to_string(), why: false }), Format::Toon, &Hints::default(), &[])?;
+    let mut out = run(Some(Cmd::Show { id: id.to_string(), why: false, line: None }), Format::Toon, &Hints::default(), &[])?;
     if let Some(related) = out.data.get("related").and_then(|r| r.as_array()).cloned() {
         let kept: Vec<Value> =
             related.into_iter().filter(|r| r["path"].as_str().is_some_and(|p| allows(sink, &snapshots, r["kb"].as_str(), p))).collect();
@@ -162,7 +162,7 @@ fn run_tool(name: &str, args: &Value) -> Result<Output, CliError> {
             if let Some(sink) = resolve_sink()? {
                 return agent_show(&sink, &id);
             }
-            Cmd::Show { id, why: false }
+            Cmd::Show { id, why: false, line: args["line"].as_u64().map(|n| n as usize) }
         }
         "rkb_note" => Cmd::Note { words: vec![text(args, "text")], priority: args["priority"].as_u64().map(|p| p.clamp(1, 3) as u8) },
         "rkb_add" => {

@@ -210,6 +210,69 @@ pub fn triage(env: &Env, ask: Option<&str>) -> Result<Output, CliError> {
     Ok(Output { data, human, exit: 0, raw: false })
 }
 
+/// Kept inbox items that `rkb search` lists after the lessons at most.
+const SEARCH_ITEMS: usize = 2;
+/// Characters of the matching line in a search row at most.
+const SEARCH_LINE: usize = 160;
+
+/// The kept inbox items that hold at least half of the query terms, most terms first, then newest,
+/// each with its id, the first line that holds the most terms and that line's number from 1. Reads the
+/// inbox and changes nothing.
+pub fn search_hits(state: &Path, query: &str) -> Vec<(String, String, usize)> {
+    use std::collections::HashSet;
+    let terms: HashSet<String> = rkb_core::text::tokens(query).into_iter().collect();
+    if terms.is_empty() {
+        return vec![];
+    }
+    let found = |text: &str| {
+        let words: HashSet<String> = rkb_core::text::tokens(text).into_iter().collect();
+        terms.iter().filter(|t| words.contains(*t)).count()
+    };
+    let mut hits = vec![];
+    for item in distill::list(state) {
+        if rkb_core::triage::Counts::of(&item.meta.candidates).keep == 0 {
+            continue;
+        }
+        let n = found(&item.body);
+        if n < terms.len().div_ceil(2) {
+            continue;
+        }
+        let (at, line) = item.body.lines().enumerate().min_by_key(|(i, l)| (std::cmp::Reverse(found(l)), *i)).unwrap_or((0, ""));
+        hits.push((n, item.meta.time, item.id.clone(), line.trim().chars().take(SEARCH_LINE).collect::<String>(), at + 1));
+    }
+    hits.sort_by_key(|(n, time, ..)| (std::cmp::Reverse(*n), std::cmp::Reverse(*time)));
+    hits.into_iter().take(SEARCH_ITEMS).map(|(_, _, id, line, at)| (id, line, at)).collect()
+}
+
+/// Lines of an inbox item that `rkb show` prints at most.
+const SHOW_LINES: usize = 40;
+
+/// `rkb show <inbox id>`: the item's focus view, short enough for an agent to read in a search turn,
+/// with the lines around `line` first when it is given.
+pub fn focus_view(item: &Item, line: Option<usize>) -> Output {
+    let view = distill::focus_at(&item.body, SHOW_LINES, line);
+    let counts = rkb_core::triage::Counts::of(&item.meta.candidates);
+    let help = format!("Run `rkb used {} --worked` if this fixed your problem; `rkb promote` then takes it first", item.id);
+    let human = format!(
+        "{} (inbox {}, {} keep, {} drop, {} unsure)\n\n{view}\n\n{help}",
+        item.id,
+        item.meta.kind.as_str(),
+        counts.keep,
+        counts.drop,
+        counts.unsure
+    );
+    let data = json!({
+        "id": item.id,
+        "inbox": true,
+        "kind": item.meta.kind.as_str(),
+        "verdicts": counts_json(counts),
+        "lines": item.body.lines().count(),
+        "focus": view,
+        "help": [help],
+    });
+    Output { data, human, exit: 0, raw: false }
+}
+
 pub fn show(env: &Env, id: &str) -> Result<Output, CliError> {
     let item = distill::get(&env.state, id)?;
     let mut data = row(&item, request::now());

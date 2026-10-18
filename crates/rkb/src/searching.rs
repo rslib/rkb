@@ -167,7 +167,17 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options, only: Option<
             row
         })
         .collect();
+    let inbox = crate::inbox::search_hits(&env.state, &query);
+    if !inbox.is_empty() {
+        human.push_str(&format!("\n{}\n", paint(c, "1", "Inbox, not lessons yet:")));
+        for (id, line, at) in &inbox {
+            human.push_str(&format!("  {id}  L{at}: {}\n", cut(line, w.saturating_sub(22), m)));
+        }
+    }
     let mut data = json!({ "query": query, "mode": label, "results": rows });
+    if !inbox.is_empty() {
+        data["inbox"] = json!(inbox.iter().map(|(id, line, at)| json!({ "id": id, "line": line, "at": at })).collect::<Vec<_>>());
+    }
     if ranked {
         data["ranked_by"] = json!(ranked_by);
     }
@@ -175,19 +185,23 @@ pub fn search(env: &Env, facts: &Facts, mode: Mode, opts: Options, only: Option<
         data["hidden"] = json!(r.hidden);
         data["hidden_by"] = json!(r.hidden_by);
     }
-    let help: Vec<String> = if r.hits.is_empty() {
-        vec![
-            "Run `rkb find <words>` to look up a lesson by name".into(),
-            "Add --all to search every folder and show hidden results".into(),
-            "Run `rkb list` to browse the topics".into(),
-        ]
-    } else {
-        vec!["Run `rkb show <id>` to read a lesson; check `applies` before you act on it".into()]
-    }
-    .into_iter()
-    // One line per extra knowledge base the search had to skip, so a down share is visible.
-    .chain(roots.skipped.iter().map(|(name, why)| format!("the extra knowledge base `{name}` was skipped: {why}; run `rkb doctor`")))
-    .collect();
+    let help: Vec<String> =
+        if r.hits.is_empty() {
+            vec![
+                "Run `rkb find <words>` to look up a lesson by name".into(),
+                "Add --all to search every folder and show hidden results".into(),
+                "Run `rkb list` to browse the topics".into(),
+            ]
+        } else {
+            vec!["Run `rkb show <id>` to read a lesson; check `applies` before you act on it".into()]
+        }
+        .into_iter()
+        .chain((!inbox.is_empty()).then(|| {
+            "Run `rkb show <id> --line <at>` for an inbox item; if it fixes the problem, run `rkb used <id> --worked`".to_string()
+        }))
+        // One line per extra knowledge base the search had to skip, so a down share is visible.
+        .chain(roots.skipped.iter().map(|(name, why)| format!("the extra knowledge base `{name}` was skipped: {why}; run `rkb doctor`")))
+        .collect();
     data["help"] = json!(help);
     Ok(Output { data, human, exit: 0, raw: false })
 }

@@ -278,6 +278,25 @@ pub fn mark_done(state: &Path, sig: &str) {
     let _ = crate::lock::append_line(&signatures_file(state), &line);
 }
 
+fn worked_file(state: &Path) -> PathBuf {
+    state.join("worked.jsonl")
+}
+
+/// Records that an agent reported this inbox item as worked, so promotion takes it first.
+pub fn mark_worked(state: &Path, id: &str) -> Result<()> {
+    let line = serde_json::json!({ "time": crate::request::now(), "item": id }).to_string();
+    crate::lock::append_line(&worked_file(state), &line)
+}
+
+/// The inbox items an agent reported as worked.
+pub fn worked(state: &Path) -> std::collections::HashSet<String> {
+    let Ok(text) = std::fs::read_to_string(worked_file(state)) else { return Default::default() };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v["item"].as_str().map(str::to_string))
+        .collect()
+}
+
 fn session_pairs(state: &Path) -> std::collections::BTreeSet<(String, String)> {
     let Ok(text) = std::fs::read_to_string(signatures_file(state)) else { return Default::default() };
     text.lines()
@@ -550,6 +569,83 @@ pub fn extract(steps: &[Step]) -> String {
         let cut = out.len() - (MAX_LINES - 1);
         out.drain(..cut);
         out.insert(0, format!("[{cut} earlier lines cut]"));
+    }
+    out.join("\n")
+}
+
+/// Lines kept on each side of a marker line in a focus view.
+const FOCUS_AROUND: usize = 2;
+/// The line that stands for skipped lines between two parts of a focus view.
+const FOCUS_GAP: &str = "[...]";
+
+/// Lines kept on each side of the line a search matched in a focus view.
+const FOCUS_MATCH_AROUND: usize = 5;
+
+/// The part of an item that matters most, in at most `max` whole lines: each failure, error output
+/// and success line of an extract with 2 lines around it, the latest parts first when they do not all
+/// fit, else the last `max` lines. An item of at most `max` lines comes back whole.
+pub fn focus(body: &str, max: usize) -> String {
+    focus_at(body, max, None)
+}
+
+/// `focus`, with lines `at - 5` to `at + 5` (from 1) kept before any other part. An `at` outside the
+/// item is ignored.
+pub fn focus_at(body: &str, max: usize, at: Option<usize>) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.len() <= max {
+        return body.to_string();
+    }
+    let last = lines.len() - 1;
+    let mut parts: Vec<(usize, usize)> = vec![];
+    for (i, l) in lines.iter().enumerate() {
+        if !(l.starts_with("[command failed") || l.starts_with("[command worked]") || l.starts_with("[tool output]")) {
+            continue;
+        }
+        let mut end = i;
+        while l.starts_with("[tool output]") && end < last && lines[end + 1].starts_with("  ") {
+            end += 1;
+        }
+        let (start, end) = (i.saturating_sub(FOCUS_AROUND), (end + FOCUS_AROUND).min(last));
+        match parts.last_mut() {
+            Some((_, e)) if start <= *e + 1 => *e = (*e).max(end),
+            _ => parts.push((start, end)),
+        }
+    }
+    if parts.is_empty() {
+        parts.push((lines.len() - max, last));
+    }
+    let mut order: Vec<(usize, usize)> = at
+        .filter(|&n| (1..=lines.len()).contains(&n))
+        .map(|n| ((n - 1).saturating_sub(FOCUS_MATCH_AROUND), (n - 1 + FOCUS_MATCH_AROUND).min(last)))
+        .into_iter()
+        .collect();
+    order.extend(parts.iter().rev());
+    // The cost of a set of lines is its size plus one gap line between each two blocks.
+    let mut kept = std::collections::BTreeSet::new();
+    let (mut size, mut blocks) = (0usize, 0usize);
+    'parts: for (start, end) in order {
+        for i in (start..=end).rev() {
+            if kept.contains(&i) {
+                continue;
+            }
+            let joins = usize::from(i > 0 && kept.contains(&(i - 1))) + usize::from(kept.contains(&(i + 1)));
+            let next_blocks = blocks + 1 - joins;
+            if size + 1 + next_blocks.saturating_sub(1) > max {
+                break 'parts;
+            }
+            kept.insert(i);
+            size += 1;
+            blocks = next_blocks;
+        }
+    }
+    let mut out: Vec<&str> = vec![];
+    let mut prev: Option<usize> = None;
+    for i in kept {
+        if prev.is_some_and(|p| p + 1 != i) {
+            out.push(FOCUS_GAP);
+        }
+        out.push(lines[i]);
+        prev = Some(i);
     }
     out.join("\n")
 }
@@ -844,6 +940,101 @@ pub fn import_notes(state: &Path, notes: &[(String, String)]) -> Result<(usize, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn numbered(n: usize, marker_at: Option<usize>) -> String {
+        (1..=n)
+            .map(|i| if Some(i) == marker_at { "[command failed] cmake ..".to_string() } else { format!("line {i}") })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn focus_keeps_the_marker_and_its_neighbors() {
+        let view = focus(&numbered(400, Some(200)), 40);
+        let lines: Vec<&str> = view.lines().collect();
+        assert!(lines.len() <= 40, "{view}");
+        for want in ["line 198", "line 199", "[command failed] cmake ..", "line 201", "line 202"] {
+            assert!(lines.contains(&want), "{want} in {view}");
+        }
+        assert!((1..=190).all(|i| !lines.contains(&format!("line {i}").as_str())), "{view}");
+    }
+
+    #[test]
+    fn focus_without_a_marker_keeps_the_end() {
+        let view = focus(&numbered(100, None), 40);
+        let want: Vec<String> = (61..=100).map(|i| format!("line {i}")).collect();
+        assert_eq!(view.lines().collect::<Vec<_>>(), want);
+    }
+
+    #[test]
+    fn focus_keeps_a_short_item_whole() {
+        let body = numbered(30, None);
+        assert_eq!(focus(&body, 40), body);
+    }
+
+    #[test]
+    fn focus_marks_the_gap_and_counts_it() {
+        let body: String = (1..=100)
+            .map(|i| if i == 20 || i == 80 { "[command worked] make".to_string() } else { format!("line {i}") })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let view = focus(&body, 11);
+        assert_eq!(view.lines().filter(|l| *l == FOCUS_GAP).count(), 1, "{view}");
+        assert_eq!(view.lines().count(), 11, "two parts of 5 and one gap: {view}");
+    }
+
+    #[test]
+    fn focus_keeps_the_tool_output_block() {
+        let mut lines: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
+        lines[50] = "[tool output]".into();
+        for (n, l) in lines.iter_mut().enumerate().skip(51).take(6) {
+            *l = format!("  error {n}");
+        }
+        let view = focus(&lines.join("\n"), 40);
+        assert!(view.contains("  error 56") && view.contains("line 59") && !view.contains("line 60"), "{view}");
+    }
+
+    #[test]
+    fn focus_cuts_a_part_larger_than_the_limit() {
+        let view = focus(&numbered(100, Some(50)), 3);
+        assert_eq!(view, "[command failed] cmake ..\nline 51\nline 52");
+        assert_eq!(focus(&numbered(100, Some(50)), 1), "line 52");
+        assert_eq!(focus(&numbered(100, Some(50)), 0), "");
+    }
+
+    #[test]
+    fn focus_at_keeps_the_lines_around_the_match_first() {
+        let body: String = (1..=400)
+            .map(|i| if i >= 300 && i % 2 == 0 { "[command failed] x".to_string() } else { format!("line {i}") })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let view = focus_at(&body, 40, Some(50));
+        let lines: Vec<&str> = view.lines().collect();
+        assert!(lines.len() <= 40, "{view}");
+        for i in 45..=55 {
+            assert!(lines.contains(&format!("line {i}").as_str()), "line {i} in {view}");
+        }
+        assert!(!lines.contains(&"line 44") && !lines.contains(&"line 56"), "{view}");
+        assert!(lines.contains(&"[command failed] x"), "the markers fill the rest: {view}");
+    }
+
+    #[test]
+    fn focus_at_a_line_past_the_end_is_the_plain_focus() {
+        let body = numbered(100, Some(50));
+        assert_eq!(focus_at(&body, 40, Some(500)), focus(&body, 40));
+        assert_eq!(focus_at(&body, 40, Some(0)), focus(&body, 40));
+    }
+
+    #[test]
+    fn focus_fits_many_markers_in_the_limit() {
+        let body: String = (1..=400)
+            .map(|i| if i % 10 == 0 { "[command worked] make".to_string() } else { format!("line {i}") })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let view = focus(&body, 40);
+        assert!(view.lines().count() <= 40, "{view}");
+        assert!(view.contains("line 399"), "the latest part stays: {view}");
+    }
 
     #[test]
     fn priority_order_and_collapse() {

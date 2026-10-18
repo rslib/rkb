@@ -1098,6 +1098,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn skill_names_inbox_items() {
+        assert!(SKILL.contains("Search can also list inbox items"), "the skill names inbox rows in search");
+        assert!(SKILL.contains("Promotion then takes it first"), "the skill says what a worked report does");
+        assert!(SKILL.contains("`rkb show <id> --line <at>`"), "the skill passes the matched line");
+    }
+
     /// The Hermes server runs `--tools propose`, so the skill names only tools in that set.
     #[test]
     fn hermes_skill_names_only_propose_tools() {
