@@ -52,6 +52,9 @@ pub struct Last {
     pub time: u64,
     pub pulled: usize,
     pub triaged: usize,
+    /// Unsure candidates the triage models were asked about.
+    #[serde(default)]
+    pub asked: usize,
     pub expired: usize,
     pub faded: usize,
     pub promoted: usize,

@@ -1,8 +1,9 @@
 # The rkb schedule
 
 `rkb maintain` runs one upkeep pass on the inbox. An OS timer can run it twice a day, at 09:00 and
-21:00 local time. The pass pulls proposals, runs the rule triage, expires transcripts, fades unused
-lessons and promotes within a daily model cap. Nothing else is needed; the timer does not require a
+21:00 local time. The pass pulls proposals, runs the rule triage, asks the approved `[triage]`
+models about one batch of unsure candidates, expires transcripts, fades unused lessons and promotes.
+Every model call counts against one daily cap. Nothing else is needed; the timer does not require a
 session.
 
 ## Install

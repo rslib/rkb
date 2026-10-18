@@ -7229,6 +7229,64 @@ fn maintain_pass_full() {
 }
 
 #[test]
+fn maintain_pass_asks_the_triage_models() {
+    let env = Env::new();
+    env.init();
+    maintain_config(&env, "\n[triage]\npi = \"small\"\n");
+    approve_as_claude(&env);
+    maintain_item(&env, "0000000008", "note", 0, None, "the linker wants -lz after -lhdf5 on this cluster");
+    maintain_item(&env, "0000000009", "note", 0, None, "the meeting moved to the afternoon");
+    maintain_fake_pi(&env, "0 keep a link order that fails\n1 drop chatter\n");
+    let o = rkb_with(with_pi(&env), &["maintain", "--harness", "pi"], "");
+    let human = stdout(&o);
+    assert_eq!(o.status.code(), Some(0), "{human}");
+    assert!(human.contains("2 asked") && human.contains("0 promoted"), "{human}");
+    let calls = std::fs::read_to_string(env.dir.path().join("fake/calls")).unwrap();
+    assert_eq!(calls.lines().count(), 1, "one model call: {calls}");
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(env.dir.path().join("state/rkb/maintain.json")).unwrap()).unwrap();
+    assert_eq!(state["calls"], 1, "the call counts against the daily cap: {state}");
+    let (show, _) = env.json(&["inbox", "show", "0000000008"], "");
+    assert_eq!(show["meta"]["candidates"][0]["verdict"], "keep", "{show}");
+
+    // Nothing unsure is left, so the next pass makes no call.
+    let o = rkb_with(with_pi(&env), &["maintain", "--harness", "pi"], "");
+    assert!(stdout(&o).contains("0 asked"), "{}", stdout(&o));
+    assert_eq!(std::fs::read_to_string(env.dir.path().join("fake/calls")).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn maintain_pass_reports_a_failed_triage_call() {
+    let env = Env::new();
+    env.init();
+    maintain_config(&env, "\n[triage]\npi = [\"small\", \"big\"]\n");
+    approve_as_claude(&env);
+    maintain_item(&env, "0000000008", "note", 0, None, "the linker wants -lz after -lhdf5 on this cluster");
+    let fake = env.dir.path().join("fake/pi");
+    env.write_abs(&fake, "#!/bin/sh\nD=$(dirname \"$0\")\necho called >> \"$D/calls\"\ncat > /dev/null\nexit 1\n");
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let o = rkb_with(with_pi(&env), &["maintain", "--harness", "pi"], "");
+    let human = stdout(&o);
+    assert_eq!(o.status.code(), Some(0), "a failed call does not fail the pass: {human}");
+    assert!(human.contains("0 asked") && human.contains("the triage models failed: "), "{human}");
+    assert_eq!(std::fs::read_to_string(env.dir.path().join("fake/calls")).unwrap().lines().count(), 1, "one call per pass");
+}
+
+#[test]
+fn maintain_pass_asks_nothing_at_the_daily_cap() {
+    let env = Env::new();
+    env.init();
+    maintain_config(&env, "\n[triage]\npi = \"small\"\n[maintain]\nmax_calls_per_day = 1\n");
+    approve_as_claude(&env);
+    maintain_calls(&env, 1);
+    maintain_item(&env, "0000000008", "note", 0, None, "the linker wants -lz after -lhdf5 on this cluster");
+    maintain_fake_pi(&env, "0 keep a link order that fails\n");
+    let o = rkb_with(with_pi(&env), &["maintain", "--harness", "pi"], "");
+    assert!(stdout(&o).contains("0 asked"), "{}", stdout(&o));
+    assert!(!env.dir.path().join("fake/calls").exists(), "no model call at the cap");
+}
+
+#[test]
 fn maintain_pass_survives_a_failed_pull() {
     let env = Env::new();
     env.init();

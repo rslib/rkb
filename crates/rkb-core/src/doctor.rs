@@ -587,8 +587,8 @@ fn schedule_check_at(home: &Path, state_dir: &Path) -> Check {
         .map(|t| t.to_zoned(jiff::tz::TimeZone::UTC).strftime("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_default();
     let counts = format!(
-        "{} pulled, {} triaged, {} expired, {} faded, {} promoted",
-        last.pulled, last.triaged, last.expired, last.faded, last.promoted
+        "{} pulled, {} triaged, {} asked, {} expired, {} faded, {} promoted",
+        last.pulled, last.triaged, last.asked, last.expired, last.faded, last.promoted
     );
     let pull = last.pull_error.as_ref().map(|r| format!("; the pull failed: {r}")).unwrap_or_default();
     let skip = last.skip.as_ref().map(|r| format!("; skipped the model step: {r}")).unwrap_or_default();
@@ -707,6 +707,7 @@ mod tests {
                 time: now - 40 * 3600,
                 pulled: 2,
                 triaged: 4,
+                asked: 0,
                 expired: 1,
                 faded: 0,
                 promoted: 1,

@@ -202,7 +202,7 @@ pub fn triage(env: &Env, ask: Option<&str>) -> Result<Output, CliError> {
     let mut data = json!({ "items": rows, "total": counts_json(total), "help": [help] });
     let mut human = human;
     if let Some(harness) = ask
-        && let Some(asked) = ask_with_cli(env, harness)?
+        && let Some(asked) = ask_with_cli(env, harness, || true)?
     {
         human.push_str(&format!("\n{}", asked.human));
         data["asked"] = asked.data;
@@ -351,7 +351,9 @@ fn entries_of(ask: &rkb_core::triage::Ask) -> String {
 }
 
 /// `rkb inbox triage --ask`: the unsure candidates through the harness's own CLI, as the observer runs.
-fn ask_with_cli(env: &Env, harness: &str) -> Result<Option<Output>, CliError> {
+/// `take` runs before each model call; when it says no, no more calls are made, and the result is
+/// `None` when no call was made or the error of the calls that failed.
+pub fn ask_with_cli(env: &Env, harness: &str, mut take: impl FnMut() -> bool) -> Result<Option<Output>, CliError> {
     use rkb_core::{observer, triage};
     let config = rkb_core::paths::config_dir();
     let Ok(cfg) = observer::load(&config) else { return Ok(None) };
@@ -362,6 +364,9 @@ fn ask_with_cli(env: &Env, harness: &str) -> Result<Option<Output>, CliError> {
     let timeout = std::time::Duration::from_secs(cfg.timeout_secs);
     let mut failures = vec![];
     for (entry, model) in &ask.models {
+        if !take() {
+            break;
+        }
         let (program, args) = observer::command(harness, model.as_deref());
         match observer::run(&program, &args, &ask.prompt, timeout, &env.state.join("observer"))? {
             observer::Ran::Ok { text, .. } => return Ok(Some(triaged(triage::finish_ask(&env.state, &ask, entry, &text)?, entry))),
@@ -369,9 +374,12 @@ fn ask_with_cli(env: &Env, harness: &str) -> Result<Option<Output>, CliError> {
             observer::Ran::Timeout => failures.push(format!("{entry}: timeout")),
         }
     }
+    if failures.is_empty() {
+        return Ok(None);
+    }
     Err(CliError::new(
         ErrorCode::Refused,
-        format!("every triage model failed: {}", failures.join("; ")),
+        format!("every triage model it called failed: {}", failures.join("; ")),
         "the candidates stay unsure; see `rkb doctor`",
     ))
 }

@@ -11,8 +11,8 @@ use crate::inbox;
 use crate::output::{CliError, ErrorCode, Output};
 use crate::writes::Env;
 
-/// Runs one pass: pull proposals, run the rule triage, expire transcripts, fade unused lessons and
-/// promote within the daily model cap. Every step reuses the command that already does it.
+/// Runs one pass: pull proposals, run the rule triage, ask the triage models about unsure candidates,
+/// expire transcripts, fade unused lessons and promote, with every model call within the daily cap. Every step reuses the command that already does it.
 pub fn run(env: &Env, harness: &str) -> Result<Output, CliError> {
     let config_dir = paths::config_dir();
     std::fs::create_dir_all(&env.state)
@@ -27,6 +27,7 @@ pub fn run(env: &Env, harness: &str) -> Result<Output, CliError> {
         Err(e) => (0, Some(e.message)),
     };
     let triaged = rule_triage(env, &config_dir)?;
+    let (asked, ask_error) = ask_step(env, harness, &config_dir);
     let expired = maintain::expire(&env.state, &config_dir);
     let faded =
         maintain::fade(&env.ctx(), &config_dir).map_err(|e| CliError::new(ErrorCode::Io, e.to_string(), "check the knowledge base"))?;
@@ -37,6 +38,7 @@ pub fn run(env: &Env, harness: &str) -> Result<Output, CliError> {
             time: request::now(),
             pulled,
             triaged,
+            asked,
             expired,
             faded,
             promoted,
@@ -44,15 +46,19 @@ pub fn run(env: &Env, harness: &str) -> Result<Output, CliError> {
             skip: skip.clone(),
         },
     );
-    let mut human = format!("rkb maintain: {pulled} pulled, {triaged} triaged, {expired} expired, {faded} faded, {promoted} promoted");
+    let mut human =
+        format!("rkb maintain: {pulled} pulled, {triaged} triaged, {asked} asked, {expired} expired, {faded} faded, {promoted} promoted");
     if let Some(reason) = &pull_error {
         human.push_str(&format!("\nthe pull failed: {reason}"));
+    }
+    if let Some(reason) = &ask_error {
+        human.push_str(&format!("\nthe triage models failed: {reason}"));
     }
     if let Some(reason) = &skip {
         human.push_str(&format!("\nskipped the model step: {reason}"));
     }
     Ok(Output {
-        data: json!({ "pulled": pulled, "triaged": triaged, "expired": expired, "faded": faded, "promoted": promoted, "pull_error": pull_error, "skip": skip }),
+        data: json!({ "pulled": pulled, "triaged": triaged, "asked": asked, "expired": expired, "faded": faded, "promoted": promoted, "pull_error": pull_error, "ask_error": ask_error, "skip": skip }),
         human,
         exit: 0,
         raw: false,
@@ -63,7 +69,7 @@ pub fn run(env: &Env, harness: &str) -> Result<Output, CliError> {
 fn busy() -> Output {
     let human = format!("{}; no step ran", maintain::BUSY);
     Output {
-        data: json!({ "running": true, "reason": maintain::BUSY, "pulled": 0, "triaged": 0, "expired": 0, "faded": 0, "promoted": 0 }),
+        data: json!({ "running": true, "reason": maintain::BUSY, "pulled": 0, "triaged": 0, "asked": 0, "expired": 0, "faded": 0, "promoted": 0 }),
         human,
         exit: 0,
         raw: false,
@@ -87,6 +93,29 @@ fn rule_triage(env: &Env, config_dir: &Path) -> Result<usize, CliError> {
     let stages = triage::Stages { thresholds: triage::Thresholds::load(config_dir), novelty: None, scorer: None };
     let done = triage::triage(&env.state, &stages).map_err(|e| CliError::new(ErrorCode::Io, e.to_string(), "check the state directory"))?;
     Ok(done.len())
+}
+
+/// One call to the approved `[triage]` models about the oldest batch of unsure candidates, counted
+/// against the daily cap. A failed call does not stop the pass; the candidates stay unsure.
+fn ask_step(env: &Env, harness: &str, config_dir: &Path) -> (usize, Option<String>) {
+    let max_day = maintain::max_calls_per_day(config_dir);
+    let mut taken = false;
+    let take = || {
+        if taken {
+            return false;
+        }
+        taken = true;
+        maintain::take_call(&env.state, max_day)
+    };
+    match inbox::ask_with_cli(env, harness, take) {
+        Ok(Some(out)) => {
+            let counts = &out.data["counts"];
+            let asked = ["keep", "drop", "unsure"].iter().map(|k| counts[*k].as_u64().unwrap_or(0)).sum::<u64>();
+            (asked as usize, None)
+        }
+        Ok(None) => (0, None),
+        Err(e) => (0, Some(e.message)),
+    }
 }
 
 /// The model step, within `min(remaining, max_per_pass)` calls. A missing approved chain, a failed
