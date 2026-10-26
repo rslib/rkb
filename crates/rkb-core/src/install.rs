@@ -68,6 +68,12 @@ const LEGACY_PLUGIN_FILES: [&str; 5] = [
 pub const ASK_RULE: &str = "Bash(rkb confirm:*)";
 /// The mod's native tools, allowed without a prompt: every rkb write that needs the user still asks.
 pub const TOOL_RULES: [&str; 4] = ["mcp__rkb__search", "mcp__rkb__show", "mcp__rkb__add", "mcp__rkb__note"];
+/// The allow rules an earlier rkb added for the plugin's MCP server. The mod registers the same four
+/// tools itself, so these name a server this version no longer installs.
+const LEGACY_TOOL_RULES: [&str; 4] =
+    ["mcp__plugin_rkb_rkb__rkb_search", "mcp__plugin_rkb_rkb__rkb_show", "mcp__plugin_rkb_rkb__rkb_add", "mcp__plugin_rkb_rkb__rkb_note"];
+/// The plugin's MCP file an earlier rkb wrote. The mod's native tools replace it.
+const LEGACY_MCP_FILE: &str = "plugins/rkb/.mcp.json";
 /// The Claude Code plugin id: plugin `rkb` from the local marketplace `rkb`.
 pub const PLUGIN: &str = "rkb@rkb";
 
@@ -477,6 +483,14 @@ fn ask_rule(path: &Path, add: bool) -> Result<bool> {
         return Err(Error::Refused(format!("{} is not a JSON object", path.display())));
     }
     let mut changed = false;
+    // The rules an earlier rkb added for the plugin's MCP server go, on install and on uninstall.
+    if let Some(allow) =
+        v.as_object_mut().and_then(|o| o.get_mut("permissions")).and_then(|p| p.get_mut("allow")).and_then(|a| a.as_array_mut())
+    {
+        let before = allow.len();
+        allow.retain(|r| !r.as_str().is_some_and(|r| LEGACY_TOOL_RULES.contains(&r)));
+        changed |= allow.len() != before;
+    }
     for (list, rules) in [("ask", &[ASK_RULE][..]), ("allow", &TOOL_RULES[..])] {
         for rule in rules {
             let has = v["permissions"][list].as_array().is_some_and(|a| a.iter().any(|r| r == rule));
@@ -564,10 +578,39 @@ fn write_plugin(dir: &Path, bin: &str) -> Result<bool> {
             changed = true;
         }
     }
+    if remove_mcp_file(&dir.join(LEGACY_MCP_FILE))? {
+        changed = true;
+    }
     for rel in ["plugins/rkb/commands", "plugins/rkb/agents"] {
         let _ = std::fs::remove_dir(dir.join(rel));
     }
     Ok(changed)
+}
+
+/// Removes the `rkb` server an earlier rkb wrote into the plugin's `.mcp.json`, and the file when
+/// that server was its only content. A server the user added there stays. Returns whether it changed.
+fn remove_mcp_file(file: &Path) -> Result<bool> {
+    let Ok(text) = std::fs::read_to_string(file) else { return Ok(false) };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) else { return Ok(false) };
+    let Some(servers) = v.as_object_mut().and_then(|o| o.get_mut("mcpServers")).and_then(|s| s.as_object_mut()) else {
+        return Ok(false);
+    };
+    if !servers.get("rkb").is_some_and(is_rkb_server) {
+        return Ok(false);
+    }
+    servers.remove("rkb");
+    if servers.is_empty() {
+        std::fs::remove_file(file).map_err(io(file))?;
+    } else {
+        write_atomic(file, &(serde_json::to_string_pretty(&v).expect("json serializes") + "\n"))?;
+    }
+    Ok(true)
+}
+
+/// Whether a server entry is the one rkb wrote: the `rkb` binary with `mcp` as its only argument.
+fn is_rkb_server(server: &serde_json::Value) -> bool {
+    let command = server["command"].as_str().unwrap_or_default();
+    Path::new(command).file_name().is_some_and(|n| n == "rkb") && server["args"] == serde_json::json!(["mcp"])
 }
 
 /// Makes Claude Code run the plugin in `dir`: adds the marketplace, then installs or updates the plugin.
@@ -1150,7 +1193,11 @@ mod tests {
         let mine = serde_json::json!({ "hooks": [{ "type": "command", "command": "echo hi" }] });
         let start = serde_json::json!({
             "theme": "dark",
-            "permissions": { "ask": ["Bash(rm:*)"], "defaultMode": "auto" },
+            "permissions": {
+                "ask": ["Bash(rm:*)"],
+                "allow": [LEGACY_TOOL_RULES[0], "Bash(ls:*)", LEGACY_TOOL_RULES[1]],
+                "defaultMode": "auto",
+            },
             "hooks": { "Stop": [old_hook], "SessionStart": [mine.clone()] },
         });
         std::fs::write(&settings, start.to_string()).unwrap();
@@ -1164,6 +1211,12 @@ mod tests {
         std::fs::write(commands.join("mine.md"), "the user's own command").unwrap();
         let marked = "old prompt\n---\ngenerated-by: rkb install\n---\n";
         let plugin = home.join(".local/share/rkb/claude-plugin/plugins/rkb");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(
+            plugin.join(".mcp.json"),
+            serde_json::json!({ "mcpServers": { "rkb": { "command": "/old/place/rkb", "args": ["mcp"] } } }).to_string(),
+        )
+        .unwrap();
         for (rel, text) in [
             ("commands/retro.md", marked),
             ("commands/curate.md", marked),
@@ -1185,7 +1238,11 @@ mod tests {
         let v = settings_of(&home);
         assert_eq!((v["theme"].as_str(), v["permissions"]["defaultMode"].as_str()), (Some("dark"), Some("auto")));
         assert_eq!(v["permissions"]["ask"], serde_json::json!(["Bash(rm:*)", ASK_RULE]));
-        assert_eq!(v["permissions"]["allow"], serde_json::json!(TOOL_RULES));
+        assert_eq!(
+            v["permissions"]["allow"],
+            serde_json::json!(["Bash(ls:*)", TOOL_RULES[0], TOOL_RULES[1], TOOL_RULES[2], TOOL_RULES[3]]),
+            "an earlier rkb's MCP rules go, the user's stay"
+        );
         assert_eq!(v["hooks"], serde_json::json!({ "SessionStart": [mine] }), "old rkb hook entries go, the user's stay");
         assert!(!commands.join(format!("rkb-{}.md", LEGACY_COMMANDS[0])).exists() && commands.join("mine.md").exists());
         assert!(!home.join(".claude/skills/rkb").exists());
@@ -1205,7 +1262,7 @@ mod tests {
         assert_eq!(hooks["hooks"].as_object().unwrap().len(), 8);
         assert_eq!(hooks["hooks"]["PostToolUseFailure"][0]["matcher"], "Bash");
         assert_eq!(hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"], format!("{} hook session-start", hook_binary()));
-        assert!(!dir.join(".mcp.json").exists(), "the plugin installs no MCP server");
+        assert!(!dir.join(".mcp.json").exists(), "the plugin installs no MCP server, and an old one goes");
         let log = claude_log(&home);
         assert!(
             log.iter().any(|l| l.starts_with("plugin marketplace add ")) && log.contains(&"plugin install rkb@rkb".to_string()),
@@ -1231,8 +1288,35 @@ mod tests {
         );
         assert!(!home.join(".local/share/rkb/claude-plugin").exists());
         let v = settings_of(&home);
-        assert_eq!(v["permissions"], serde_json::json!({ "ask": ["Bash(rm:*)"], "defaultMode": "auto" }));
+        assert_eq!(
+            v["permissions"],
+            serde_json::json!({ "ask": ["Bash(rm:*)"], "allow": ["Bash(ls:*)"], "defaultMode": "auto" }),
+            "uninstall takes rkb's rules and keeps the user's"
+        );
         assert!(!std::fs::read_to_string(cfg.join("trust.toml")).unwrap().contains("claude-code"));
+    }
+
+    /// An old plugin `.mcp.json` loses rkb's server and keeps one the user added there.
+    #[test]
+    fn old_mcp_file_keeps_other_servers() {
+        let (_d, home, cfg) = setup();
+        let plugin = home.join(".local/share/rkb/claude-plugin/plugins/rkb");
+        std::fs::create_dir_all(&plugin).unwrap();
+        let file = plugin.join(".mcp.json");
+        std::fs::write(
+            &file,
+            serde_json::json!({
+                "mcpServers": {
+                    "rkb": { "command": "rkb", "args": ["mcp"] },
+                    "mine": { "command": "other", "args": [] }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        apply(&test_plan(&home, &cfg, &[Harness::Claude], false), "S").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"].as_object().unwrap().keys().collect::<Vec<_>>(), ["mine"]);
     }
 
     /// Runs only where Claude Code's `claude` command exists; `validate` reads files and changes nothing.
