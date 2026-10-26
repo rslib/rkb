@@ -1,6 +1,6 @@
 ---
 name: rkb
-description: Load before you fix an error or a failure, and before a web search or a guess about a problem that may have been seen before. Also load after you learn something durable, when the user says to remember something and when the user asks to clean up the knowledge base. Load it even for a quick question about a past error. rkb is a personal knowledge base of lessons learned, used through the rkb CLI and the rkb_ tools. Rules for every turn belong in CLAUDE.md or AGENTS.md, not in rkb.
+description: Load before you fix an error, before a web search or a guess about a problem seen before, and after you learn something durable or when the user says to remember something. Also load it to clean up the knowledge base or answer a question about a past error. rkb is a personal knowledge base of lessons learned, used through the rkb CLI.
 ---
 
 # rkb
@@ -9,8 +9,8 @@ rkb manages a git repository of Markdown lessons at `$RKB_HOME` (default `~/Pers
 Pass `--toon` on every rkb command, such as `rkb search "cmake hdf5" --toon`.
 Tell the user the result in your own words.
 
-In Claude Code, pi and omp the tools `rkb_search`, `rkb_show`, `rkb_add`, `rkb_note`, `rkb_used`, `rkb_flag` and `rkb_edit` do what the commands do.
-Claude Code can name them `mcp__rkb__search` and so on.
+In Claude Code the tools `rkb_search`, `rkb_show`, `rkb_add`, `rkb_note`, `rkb_used`, `rkb_flag` and `rkb_edit` do what the commands do, as `mcp__rkb__search` and so on.
+In pi and omp only `rkb_search` is a tool, so run every other command with bash.
 
 Run `rkb <command> --help` for flags.
 Run `rkb --help` for the commands this skill does not name.

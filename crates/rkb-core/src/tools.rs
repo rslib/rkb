@@ -143,7 +143,7 @@ fn inputs() -> Vec<Value> {
     vec![
         json!({
             "name": "rkb_search",
-            "description": "Search the user's knowledge base of lessons learned. Use it BEFORE a web search or a guess about an error or problem. Read a result with rkb_show.",
+            "description": "Search the user's knowledge base of lessons learned. Use it BEFORE a web search or a guess about an error or problem. Read a result in full before you act on it.",
             "inputSchema": { "type": "object", "properties": {
                 "query": { "type": "string", "description": "Words from the problem or the error" },
                 "limit": { "type": "integer", "minimum": 1, "description": "Default: 10" },

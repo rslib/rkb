@@ -115,8 +115,10 @@ if (harness === "omp") {
 
 assert.deepEqual(Object.keys(commands), ["rkb-status"]);
 
-// The agent tools run `rkb tool` and return its TOON text; failures throw, as pi expects.
-assert.deepEqual(Object.keys(tools).sort(), ["rkb_add", "rkb_edit", "rkb_flag", "rkb_note", "rkb_search", "rkb_show", "rkb_used"]);
+// The agent tool runs `rkb tool` and returns its TOON text; failures throw, as pi expects.
+// Only the search stays a tool: every other command costs a schema on every request, and the skill
+// and the CLI do the same work.
+assert.deepEqual(Object.keys(tools), ["rkb_search"]);
 assert.match(tools.rkb_search.description, /before a web search/i);
 assert.equal(tools.rkb_search.parameters.properties.query.type, "string");
 const found = await tools.rkb_search.execute("t1", { query: "undefined reference to vtable" });
@@ -126,11 +128,9 @@ assert.ok(found.structuredContent.results.some((r) => r.id === "1a00000012"));
 assert.ok(!found.content[0].text.startsWith("{"), "the model reads TOON, not JSON");
 assert.equal(tools.rkb_search.namespace.name, "rkb");
 assert.equal(tools.rkb_search.annotations.readOnlyHint, true);
-assert.equal(tools.rkb_edit.annotations.destructiveHint, true);
 assert.equal(tools.rkb_search.outputSchema.properties.results.type, "array");
-assert.match(tools.rkb_search.promptGuidelines[0], /rkb_used/);
-assert.equal(tools.rkb_show.promptGuidelines, undefined);
-await assert.rejects(tools.rkb_show.execute("t2", {}), /`id` is required/);
+assert.match(tools.rkb_search.promptGuidelines[0], /rkb used/);
+assert.match(tools.rkb_search.promptGuidelines[0], /the other rkb commands run in bash/);
 
 // A recall reply goes into the next turn's context, hidden, with the session-start lines.
 const stubDir = mkdtempSync(`${tmpdir()}/rkb-stub-`);
