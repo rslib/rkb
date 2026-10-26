@@ -1246,7 +1246,11 @@ mod tests {
         for dir in [d.path().to_path_buf(), d.path().join("plugins/rkb")] {
             let out = std::process::Command::new("claude").args(["plugin", "validate"]).arg(&dir).output().unwrap();
             let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-            assert!(out.status.success() && !text.contains("warning"), "{text}");
+            // Newer validators add the directory-submission checks after this marker: README, LICENSE
+            // and an icon. A local marketplace plugin needs none of them, and `--strict` agrees, since
+            // they do not change the verdict. The plugin's own checks still must not warn.
+            let plugin = text.split("Plugin directory checks for").next().unwrap_or(&text);
+            assert!(out.status.success() && !plugin.contains("warning"), "{text}");
         }
     }
 
